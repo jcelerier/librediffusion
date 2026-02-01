@@ -22,6 +22,7 @@
 #endif
 
 #include <cassert>
+#include <cstdio>
 
 namespace sd
 {
