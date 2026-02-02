@@ -126,7 +126,7 @@ add_library(librediffusion SHARED
 ) 
 set_target_properties(librediffusion PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
-target_compile_definitions(librediffusion PRIVATE $<$<BOOL:${WIN32}>:SD_BUILD_DLL>)
+target_compile_definitions(librediffusion PRIVATE $<$<BOOL:${WIN32}>:LIBREDIFFUSION_BUILD_DLL>)
 target_include_directories(librediffusion PUBLIC
     src
     src/clip-tokenizer-c
