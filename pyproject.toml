@@ -5,7 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 
 # hint: You're using CPython 3.14 (`cp314`), but `onnxruntime` (v1.23.2) only has wheels with the following Python ABI tags: `cp310`, `cp311`, `cp312`, `cp313`, `cp313t`
-requires-python = ">=3.13,<=3.14" 
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "accelerate>=1.5",
     "colored>=2.3",
