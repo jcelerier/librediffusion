@@ -429,7 +429,8 @@ public:
     EnginePtr result;
 
     cache_.visit(engine_path, [&result](const auto& entry) {
-      entry.second->touch();
+      if(entry.second)
+        entry.second->touch();
       result = entry.second;
     });
 
@@ -448,7 +449,8 @@ public:
         engine_path, engine,
         [&result](const auto& entry) {
           // Key already exists, use existing engine
-          entry.second->touch();
+          if(entry.second)
+            entry.second->touch();
           result = entry.second;
         });
 
