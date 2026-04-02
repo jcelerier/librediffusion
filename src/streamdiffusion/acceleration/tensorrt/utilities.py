@@ -550,6 +550,7 @@ def build_engine(
         static_batch=build_static_batch,
         static_shape=not build_dynamic_shape,
     )
+    print(input_profile)
     engine.build(
         onnx_opt_path,
         fp16=True,

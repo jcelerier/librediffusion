@@ -282,7 +282,7 @@ def accelerate_with_tensorrt(
     # Check if we'll use pre-built ONNX (needed for model selection)
     prebuilt_onnx_dir = os.path.join(os.path.dirname(engine_dir), "engines_sdxl_turbo")
     prebuilt_unet_onnx = os.path.join(prebuilt_onnx_dir, "unetxl.opt", "model.onnx")
-    use_prebuilt_onnx = stream.sdxl and os.path.exists(prebuilt_unet_onnx)
+    use_prebuilt_onnx = False#stream.sdxl and os.path.exists(prebuilt_unet_onnx)
 
     # Use SDXL-specific model configuration if SDXL pipeline
     if stream.sdxl:
