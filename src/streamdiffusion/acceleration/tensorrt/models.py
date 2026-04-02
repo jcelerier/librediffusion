@@ -565,6 +565,30 @@ class SDXLUNet(BaseModel):
             ],
         }
 
+    def get_shape_dict(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        return {
+            "sample": (batch_size, self.unet_dim, latent_height, latent_width),
+            "timestep": (batch_size,),
+            "encoder_hidden_states": (batch_size, self.text_maxlen, self.embedding_dim),
+            "text_embeds": (batch_size, self.pooled_embedding_dim),
+            "time_ids": (batch_size, 6),
+            "latent": (batch_size, 4, latent_height, latent_width),
+        }
+
+    def get_sample_input(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        dtype = torch.float16 if self.fp16 else torch.float32
+        return (
+            torch.randn(
+                batch_size, self.unet_dim, latent_height, latent_width, dtype=torch.float32, device=self.device
+            ),
+            torch.ones((batch_size,), dtype=torch.float32, device=self.device),
+            torch.randn(batch_size, self.text_maxlen, self.embedding_dim, dtype=dtype, device=self.device),
+            torch.randn(batch_size, self.pooled_embedding_dim, dtype=dtype, device=self.device),
+            torch.randn(batch_size, 6, dtype=dtype, device=self.device),  # time_ids
+        )
+
 
 class SDXLUNetPrebuilt(SDXLUNet):
     """SDXL UNet for pre-built ONNX from HuggingFace (static timestep shape)"""
