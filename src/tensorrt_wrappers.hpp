@@ -160,6 +160,35 @@ public:
       int pooled_dim, cudaStream_t stream);
 
   /**
+   * StreamV2V (live kvo_cache design). Run the SD1.5 UNet with cross-frame extended self-attention:
+   * the engine declares kvo_cache_in_0..15 (the rolling K/V bank, [2, maxframes, B, seq, hidden] per
+   * self-attn layer) and kvo_cache_out_0..15 (this frame's new K/V, [2, 1, B, seq, hidden]). It
+   * concatenates the banked K/V into each self-attention before SDPA, giving temporal coherence.
+   *
+   * The rolling bank lives INSIDE this wrapper (kvo_bank_): forward_v2v binds it to kvo_cache_in_*,
+   * enqueues, then host-rolls the bank from kvo_cache_out_* (shift -1 on the maxframes dim, write the
+   * newest at the last slot — mirrors pipeline.py update_kvo_cache). On frame 0 the bank is zeros
+   * (== plain attention, matching create_kvo_cache). Call resetV2VBank() to clear it between clips.
+   *
+   * Inputs/output mirror forward(); cache_maxframes sizes the bank's frame dim (engine profile max=4).
+   */
+  void forward_v2v(
+      const float* sample, const float* timestep, const __half* encoder_hidden_states,
+      __half* output, int batch, int height, int width, int seq_len, int hidden_dim,
+      int cache_maxframes, bool use_tome, float fi_strength, float fi_threshold,
+      cudaStream_t stream);
+  /// True if the engine declares the v2v_inject_params input (feature-injection strength/threshold are
+  /// runtime-adjustable rather than baked).
+  bool hasV2VDynamicInject() const { return has_v2v_inject_params_; }
+
+  /// True if the loaded engine declares the kvo_cache_in_* inputs (live StreamV2V UNet).
+  bool hasV2VKvo() const { return has_v2v_kvo_; }
+  /// True if the engine banks attention OUTPUTS (3-component [K,V,O]) — i.e. feature injection is baked.
+  bool hasV2VInject() const { return kvo_components_ >= 3; }
+  /// Clear the rolling K/V bank (zeros) so the next frame starts an empty temporal context.
+  void resetV2VBank();
+
+  /**
    * StreamV2V: Access attention output buffers for feature injection
    * Returns the 16 attention layer outputs from the last forward pass
    */
@@ -204,10 +233,35 @@ private:
   std::unique_ptr<CUDATensor<__half>> text_embeds_buffer_;
   std::unique_ptr<CUDATensor<__half>> time_ids_buffer_;
 
-  // StreamV2V attention caching
+  // StreamV2V attention caching (LEGACY attention-output feature-bank — superseded by the kvo design
+  // below; kept only because forward()/getAttentionBuffers still reference these for engines exported
+  // via the dead tensorrt_orig path. New engines use kvo_cache_in/out, handled by forward_v2v.)
   bool use_v2v_ = false;
+  bool has_v2v_outputs_ = false;  // engine actually declares attention_* outputs (detected at load)
   static constexpr int NUM_ATTENTION_OUTPUTS = 16;
   std::vector<std::unique_ptr<CUDATensor<__half>>> attention_output_buffers_;
+
+  // StreamV2V LIVE design: kvo_cache cross-frame K/V banking (extended self-attention). Detected at
+  // load from kvo_cache_in_0 (kINPUT). Per self-attn layer the engine bakes a STATIC (seq, hidden)
+  // for the build resolution (e.g. 4096/320, 1024/640, ...) and DYNAMIC (maxframes, batch).
+  bool has_v2v_kvo_ = false;
+  int num_kvo_layers_ = 0;            // 16 for SD1.5 (attn1 layers)
+  int kvo_components_ = 2;            // cache components per layer: 2 = [K,V] (extended-attn),
+                                     // 3 = [K,V,O] (+ feature injection — engine bakes get_nn_feats)
+  std::vector<int> kvo_seq_;          // per-layer baked sequence length (from binding d[3])
+  std::vector<int> kvo_hidden_;       // per-layer hidden dim       (from binding d[4])
+  int kvo_profile_max_frames_ = 0;    // optimization-profile MAX for the maxframes dim
+  int kvo_profile_max_batch_ = 0;     // optimization-profile MAX for the batch dim
+  // Rolling bank + per-frame output buffers, (re)allocated when (batch, maxframes) change.
+  int bank_batch_ = 0, bank_maxframes_ = 0;
+  std::vector<std::unique_ptr<CUDATensor<__half>>> kvo_bank_;  // per layer [C, maxframes, B, seq, hidden]
+  std::vector<std::unique_ptr<CUDATensor<__half>>> kvo_out_;   // per layer [C, 1, B, seq, hidden]
+  // ToMe scratch: per-layer concat(bank, new) = [B, 2*seq, hidden] for K, V, O (reused each frame).
+  bool bank_tome_ = false;  // bank built for the ToMe (maxframes=1, merge) update path
+  std::vector<std::unique_ptr<CUDATensor<__half>>> tome_cat_k_, tome_cat_v_, tome_cat_o_;
+  // Runtime-adjustable feature-injection [fi_strength, threshold] (engine input v2v_inject_params).
+  bool has_v2v_inject_params_ = false;
+  std::unique_ptr<CUDATensor<float>> v2v_inject_params_buffer_;  // device [2] fp32
 
   // ControlNet residual inputs. Persistent buffers, bound only when the engine declares
   // input_control_* inputs (control-aware UNet). down_residuals copied per-call.

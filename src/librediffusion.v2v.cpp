@@ -1,5 +1,7 @@
 #include "librediffusion.hpp"
 
+#include "tensorrt_wrappers.hpp"
+
 namespace librediffusion
 {
 
@@ -60,5 +62,8 @@ void LibreDiffusionPipeline::resetTemporalState()
   temporal_state_.cached_x_t_latent.clear();
   temporal_state_.cached_attentions.clear();
   temporal_state_.frame_id = 0;
+  // Clear the live kvo K/V bank so the next clip starts an empty temporal context.
+  if(unet_)
+    unet_->resetV2VBank();
 }
 }

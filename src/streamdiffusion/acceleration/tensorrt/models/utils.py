@@ -89,16 +89,19 @@ def convert_structure_to_list(structured_list):
     return flat_list
 
 
-def create_kvo_cache(unet: UNet2DConditionModel, batch_size, cache_maxframes, height=512, width=512, 
-                     device='cuda', dtype=torch.float16):
+def create_kvo_cache(unet: UNet2DConditionModel, batch_size, cache_maxframes, height=512, width=512,
+                     device='cuda', dtype=torch.float16, n_components=2):
+    # n_components: 2 = [K,V] (extended self-attention), 3 = [K,V,O] (+ feature injection: also bank the
+    # attention OUTPUTS so the engine's baked get_nn_feats can read them). The runtime feed/roll is
+    # component-agnostic (it indexes dim 1 = maxframes), so a 3-component cache works unchanged.
     kvo_cache_shapes, kvo_cache_structure, _ = get_kvo_cache_info(unet, height, width)
-    
+
     kvo_cache = []
     for seq_length, hidden_dim in kvo_cache_shapes:
         cache_tensor = torch.zeros(
-            2, cache_maxframes, batch_size, seq_length, hidden_dim,
+            n_components, cache_maxframes, batch_size, seq_length, hidden_dim,
             dtype=dtype, device=device
         )
         kvo_cache.append(cache_tensor)
-    
+
     return kvo_cache, kvo_cache_structure

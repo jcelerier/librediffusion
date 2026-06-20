@@ -51,29 +51,12 @@ LibreDiffusionPipeline::~LibreDiffusionPipeline()
 void LibreDiffusionPipeline::reseed(int64_t rs)
 {
   config_.seed = rs;
-  // Initialize noise buffers on host, then copy to device
-  // init_noise: random normal distribution (using Box-Muller transform)
-  {
-    size_t noise_size = init_noise_->size();
-    static thread_local std::vector<__half> host_noise;
-    host_noise.resize(noise_size);
-
-    // Initialize PCG with seed
-    pcg rng;
-    rng.seed(config_.seed, config_.seed + 1);
-    std::normal_distribution<float> normal_dist(0.0f, 1.0f);
-
-    // Generate random normal values
-    for(size_t i = 0; i < noise_size; ++i)
-    {
-      host_noise[i] = normal_dist(rng);
-    }
-
-    // Copy to device
-    cudaMemcpyAsync(
-        init_noise_->data(), host_noise.data(), noise_size * sizeof(__half),
-        cudaMemcpyHostToDevice, stream_);
-  }
+  // init_noise: the SHARED counter-based PCG32 Gaussian (launch_randn_fp16) — bit-identical to the
+  // Python pcg32_randn (deterministic_noise.py) and the txt2img path, so img2img generated noise
+  // matches python<->C++ element-for-element. (Previously this was a host-side std::normal_distribution
+  // over a single pcg stream seeded (seed, seed+1), which is a DIFFERENT RNG and did NOT match the
+  // shared per-element counter+Box-Muller kernel — img2img noise silently diverged from the goldens.)
+  launch_randn_fp16(init_noise_->data(), config_.seed, (int)init_noise_->size(), stream_);
 
   // stock_noise: zeros (updated during denoising, matches Python torch.zeros_like)
   cudaMemsetAsync(

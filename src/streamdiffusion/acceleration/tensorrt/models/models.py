@@ -479,6 +479,7 @@ class UNet(BaseModel):
         cache_maxframes: int = 1,
         min_cache_maxframes: int = 1,
         max_cache_maxframes: int = 4,
+        cache_components: int = 2,
     ):
         super(UNet, self).__init__(
             fp16=fp16,
@@ -521,6 +522,8 @@ class UNet(BaseModel):
         self.cache_maxframes = cache_maxframes
         self.min_cache_maxframes = min_cache_maxframes
         self.max_cache_maxframes = max_cache_maxframes
+        # 2 = [K,V] (extended-attn only); 3 = [K,V,O] (+ feature injection — O = banked attention output)
+        self.cache_components = cache_components
         if self.use_cached_attn and self.unet is not None:
             from .utils import get_kvo_cache_info
             self.kvo_cache_shapes, self.kvo_cache_structure, self.kvo_cache_count = get_kvo_cache_info(self.unet, image_height, image_width)
@@ -654,6 +657,8 @@ class UNet(BaseModel):
         if self.use_control and self.control_inputs:
             control_names = sorted(self.control_inputs.keys())
             base_names = base_names + control_names
+        if self.cache_components >= 3:
+            base_names.append("v2v_inject_params")  # [fi_strength, threshold] — runtime-adjustable
         if self.use_cached_attn:
             base_names = base_names + self.get_kvo_cache_names("in")
         return base_names
@@ -667,7 +672,8 @@ class UNet(BaseModel):
     def get_kvo_cache_input_profile(self, min_batch, batch_size, max_batch):
         profiles = []
         for min_shape, shape, max_shape in zip(self.min_kvo_cache_shapes, self.kvo_cache_shapes, self.max_kvo_cache_shapes):
-            profile = [(2, self.min_cache_maxframes, min_batch, min_shape[0], min_shape[1]), (2, self.cache_maxframes, batch_size, shape[0], shape[1]), (2, self.max_cache_maxframes, max_batch, max_shape[0], max_shape[1])]
+            nc = self.cache_components
+            profile = [(nc, self.min_cache_maxframes, min_batch, min_shape[0], min_shape[1]), (nc, self.cache_maxframes, batch_size, shape[0], shape[1]), (nc, self.max_cache_maxframes, max_batch, max_shape[0], max_shape[1])]
             profiles.append(profile)
         return profiles
 
@@ -795,10 +801,12 @@ class UNet(BaseModel):
                     (batch_size, channels, opt_control_h, opt_control_w),   # opt  
                     (max_batch, channels, max_control_h, max_control_w),    # max
                 ]
+        if self.cache_components >= 3:
+            profile["v2v_inject_params"] = [(2,), (2,), (2,)]  # static [fi_strength, threshold]
         if self.use_cached_attn:
             for name, _profile in zip(self.get_kvo_cache_names("in"), self.get_kvo_cache_input_profile(min_batch, batch_size, max_batch)):
                 profile[name] = _profile
-        
+
         return profile
 
     def get_shape_dict(self, batch_size, image_height, image_width):
@@ -825,9 +833,11 @@ class UNet(BaseModel):
                 control_width = shape_spec["width"]
                 shape_dict[name] = (2 * batch_size, channels, control_height, control_width)
 
+        if self.cache_components >= 3:
+            shape_dict["v2v_inject_params"] = (2,)
         if self.use_cached_attn:
             for in_name, out_name, shape in zip(self.get_kvo_cache_names("in"), self.get_kvo_cache_names("out"), self.get_kvo_cache_shapes):
-                shape_dict[in_name] = (2, self.cache_maxframes, batch_size, shape[0], shape[1])
+                shape_dict[in_name] = (self.cache_components, self.cache_maxframes, batch_size, shape[0], shape[1])
                 shape_dict[out_name] = (2, 1, batch_size, shape[0], shape[1])
         
         return shape_dict
@@ -886,8 +896,11 @@ class UNet(BaseModel):
             
             base_inputs = base_inputs + control_inputs
         
+        if self.cache_components >= 3:
+            # [fi_strength, threshold] — values irrelevant to the trace (used as multiply/compare operands)
+            base_inputs.append(torch.tensor([0.95, 0.95], dtype=torch.float32, device=self.device))
         if self.use_cached_attn:
-            base_inputs = base_inputs + [torch.randn(2, self.cache_maxframes, 2 * export_batch_size, shape[0], shape[1], dtype=torch.float16).to(self.device) for shape in self.kvo_cache_shapes]
+            base_inputs = base_inputs + [torch.randn(self.cache_components, self.cache_maxframes, 2 * export_batch_size, shape[0], shape[1], dtype=torch.float16).to(self.device) for shape in self.kvo_cache_shapes]
         return tuple(base_inputs)
 
 
