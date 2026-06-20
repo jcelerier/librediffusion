@@ -99,6 +99,19 @@ void LibreDiffusionPipeline::init_engines()
                 << ipadapter_image_encoder_->tokenDim() << ")" << std::endl;
     }
   }
+
+  // CUDA graph: only the 1-step, non-V2V single_step path is capturable (multi-step has per-step host
+  // branches + a changing timestep). Gate strictly so enabling the flag on an unsupported config is a
+  // silent no-op (falls back to per-call enqueue) rather than a capture failure.
+  graph_ready_ = false;  // any engine (re)load invalidates a prior graph (buffer addresses moved)
+  graph_enabled_ = config_.use_cuda_graph
+                   && config_.denoising_steps == 1
+                   && config_.mode != PipelineMode::TEMPORAL_V2V;
+  if(config_.use_cuda_graph && !graph_enabled_)
+    std::cout << "Note: CUDA graph requested but config is not 1-step/non-V2V; using per-call enqueue"
+              << std::endl;
+  else if(graph_enabled_)
+    std::cout << "Note: CUDA graph enabled (1-step single_step capture)" << std::endl;
 }
 
 void LibreDiffusionPipeline::init_buffers()
@@ -301,8 +314,18 @@ void LibreDiffusionPipeline::reinit_buffers(const LibreDiffusionConfig& new_conf
   config_.cache_maxframes = new_config.cache_maxframes;
   config_.use_tome_cache = new_config.use_tome_cache;
   config_.tome_ratio = new_config.tome_ratio;
+  config_.use_cuda_graph = new_config.use_cuda_graph;
 
   // Reinitialize all buffers with new config
   init_buffers();
+
+  // CUDA graph: buffers were reallocated (addresses moved) AND geometry/steps/cfg may have changed -> any
+  // prior graph is stale. Re-evaluate the gate against the NEW config and force a recapture. (capture_signature
+  // would also catch the address change, but re-evaluating graph_enabled_ here keeps a 1-step->multi-step or
+  // ->V2V reconfigure from even attempting a capture.)
+  graph_ready_ = false;
+  graph_enabled_ = config_.use_cuda_graph
+                   && config_.denoising_steps == 1
+                   && config_.mode != PipelineMode::TEMPORAL_V2V;
 }
 }

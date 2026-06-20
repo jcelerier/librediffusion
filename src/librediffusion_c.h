@@ -185,6 +185,11 @@ librediffusion_config_set_denoising_batch(
     librediffusion_config_handle config, int enabled);
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_seed(librediffusion_config_handle config, uint64_t seed);
+/* CUDA graph: capture the 1-step single_step path as one graph + replay per frame (~+18% on SD-Turbo/
+ * ControlNet/IP-Adapter 1-step; no-op on multi-step/SDXL@1024/klein/V2V). Default OFF. Enable per 1-step
+ * bundle after validation. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_config_set_cuda_graph(librediffusion_config_handle config, int enabled);
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_cfg_type(
     librediffusion_config_handle config, librediffusion_cfg_type_t type);
@@ -271,6 +276,31 @@ librediffusion_pipeline_create(
  */
 LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
 librediffusion_pipeline_destroy(librediffusion_pipeline_handle pipeline);
+
+/*===========================================================================*/
+/* Engine cache management                                                   */
+/*===========================================================================*/
+/* The library keeps a shared LRU cache of deserialized TensorRT engines (default 16) so reused models
+ * load instantly and VRAM is shared across pipelines. It only evicts reactively (when loading another
+ * librediffusion engine that doesn't fit). These give the HOST explicit control so it can hand VRAM
+ * back — e.g. before loading a model through a DIFFERENT framework. Engines still held by a LIVE
+ * pipeline are never freed by these (their VRAM is released only when that pipeline is destroyed);
+ * only engines the cache alone holds (unused/previously-loaded models) are released. */
+
+/* Drop all cache entries; frees the VRAM of every engine not currently in use by a live pipeline.
+ * Returns the number of entries that were in the cache, or -1 on error. */
+LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+librediffusion_engine_cache_clear(void);
+
+/* Number of engines currently in the cache. */
+LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+librediffusion_engine_cache_count(void);
+
+/* Cap the cache's LRU size (default 16); immediately evicts the least-recently-used UNUSED engines
+ * down to the cap. Set to 0 to keep VRAM as tight as possible (engines load on demand, evicted as soon
+ * as unused). */
+LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
+librediffusion_engine_cache_set_max_entries(unsigned long long max_entries);
 
 /**
  * Initialize CUDA context for the pipeline.

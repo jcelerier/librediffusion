@@ -19,6 +19,7 @@
 #
 
 import gc
+import os
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, List, Optional, Tuple, Union
@@ -694,13 +695,23 @@ def export_onnx(
         # Determine if we need external data format for large models (like SDXL)
         is_large_model = is_sdxl or (hasattr(model, 'config') and getattr(model.config, 'sample_size', 32) >= 64)
         
+        # FP8 (e4m3) export: modelopt inserts Q/DQ nodes. Keep do_constant_folding=True (the default):
+        # folding resolves the WEIGHT-side DequantizeLinear into a quantized constant so the conv/gemm
+        # kernel shape is known to the exporter (folding OFF triggers "convolution of unknown shape" on
+        # SDXL convs). The ACTIVATION Q/DQ depend on a runtime input and are NOT folded, so the FP8
+        # semantics are preserved — this matches NVIDIA demoDiffusion's SDXL FP8 export. We only bump the
+        # opset (>=19 is required for float8e4m3 QuantizeLinear) and skip onnxslim downstream (it would
+        # re-fold/strip the Q/DQ). The klein Linear-only path used folding OFF for an unrelated reason
+        # (rms_norm decompose), which doesn't apply to the SD/SDXL UNet.
+        _is_fp8 = getattr(wrapped_model, "_fp8_quantized", False) or \
+            getattr(model, "_fp8_quantized", False) or os.environ.get("LRD_FP8_EXPORT") == "1"
         # Export ONNX normally first
         torch.onnx.export(
             wrapped_model,
             inputs,
             onnx_path,
             export_params=True,
-            opset_version=onnx_opset,
+            opset_version=max(onnx_opset, 19) if _is_fp8 else onnx_opset,
             do_constant_folding=True,
             input_names=model_data.get_input_names(),
             output_names=model_data.get_output_names(),
@@ -772,6 +783,20 @@ def optimize_onnx(
     # definitive >2GB signal — torch.onnx.export spills weights externally only when the model exceeds
     # protobuf's 2GB limit). This is robust regardless of how/where the weights were spilled (a previous
     # directory-size heuristic was unreliable: same dir as opt_dir, files deleted/flushed at scan time).
+    # FP8 (e4m3) passthrough: the export already inserted Q/DQ with no constant-folding. onnxslim /
+    # onnxsim / onnxoptimizer fold and re-fuse, which can drop or mangle the FP8 Q/DQ nodes. TRT redoes
+    # node fusion itself (engine perf unaffected), so for FP8 we DON'T optimize — just round-trip the
+    # graph (with external data) to onnx_opt_path so the FP8 Q/DQ reaches the strongly-typed TRT parser
+    # verbatim. (Matches the klein FP8 path, which builds straight from the unoptimized FP8 ONNX.)
+    if os.environ.get("LRD_FP8_EXPORT") == "1":
+        logger.info("ONNX optimize: FP8 graph — skipping onnxslim/onnxsim, round-tripping to preserve Q/DQ")
+        m = onnx.load(onnx_path, load_external_data=True)
+        onnx.save_model(m, onnx_opt_path, save_as_external_data=True,
+                        all_tensors_to_one_file=True, location="weights.pb", convert_attribute=False)
+        del m
+        gc.collect(); torch.cuda.empty_cache()
+        return
+
     use_onnxslim = False
     try:
         meta = onnx.load(onnx_path, load_external_data=False)

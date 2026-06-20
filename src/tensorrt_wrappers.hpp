@@ -195,11 +195,22 @@ private:
   static constexpr int NUM_ATTENTION_OUTPUTS = 16;
   std::vector<std::unique_ptr<CUDATensor<__half>>> attention_output_buffers_;
 
-  // ControlNet residual inputs (SD1.5: 12 down + 1 mid). Persistent buffers, bound only when the
-  // engine declares input_control_* inputs (control-aware UNet). down_residuals copied per-call.
+  // ControlNet residual inputs. Persistent buffers, bound only when the engine declares
+  // input_control_* inputs (control-aware UNet). down_residuals copied per-call.
+  //
+  // The residual COUNT and per-index geometry are NOT hardcoded: they are derived from the loaded
+  // UNet engine's own input_control_NN bindings at init (see UNetWrapper ctor). This makes the
+  // wrapper model-agnostic — SD1.5 declares 12 down (factors {1,1,1,2,2,2,4,4,4,8,8,8}), the pruned
+  // SDXS UNet declares 6 (factors {1,1,2,2,4,4}), and both are read straight from the engine instead
+  // of a fixed SD1.5 table. NUM_CONTROL_DOWN remains only as the SD1.5 fallback/MAX bound.
   static constexpr int NUM_CONTROL_DOWN = 12;
   bool has_control_inputs_ = false;
-  std::vector<std::unique_ptr<CUDATensor<__half>>> control_down_buffers_;  // 12
+  int num_control_down_ = 0;                      // actual input_control_NN count (6 SDXS / 12 SD1.5)
+  std::vector<int> control_down_ch_;              // per-index channel count, from the engine binding
+  std::vector<int> control_down_fac_;             // per-index spatial downsample factor (latent_dim / control_dim)
+  int control_mid_ch_ = 1280;                     // input_control_middle channels
+  int control_mid_fac_ = 8;                       // input_control_middle downsample factor (= last down factor)
+  std::vector<std::unique_ptr<CUDATensor<__half>>> control_down_buffers_;
   std::unique_ptr<CUDATensor<__half>> control_mid_buffer_;
 
   // IP-Adapter: engine declares an `ipadapter_scale` fp32 vector input (+ a longer ehs seq). The IP
@@ -207,6 +218,12 @@ private:
   bool has_ipadapter_ = false;
   int num_ip_layers_ = 0;
   std::unique_ptr<CUDATensor<float>> ipadapter_scale_buffer_;
+  // PINNED host staging for the per-layer scale (cudaMemcpyAsync H2D from PAGEABLE host memory is illegal
+  // inside CUDA-graph capture; pinned is capturable + faster). Cache last-uploaded values so a steady-state
+  // graph replay does NO H2D at all (re-upload only when the scale actually changes).
+  float* ipadapter_scale_pinned_ = nullptr;   // cudaMallocHost, length = ipadapter_scale_pinned_cap_
+  int ipadapter_scale_pinned_cap_ = 0;
+  std::vector<float> ipadapter_scale_last_;    // last host values uploaded (to skip redundant H2D)
 
   void loadEngine(const std::string& engine_path);
   bool needsReallocation(int batch, int height, int width, int seq_len, int hidden_dim, int pooled_dim = 0);
@@ -280,6 +297,10 @@ private:
   std::unique_ptr<CUDATensor<__half>> ehs_buffer_;
   std::unique_ptr<CUDATensor<__half>> cond_buffer_;
   std::unique_ptr<CUDATensor<float>> scale_buffer_;
+  // PINNED host staging for the scalar conditioning_scale (was H2D from a stack local -> illegal in CUDA-graph
+  // capture). Skip the H2D when unchanged so a captured graph replays H2D-free.
+  float* scale_pinned_ = nullptr;
+  float scale_last_ = -1e30f;
   std::unique_ptr<CUDATensor<__half>> text_embeds_buffer_;  // SDXL
   std::unique_ptr<CUDATensor<__half>> time_ids_buffer_;     // SDXL
   std::vector<std::unique_ptr<CUDATensor<__half>>> down_buffers_;

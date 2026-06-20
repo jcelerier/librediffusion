@@ -531,14 +531,31 @@ class UNet(BaseModel):
     def get_control(self, image_height: int = 512, image_width: int = 512) -> dict:
         """Generate ControlNet input configurations with dynamic spatial dimensions based on input resolution."""
         block_out_channels = self.unet_arch.get('block_out_channels', (320, 640, 1280, 1280))
-        
+        layers_per_block = self.unet_arch.get('layers_per_block', None)
+
         # Calculate latent space dimensions
         latent_height = image_height // 8
         latent_width = image_width // 8
-        
+
         control_inputs = {}
-        
-        if len(block_out_channels) == 3:
+
+        if layers_per_block is not None:
+            # GENERIC layout from the real diffusers down_block_res_samples structure — works for
+            # any UNet (SD1.5: 4 blocks/lpb2 -> 12; SDXL: 3/lpb2 -> 9; SDXS: 3/lpb1 -> 6). The
+            # res_samples are: conv_in (1, factor 1) + per block i: lpb residuals at factor f_i, then
+            # (if not last block) 1 downsampled residual at factor 2*f_i. Channels = block_out[i].
+            control_tensors = [(block_out_channels[0], 1)]  # conv_in
+            f = 1
+            n = len(block_out_channels)
+            for i in range(n):
+                for _ in range(layers_per_block):
+                    control_tensors.append((block_out_channels[i], f))
+                if i < n - 1:
+                    f *= 2
+                    control_tensors.append((block_out_channels[i], f))  # downsampler output
+            middle_downsample_factor = f
+            middle_channels = block_out_channels[-1]
+        elif len(block_out_channels) == 3:
             # SDXL architecture: Match UNet's exact down_block_res_samples structure
             # UNet down_block_res_samples = [initial_sample] + [block0_residuals] + [block1_residuals] + [block2_residuals]
             # Pattern: [88x88] + [88x88, 88x88, 44x44] + [44x44, 44x44, 22x22] + [22x22, 22x22]
@@ -590,17 +607,19 @@ class UNet(BaseModel):
                 'downsampling_factor': downsample_factor
             }
         
-        # Middle block uses the most downsampled resolution based on architecture
-        if len(block_out_channels) == 3:
-            # SDXL: middle block at 4x downsampling (after 3 down blocks)
-            middle_downsample_factor = 4
+        # Middle block: use the generic values when computed; else fall back per architecture.
+        if layers_per_block is not None:
+            pass  # middle_downsample_factor + middle_channels already set generically above
+        elif len(block_out_channels) == 3:
+            middle_downsample_factor = 4   # SDXL: after 3 down blocks
+            middle_channels = 1280
         else:
-            # SD1.5: middle block at 8x downsampling (after 4 down blocks)
-            middle_downsample_factor = 8
-            
+            middle_downsample_factor = 8   # SD1.5: after 4 down blocks
+            middle_channels = 1280
+
         control_inputs["input_control_middle"] = {
             'batch': self.min_batch,
-            'channels': 1280,
+            'channels': middle_channels,
             'height': max(1, latent_height // middle_downsample_factor),
             'width': max(1, latent_width // middle_downsample_factor),
             'downsampling_factor': middle_downsample_factor
