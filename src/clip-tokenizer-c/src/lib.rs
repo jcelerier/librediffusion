@@ -351,6 +351,135 @@ pub extern "C" fn clip_tokenizer_free() {
     // Nothing to do - thread-local storage is automatically cleaned up
 }
 
+// ============================================================================================
+// Qwen2/Qwen3 tokenizer for FLUX.2-klein-4B (Phase 4).
+//
+// Uses the HuggingFace `tokenizers` crate to load tokenizer.json (Qwen2 byte-level pre-tokenizer
+// regex + BPE merges + special-token table). It does NOT execute the jinja chat template, so we
+// hand-build the klein prompt formatting (validated to match the golden input_ids exactly).
+//
+// For a single user message with add_generation_prompt=True, enable_thinking=False the klein
+// chat_template renders:
+//     <|im_start|>user\n{PROMPT}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
+// then pad to max_length with <|endoftext|> (151643), attention_mask 1=real / 0=pad.
+// ============================================================================================
+use std::sync::Mutex as StdMutex;
+use tokenizers::Tokenizer as HfTokenizer;
+
+struct QwenTok {
+    tok: HfTokenizer,
+    im_start: u32,
+    im_end: u32,
+    endoftext: u32,
+    think: u32,
+    think_end: u32,
+    user_nl: Vec<u32>,
+    assistant_nl: Vec<u32>,
+    nl: Vec<u32>,
+    nlnl: Vec<u32>,
+}
+
+static QWEN_TOK: StdMutex<Option<QwenTok>> = StdMutex::new(None);
+
+fn qwen_enc_plain(tok: &HfTokenizer, text: &str) -> Vec<u32> {
+    match tok.encode(text, false) {
+        Ok(e) => e.get_ids().to_vec(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Load the Qwen tokenizer from a tokenizer.json path. 0 on success, -1 on failure. Idempotent.
+#[no_mangle]
+pub extern "C" fn qwen_tokenizer_load(tokenizer_json_path: *const c_char) -> c_int {
+    if tokenizer_json_path.is_null() {
+        return -1;
+    }
+    let path = match unsafe { CStr::from_ptr(tokenizer_json_path) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let tok = match HfTokenizer::from_file(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("qwen_tokenizer_load: {}", e);
+            return -1;
+        }
+    };
+    let im_start = match tok.token_to_id("<|im_start|>") { Some(v) => v, None => return -1 };
+    let im_end = match tok.token_to_id("<|im_end|>") { Some(v) => v, None => return -1 };
+    let endoftext = match tok.token_to_id("<|endoftext|>") { Some(v) => v, None => return -1 };
+    let think = tok.token_to_id("<think>").unwrap_or(151667);
+    let think_end = tok.token_to_id("</think>").unwrap_or(151668);
+    let user_nl = qwen_enc_plain(&tok, "user\n");
+    let assistant_nl = qwen_enc_plain(&tok, "assistant\n");
+    let nl = qwen_enc_plain(&tok, "\n");
+    let nlnl = qwen_enc_plain(&tok, "\n\n");
+
+    let mut guard = QWEN_TOK.lock().unwrap();
+    *guard = Some(QwenTok {
+        tok, im_start, im_end, endoftext, think, think_end, user_nl, assistant_nl, nl, nlnl,
+    });
+    0
+}
+
+/// Apply the klein chat template + tokenize to padded max_len ids + attention mask (both int64).
+/// Returns the number of real (non-pad) tokens, or -1 on error.
+#[no_mangle]
+pub extern "C" fn qwen_tokenizer_encode_chat(
+    prompt: *const c_char,
+    max_len: c_int,
+    out_ids: *mut i64,
+    out_mask: *mut i64,
+) -> c_int {
+    if prompt.is_null() || out_ids.is_null() || out_mask.is_null() || max_len <= 0 {
+        return -1;
+    }
+    let prompt_str = match unsafe { CStr::from_ptr(prompt) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let max_len = max_len as usize;
+    let guard = QWEN_TOK.lock().unwrap();
+    let qt = match guard.as_ref() { Some(q) => q, None => return -1 };
+
+    let mut ids: Vec<u32> = Vec::with_capacity(max_len);
+    ids.push(qt.im_start);
+    ids.extend_from_slice(&qt.user_nl);
+    ids.extend(qwen_enc_plain(&qt.tok, prompt_str));
+    ids.push(qt.im_end);
+    ids.extend_from_slice(&qt.nl);
+    ids.push(qt.im_start);
+    ids.extend_from_slice(&qt.assistant_nl);
+    ids.push(qt.think);
+    ids.extend_from_slice(&qt.nlnl);
+    ids.push(qt.think_end);
+    ids.extend_from_slice(&qt.nlnl);
+
+    if ids.len() > max_len {
+        ids.truncate(max_len);
+    }
+    let n_real = ids.len();
+    unsafe {
+        for i in 0..max_len {
+            if i < n_real {
+                *out_ids.add(i) = ids[i] as i64;
+                *out_mask.add(i) = 1;
+            } else {
+                *out_ids.add(i) = qt.endoftext as i64;
+                *out_mask.add(i) = 0;
+            }
+        }
+    }
+    n_real as c_int
+}
+
+/// Free the Qwen tokenizer (idempotent).
+#[no_mangle]
+pub extern "C" fn qwen_tokenizer_free() {
+    let mut guard = QWEN_TOK.lock().unwrap();
+    *guard = None;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

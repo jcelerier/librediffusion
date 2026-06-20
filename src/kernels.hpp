@@ -90,6 +90,15 @@ void launch_rgba_to_rgb_chw_01_fp16(
     int n, int h, int w,
     void* stream_ptr);
 
+// IP-Adapter CLIP image preprocess: RGBA uint8 (NHWC [H,W,4]) -> separable Lanczos-3 resize to
+// 224x224 -> CLIP normalize (mean/std) -> RGB fp16 NCHW [1,3,224,224]. Matches PIL LANCZOS + the HF
+// CLIPImageProcessor recipe used by diffusers_ipadapter (cos>=0.99 vs golden). Alpha ignored.
+void launch_clip_image_preprocess_fp16(
+    const void* rgba_in,
+    void* chw_out,
+    int in_h, int in_w,
+    void* stream_ptr);
+
 // Add a control residual into an accumulator (multi-ControlNet sum): acc[i] += src[i] (fp16).
 void launch_tensor_add_fp16(
     void* acc, const void* src, int n, void* stream_ptr);
@@ -117,6 +126,38 @@ void launch_rgb_to_rgba_denormalized_fp16(
     void* rgba_out,
     int n, int h, int w,
     void* stream_ptr);
+
+// ===== FLUX.2-klein-4B kernels (bf16) =====
+void launch_klein_stack3_7680(
+    const void* l0, const void* l1, const void* l2, void* out, int B, int Lt, int D, void* stream_ptr);
+void launch_klein_patchify(const void* in, void* out, int B, int C, int Lh, int Lw, void* stream_ptr);
+void launch_klein_unpatchify(const void* in, void* out, int B, int C, int Th, int Tw, void* stream_ptr);
+void launch_klein_pack(const void* in, void* out, int B, int C, int Th, int Tw, void* stream_ptr);
+void launch_klein_unpack(const void* in, void* out, int B, int C, int Th, int Tw, void* stream_ptr);
+void launch_klein_bn(const void* in, void* out, const void* mean, const void* std_, int B, int C,
+                     int HW, int denorm, void* stream_ptr);
+void launch_klein_img_ids(void* out, int Th, int Tw, void* stream_ptr);
+void launch_klein_txt_ids(void* out, int Lt, void* stream_ptr);
+void launch_klein_euler_axpy(void* x, const void* v, float dt, long N, void* stream_ptr);
+void launch_klein_randn_bf16(void* out, unsigned long long seed, long N, void* stream_ptr);
+void launch_klein_bf16_to_fp32(const void* in, void* out, long N, void* stream_ptr);
+void launch_klein_fp32_to_bf16(const void* in, void* out, long N, void* stream_ptr);
+void launch_klein_chw_to_rgba_u8(const void* in, void* out, int H, int W, void* stream_ptr);
+// Streaming / reference image:
+void launch_klein_rgba_u8_to_chw_m1p1(const void* in, void* out, int H, int W, void* stream_ptr);
+void launch_klein_ref_ids(void* out, int Th, int Tw, float t_offset, void* stream_ptr);
+void launch_klein_concat_seq(const void* a, const void* b, void* out, long Na, long Nb, void* stream_ptr);
+
+// ===== RIFE (IFNet) frame-interpolation helpers (fp16, model-agnostic) =====
+// RGBA uint8 NHWC [H,W,4] <-> RGB fp16 CHW [3,H,W] in [0,1] (RIFE's I/O domain).
+void launch_rife_rgba_to_chw01(const void* rgba, void* chw, int H, int W, void* stream_ptr);
+void launch_rife_chw01_to_rgba(const void* chw, void* rgba, int H, int W, void* stream_ptr);
+// Pack B (img0,img1) pairs into engine input [B,6,H,W] from prevs/nexts [B,3,H,W].
+void launch_rife_pack_pairs(
+    const void* prevs, const void* nexts, void* out, int B, int H, int W, void* stream_ptr);
+// Interleave subdivision level: dst[2B-1] = {src[k] at even, mids[k] at odd}.
+void launch_rife_interleave(
+    const void* src, const void* mids, void* dst, int B, int H, int W, void* stream_ptr);
 
 // Simple implementation of launch_concat using cudaMemcpy
 inline void launch_concat(

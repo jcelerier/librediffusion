@@ -169,6 +169,11 @@ librediffusion_config_set_model_type(
     case MODEL_SDXL_TURBO:
       config->cpp_config.model_type = librediffusion::ModelType::SDXL_TURBO;
       break;
+    case MODEL_FLUX2_KLEIN_4B:
+      // klein uses the standalone librediffusion_flux2_* C-API (Flux2Pipeline), not the SD
+      // predict_x0 path; the config model_type is recorded for completeness.
+      config->cpp_config.model_type = librediffusion::ModelType::FLUX2_KLEIN_4B;
+      break;
     default:
       return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
   }
@@ -760,6 +765,35 @@ librediffusion_config_set_ipadapter(
   return try_catch_wrapper([&]() {
     config->cpp_config.ipadapter_num_tokens = num_image_tokens;
     config->cpp_config.ipadapter_scale = scale;
+  });
+}
+
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_config_set_ipadapter_image_encoder(
+    librediffusion_config_handle config, const char* image_encoder_engine,
+    const char* image_proj_engine)
+{
+  if (!config)
+    return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  if (!image_encoder_engine || !image_proj_engine)
+    return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  return try_catch_wrapper([&]() {
+    config->cpp_config.ipadapter_image_encoder_path = image_encoder_engine;
+    config->cpp_config.ipadapter_image_proj_path = image_proj_engine;
+  });
+}
+
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_ipadapter_image(
+    librediffusion_pipeline_handle pipeline, const uint8_t* cpu_rgba, int img_height,
+    int img_width)
+{
+  if (!pipeline || !pipeline->cpp_pipeline)
+    return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  if (!cpu_rgba)
+    return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  return try_catch_wrapper([&]() {
+    pipeline->cpp_pipeline->set_ipadapter_image(cpu_rgba, img_height, img_width);
   });
 }
 
