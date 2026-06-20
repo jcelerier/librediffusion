@@ -348,6 +348,26 @@ librediffusion_config_set_vae_decoder(
   });
 }
 
+LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+librediffusion_config_add_controlnet(
+    librediffusion_config_handle config, const char* engine_path, float conditioning_scale)
+{
+  // Returns the new ControlNet index (>=0), or -1 on error. Preprocessing is EXTERNAL: feed each
+  // net's control image per-frame via librediffusion_set_controlnet_cond[_rgba](pipe, index, ...).
+  if (!config || !engine_path)
+    return -1;
+  try
+  {
+    config->cpp_config.controlnets.push_back(
+        {std::string(engine_path), conditioning_scale});
+    return (int)config->cpp_config.controlnets.size() - 1;
+  }
+  catch (...)
+  {
+    return -1;
+  }
+}
+
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_timestep_indices(
     librediffusion_config_handle config, const int* indices, size_t count)
@@ -688,6 +708,45 @@ librediffusion_set_init_noise(
 
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->set_init_noise(to_half_ptr(noise));
+  });
+}
+
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_controlnet_cond(
+    librediffusion_pipeline_handle pipeline, int index, const librediffusion_half_t* cond,
+    int img_height, int img_width)
+{
+  if (!pipeline || !pipeline->cpp_pipeline)
+    return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  if (!cond)
+    return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  return try_catch_wrapper([&]() {
+    pipeline->cpp_pipeline->set_controlnet_cond(index, to_half_ptr(cond), img_height, img_width);
+  });
+}
+
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_controlnet_cond_rgba(
+    librediffusion_pipeline_handle pipeline, int index, const uint8_t* cpu_rgba,
+    int img_height, int img_width)
+{
+  if (!pipeline || !pipeline->cpp_pipeline)
+    return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  if (!cpu_rgba)
+    return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  return try_catch_wrapper([&]() {
+    pipeline->cpp_pipeline->set_controlnet_cond_rgba(index, cpu_rgba, img_height, img_width);
+  });
+}
+
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_controlnet_scale(
+    librediffusion_pipeline_handle pipeline, int index, float scale)
+{
+  if (!pipeline || !pipeline->cpp_pipeline)
+    return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  return try_catch_wrapper([&]() {
+    pipeline->cpp_pipeline->set_controlnet_scale(index, scale);
   });
 }
 
