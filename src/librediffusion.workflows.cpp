@@ -123,12 +123,54 @@ void LibreDiffusionPipeline::txt2img_sd_turbo_impl(
   CUDATensor<__half> model_pred(latent_size);
   if(config_.model_type == ModelType::SDXL_TURBO)
   {
-    unet_->forward_sdxl(
+    if(controlnet_enabled_)
+    {
+      // SDXL + ControlNet in the single-step turbo txt2img path (mirrors the batched site in
+      // predict_x0_batch_impl_multi_step_batched ~386): run every net with the SDXL conditioning,
+      // SUM residuals, inject via forward_controlnet_sdxl. forward_sdxl alone leaves the control
+      // residual inputs unset on this control-aware engine -> "Not all input dimensions specified".
+      const __half* down_ptrs[ControlNetWrapper::MAX_DOWN];
+      const __half* mid_ptr = nullptr;
+      int down_count = 0;
+      run_controlnets(vae_encoded_x_t_latent_->data(), sub_timesteps_->data(),
+                      prompt_embeds_->data(),
+                      text_embeds_->data(), time_ids_->data(), config_.batch_size,
+                      config_.text_seq_len, config_.text_hidden_dim,
+                      config_.pooled_embedding_dim, down_ptrs, &mid_ptr, down_count, stream);
+      unet_->forward_controlnet_sdxl(
+          unet_input_latent_fp32.data(), sub_timesteps_->data(), prompt_embeds_->data(),
+          text_embeds_->data(), time_ids_->data(), down_ptrs, mid_ptr,
+          model_pred.data(), config_.batch_size, config_.latent_height, config_.latent_width,
+          config_.text_seq_len, config_.text_hidden_dim,
+          config_.pooled_embedding_dim, stream);
+    }
+    else
+    {
+      unet_->forward_sdxl(
+          unet_input_latent_fp32.data(), sub_timesteps_->data(), prompt_embeds_->data(),
+          text_embeds_->data(), time_ids_->data(),
+          model_pred.data(), config_.batch_size, config_.latent_height, config_.latent_width,
+          config_.text_seq_len, config_.text_hidden_dim,
+          config_.pooled_embedding_dim, stream);
+    }
+  }
+  else if(controlnet_enabled_)
+  {
+    // ControlNet (SD1.5) in the single-step turbo txt2img path: run every net, SUM residuals,
+    // inject via forward_controlnet. Without this branch a control-aware unet.engine hits plain
+    // forward() -> "Not all input dimensions specified".
+    const __half* down_ptrs[ControlNetWrapper::MAX_DOWN];
+    const __half* mid_ptr = nullptr;
+    int down_count = 0;
+    run_controlnets(vae_encoded_x_t_latent_->data(), sub_timesteps_->data(),
+                    prompt_embeds_->data(),
+                    nullptr, nullptr, config_.batch_size, config_.text_seq_len,
+                    config_.text_hidden_dim, 0, down_ptrs, &mid_ptr, down_count, stream);
+    unet_->forward_controlnet(
         unet_input_latent_fp32.data(), sub_timesteps_->data(), prompt_embeds_->data(),
-        text_embeds_->data(), time_ids_->data(),
+        down_ptrs, mid_ptr,
         model_pred.data(), config_.batch_size, config_.latent_height, config_.latent_width,
-        config_.text_seq_len, config_.text_hidden_dim,
-        config_.pooled_embedding_dim, stream);
+        config_.text_seq_len, config_.text_hidden_dim, stream);
   }
   else
   {

@@ -71,6 +71,8 @@ UNetWrapper::UNetWrapper(const std::string& engine_path, bool use_v2v)
 UNetWrapper::~UNetWrapper()
 {
   // Unique_ptrs will handle cleanup automatically
+  if(ipadapter_scale_pinned_)
+    cudaFreeHost(ipadapter_scale_pinned_);
 }
 
 void UNetWrapper::loadEngine(const std::string& engine_path)
@@ -110,14 +112,22 @@ void UNetWrapper::loadEngine(const std::string& engine_path)
                 << timestep_fixed_extent_ << " for " << engine_path << std::endl;
     }
 
-    // Detect a control-aware UNet engine: it declares input_control_00 (+ ..11 + _middle). When
+    // Detect a control-aware UNet engine: it declares input_control_00 (+ ..NN + _middle). When
     // present, forward_controlnet() binds the ControlNet residuals; plain forward() leaves them unset
     // (which would fail allInputDimensionsSpecified — callers must use forward_controlnet for these).
+    //
+    // CRUCIAL: the residual COUNT and per-index geometry are read from the engine, NOT hardcoded to
+    // the SD1.5 12-residual table. SD1.5 declares 12 input_control_NN (dynamic spatial), the pruned
+    // SDXS UNet declares 6 (static spatial). We enumerate them here so forward_controlnet() iterates
+    // 0..count-1 with the engine's actual channels and the correct downsample factor.
     for(int i = 0; i < eng->getNbIOTensors(); i++)
     {
       const char* tn = eng->getIOTensorName(i);
       if(!tn) continue;
       std::string nm = tn;
+      if(nm.rfind("input_control_", 0) == 0 && nm != "input_control_middle"
+         && eng->getTensorIOMode(tn) == nvinfer1::TensorIOMode::kINPUT)
+        num_control_down_++;
       if(nm == "input_control_00")
       {
         has_control_inputs_ = true;
@@ -136,6 +146,64 @@ void UNetWrapper::loadEngine(const std::string& engine_path)
                   << (num_ip_layers_ ? std::to_string(num_ip_layers_) : std::string("dynamic"))
                   << " layers) for " << engine_path << std::endl;
       }
+    }
+
+    // Derive the per-residual ControlNet geometry from the engine's input_control_NN bindings, so the
+    // wrapper is model-agnostic (SD1.5 = 12 down, pruned SDXS = 6 down, ...). For each input_control_NN
+    // we read the channel count, and the spatial downsample factor relative to the base latent.
+    //  - The channel dim (d[1]) is fixed on every control-aware engine -> read directly.
+    //  - The factor = base_latent_dim / control_dim. On a STATIC engine (e.g. SDXS) the control spatial
+    //    dim and `sample`'s spatial dim are both declared (>0), so factor = sampleH / controlH exactly.
+    //    On a DYNAMIC-spatial engine (SD1.5/SDXL trace, declares -1) we fall back to the canonical
+    //    diffusers factor table selected by the residual count.
+    if(has_control_inputs_ && num_control_down_ > 0)
+    {
+      control_down_ch_.assign(num_control_down_, 0);
+      control_down_fac_.assign(num_control_down_, 1);
+
+      // sample's spatial extent (>0 only on a fully-static engine) lets us recover factors directly.
+      nvinfer1::Dims sd = eng->getTensorShape("sample");
+      const int sampleH = (sd.nbDims >= 3 && sd.d[2] > 0) ? (int)sd.d[2] : -1;
+
+      bool static_factors_ok = (sampleH > 0);
+      for(int i = 0; i < num_control_down_; i++)
+      {
+        char name[24];
+        std::snprintf(name, sizeof(name), "input_control_%02d", i);
+        nvinfer1::Dims d = eng->getTensorShape(name);
+        control_down_ch_[i] = (d.nbDims >= 2 && d.d[1] > 0) ? (int)d.d[1] : 0;
+        if(static_factors_ok && d.nbDims >= 3 && d.d[2] > 0)
+          control_down_fac_[i] = sampleH / (int)d.d[2];
+        else
+          static_factors_ok = false;  // any dynamic dim -> use the table fallback below
+      }
+      {
+        nvinfer1::Dims dm = eng->getTensorShape("input_control_middle");
+        control_mid_ch_ = (dm.nbDims >= 2 && dm.d[1] > 0) ? (int)dm.d[1] : 1280;
+        if(static_factors_ok && dm.nbDims >= 3 && dm.d[2] > 0)
+          control_mid_fac_ = sampleH / (int)dm.d[2];
+      }
+
+      if(!static_factors_ok)
+      {
+        // Dynamic-spatial engine: spatial dims are -1, so they can't be read here. Use the canonical
+        // diffusers factor sequence keyed by the residual count (preserves the proven SD1.5/SDXL path).
+        static const int kFac12[12] = {1, 1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8};  // SD1.5 (12 down)
+        static const int kFac9[9] = {1, 1, 1, 2, 2, 2, 4, 4, 4};             // SDXL trace (9 down)
+        static const int kFac6[6] = {1, 1, 2, 2, 4, 4};                      // SDXS (6 down)
+        const int* fac = (num_control_down_ == 9) ? kFac9
+                         : (num_control_down_ == 6) ? kFac6
+                                                    : kFac12;
+        for(int i = 0; i < num_control_down_ && i < 12; i++)
+          control_down_fac_[i] = fac[i];
+        control_mid_fac_ = control_down_fac_[num_control_down_ - 1];  // mid = deepest down factor
+      }
+
+      std::cout << "Note: control-aware UNet geometry = " << num_control_down_
+                << " down residuals, factors {";
+      for(int i = 0; i < num_control_down_; i++)
+        std::cout << control_down_fac_[i] << (i + 1 < num_control_down_ ? "," : "");
+      std::cout << "}, mid factor " << control_mid_fac_ << " (" << engine_path << ")" << std::endl;
     }
   }
 }
@@ -193,7 +261,7 @@ void UNetWrapper::forward(
   // CRITICAL: Synchronize stream after copies to ensure TensorRT reads complete data
   // Even though Python doesn't explicitly sync, tensor.copy_() likely handles this internally
   // Without this, TensorRT may read stale/incomplete data from persistent buffers
-  cudaStreamSynchronize(stream);
+  /* LRD-PERF: redundant pre-enqueue sync removed (same-stream async copies already ordered) */
 
   // CRITICAL: Set input shapes BEFORE setting tensor addresses (matches Python's exact order)
   // Python calls set_input_shape() in infer(), right before set_tensor_address()
@@ -295,15 +363,17 @@ void UNetWrapper::forward_controlnet(
     __half* output, int batch, int height, int width, int seq_len, int hidden_dim,
     cudaStream_t stream)
 {
-  // SD1.5 ControlNet residual geometry (matches UNet.get_control / the engine's input_control_*):
-  //   down idx:  0   1   2    3    4    5    6     7     8     9    10    11
-  //   channels: 320 320 320  320  640  640  640  1280  1280  1280  1280  1280
-  //   factor:    1   1   1    2    2    2    4     4     4     8     8     8
-  //   mid: 1280 @ factor 8
-  static const int kDownCh[NUM_CONTROL_DOWN]
-      = {320, 320, 320, 320, 640, 640, 640, 1280, 1280, 1280, 1280, 1280};
-  static const int kDownFac[NUM_CONTROL_DOWN] = {1, 1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8};
-  const int kMidCh = 1280, kMidFac = 8;
+  // ControlNet residual geometry, DERIVED from this UNet engine's input_control_NN bindings at init
+  // (see ctor). This is model-agnostic: SD1.5 yields 12 down with factors {1,1,1,2,2,2,4,4,4,8,8,8},
+  // the pruned SDXS UNet yields 6 down with factors {1,1,2,2,4,4}. Do NOT hardcode the SD1.5 table:
+  // the caller (run_controlnets) hands us exactly num_control_down_ residual pointers from the
+  // matching ControlNet engine, and the UNet engine expects exactly these shapes.
+  const int kNumDown = num_control_down_;
+  const int* kDownCh = control_down_ch_.data();
+  const int* kDownFac = control_down_fac_.data();
+  const int kMidCh = control_mid_ch_, kMidFac = control_mid_fac_;
+  if(kNumDown <= 0)
+    throw std::runtime_error("forward_controlnet called on a non-control-aware UNet engine");
 
   int sample_size = batch * 4 * height * width;
   int timestep_extent = (timestep_fixed_extent_ > 0) ? timestep_fixed_extent_ : batch;
@@ -318,8 +388,8 @@ void UNetWrapper::forward_controlnet(
     encoder_hidden_states_buffer_ = std::make_unique<CUDATensor<__half>>(encoder_size);
     output_buffer_ = std::make_unique<CUDATensor<__half>>(output_size);
     control_down_buffers_.clear();
-    control_down_buffers_.resize(NUM_CONTROL_DOWN);
-    for(int i = 0; i < NUM_CONTROL_DOWN; i++)
+    control_down_buffers_.resize(kNumDown);
+    for(int i = 0; i < kNumDown; i++)
     {
       int h = height / kDownFac[i], w = width / kDownFac[i];
       control_down_buffers_[i]
@@ -343,7 +413,7 @@ void UNetWrapper::forward_controlnet(
   cudaMemcpyAsync(encoder_hidden_states_buffer_->data(), encoder_hidden_states,
                   encoder_size * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
   // Copy the control residuals into persistent buffers (stable addresses for setTensorAddress).
-  for(int i = 0; i < NUM_CONTROL_DOWN; i++)
+  for(int i = 0; i < kNumDown; i++)
   {
     int h = height / kDownFac[i], w = width / kDownFac[i];
     cudaMemcpyAsync(control_down_buffers_[i]->data(), down_residuals[i],
@@ -353,7 +423,7 @@ void UNetWrapper::forward_controlnet(
   cudaMemcpyAsync(control_mid_buffer_->data(), mid_residual,
                   (size_t)batch * kMidCh * (height / kMidFac) * (width / kMidFac) * sizeof(__half),
                   cudaMemcpyDeviceToDevice, stream);
-  cudaStreamSynchronize(stream);
+  /* LRD-PERF: redundant pre-enqueue sync removed (same-stream async copies already ordered) */
 
   // Set core shapes.
   nvinfer1::Dims4 sample_dims{batch, 4, height, width};
@@ -369,7 +439,7 @@ void UNetWrapper::forward_controlnet(
     throw std::runtime_error("Failed to set encoder_hidden_states shape");
 
   // Set control residual shapes + addresses.
-  for(int i = 0; i < NUM_CONTROL_DOWN; i++)
+  for(int i = 0; i < kNumDown; i++)
   {
     char name[24];
     std::snprintf(name, sizeof(name), "input_control_%02d", i);
@@ -441,10 +511,27 @@ void UNetWrapper::forward_ipadapter(
                   cudaMemcpyDeviceToDevice, stream);
   cudaMemcpyAsync(encoder_hidden_states_buffer_->data(), encoder_hidden_states,
                   encoder_size * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
-  // ipadapter_scale is host-supplied (a small per-layer vector) -> H2D.
-  cudaMemcpyAsync(ipadapter_scale_buffer_->data(), ipadapter_scale, num_ip_layers * sizeof(float),
-                  cudaMemcpyHostToDevice, stream);
-  cudaStreamSynchronize(stream);
+  // ipadapter_scale is host-supplied (a small per-layer vector) -> H2D. Stage through PINNED host memory so
+  // this copy is legal inside CUDA-graph capture (pageable H2D is not) and skip the copy entirely when the
+  // values are unchanged (so a captured graph replays with NO H2D, and the warm pre-capture enqueue baked
+  // the correct device value). On change while a graph exists, the caller-side signature/grow path recaptures.
+  if(ipadapter_scale_pinned_cap_ < num_ip_layers)
+  {
+    if(ipadapter_scale_pinned_) cudaFreeHost(ipadapter_scale_pinned_);
+    cudaMallocHost((void**)&ipadapter_scale_pinned_, num_ip_layers * sizeof(float));
+    ipadapter_scale_pinned_cap_ = num_ip_layers;
+    ipadapter_scale_last_.clear();
+  }
+  bool scale_changed = (int)ipadapter_scale_last_.size() != num_ip_layers
+      || std::memcmp(ipadapter_scale_last_.data(), ipadapter_scale, num_ip_layers * sizeof(float)) != 0;
+  if(scale_changed)
+  {
+    std::memcpy(ipadapter_scale_pinned_, ipadapter_scale, num_ip_layers * sizeof(float));
+    cudaMemcpyAsync(ipadapter_scale_buffer_->data(), ipadapter_scale_pinned_,
+                    num_ip_layers * sizeof(float), cudaMemcpyHostToDevice, stream);
+    ipadapter_scale_last_.assign(ipadapter_scale, ipadapter_scale + num_ip_layers);
+  }
+  /* LRD-PERF: redundant pre-enqueue sync removed (same-stream async copies already ordered) */
 
   nvinfer1::Dims4 sample_dims{batch, 4, height, width};
   nvinfer1::Dims timestep_dims; timestep_dims.nbDims = 1; timestep_dims.d[0] = timestep_extent;
@@ -544,7 +631,7 @@ void UNetWrapper::forward_controlnet_sdxl(
   cudaMemcpyAsync(control_mid_buffer_->data(), mid_residual,
                   (size_t)batch * kMidCh * (height / kMidFac) * (width / kMidFac) * sizeof(__half),
                   cudaMemcpyDeviceToDevice, stream);
-  cudaStreamSynchronize(stream);
+  /* LRD-PERF: redundant pre-enqueue sync removed (same-stream async copies already ordered) */
 
   nvinfer1::Dims4 sample_dims{batch, 4, height, width};
   nvinfer1::Dims timestep_dims; timestep_dims.nbDims = 1; timestep_dims.d[0] = timestep_extent;
@@ -658,7 +745,7 @@ void UNetWrapper::forward_sdxl(
       time_ids_size * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
 
   // CRITICAL: Synchronize stream after copies to ensure TensorRT reads complete data
-  cudaStreamSynchronize(stream);
+  /* LRD-PERF: redundant pre-enqueue sync removed (same-stream async copies already ordered) */
 
   // CRITICAL: Set input shapes BEFORE setting tensor addresses (matches Python's exact order)
   nvinfer1::Dims4 sample_dims{batch, 4, height, width};
@@ -749,7 +836,11 @@ ControlNetWrapper::ControlNetWrapper(const std::string& engine_path)
   loadEngine(engine_path);
 }
 
-ControlNetWrapper::~ControlNetWrapper() = default;
+ControlNetWrapper::~ControlNetWrapper()
+{
+  if(scale_pinned_)
+    cudaFreeHost(scale_pinned_);
+}
 
 void ControlNetWrapper::loadEngine(const std::string& engine_path)
 {
@@ -799,15 +890,20 @@ void ControlNetWrapper::forward(
     int batch, int height, int width, int img_height, int img_width, int seq_len, int hidden_dim,
     int pooled_dim, const __half** down_out, const __half** mid_out, cudaStream_t stream)
 {
-  // Per-arch residual geometry. SD1.5: 12 down, factors up to 8. SDXL: 9 down, factors up to 4.
+  // Per-arch residual geometry, selected by the engine's detected down_block_* COUNT (num_down_) — NOT
+  // by is_sdxl_ alone — so pruned SD-family UNets (e.g. SDXS = 6 down) get the right channels/factors
+  // for their OUTPUT buffers. SD1.5 = 12 (factors up to 8), SDXL = 9 (up to 4), SDXS = 6 (up to 4).
   static const int kSD15Ch[12] = {320,320,320,320,640,640,640,1280,1280,1280,1280,1280};
   static const int kSD15Fac[12] = {1,1,1,2,2,2,4,4,4,8,8,8};
   static const int kSDXLCh[9] = {320,320,320,320,640,640,640,1280,1280};
   static const int kSDXLFac[9] = {1,1,1,2,2,2,4,4,4};
-  const int* kDownCh = is_sdxl_ ? kSDXLCh : kSD15Ch;
-  const int* kDownFac = is_sdxl_ ? kSDXLFac : kSD15Fac;
-  const int kMidCh = 1280, kMidFac = is_sdxl_ ? 4 : 8;
+  static const int kSDXSCh[6] = {320,320,320,640,640,1280};
+  static const int kSDXSFac[6] = {1,1,2,2,4,4};
   const int nd = num_down_;
+  const int* kDownCh = (nd == 6) ? kSDXSCh : is_sdxl_ ? kSDXLCh : kSD15Ch;
+  const int* kDownFac = (nd == 6) ? kSDXSFac : is_sdxl_ ? kSDXLFac : kSD15Fac;
+  // mid factor = the deepest down factor: SD1.5 8, SDXL/SDXS 4.
+  const int kMidCh = 1280, kMidFac = (nd == 6 || is_sdxl_) ? 4 : 8;
 
   const int sample_size = batch * 4 * height * width;
   const int ehs_size = batch * seq_len * hidden_dim;
@@ -850,8 +946,16 @@ void ControlNetWrapper::forward(
                   cudaMemcpyDeviceToDevice, stream);
   cudaMemcpyAsync(cond_buffer_->data(), controlnet_cond, cond_size * sizeof(__half),
                   cudaMemcpyDeviceToDevice, stream);
-  cudaMemcpyAsync(scale_buffer_->data(), &conditioning_scale, sizeof(float),
-                  cudaMemcpyHostToDevice, stream);
+  // conditioning_scale: stage through pinned host memory (capturable) + skip when unchanged.
+  if(!scale_pinned_)
+    cudaMallocHost((void**)&scale_pinned_, sizeof(float));
+  if(conditioning_scale != scale_last_)
+  {
+    *scale_pinned_ = conditioning_scale;
+    cudaMemcpyAsync(scale_buffer_->data(), scale_pinned_, sizeof(float),
+                    cudaMemcpyHostToDevice, stream);
+    scale_last_ = conditioning_scale;
+  }
   if(is_sdxl_)
   {
     cudaMemcpyAsync(text_embeds_buffer_->data(), text_embeds, batch * pooled_dim * sizeof(__half),
@@ -859,7 +963,7 @@ void ControlNetWrapper::forward(
     cudaMemcpyAsync(time_ids_buffer_->data(), time_ids, batch * 6 * sizeof(__half),
                     cudaMemcpyDeviceToDevice, stream);
   }
-  cudaStreamSynchronize(stream);
+  /* LRD-PERF: redundant pre-enqueue sync removed (same-stream async copies already ordered) */
 
   nvinfer1::Dims4 sample_dims{batch, 4, height, width};
   nvinfer1::Dims ts_dims; ts_dims.nbDims = 1; ts_dims.d[0] = batch;
@@ -1001,7 +1105,7 @@ void VAEEncoderWrapper::encode(
 
   // CRITICAL: Synchronize stream to ensure conversion is complete before TensorRT uses the buffer
   // Without this, TensorRT might read incomplete/wrong data from the FP32 buffer
-  cudaStreamSynchronize(stream);
+  /* LRD-PERF: redundant pre-enqueue sync removed (same-stream async copies already ordered) */
 
   if(!context_->allInputDimensionsSpecified())
   {
@@ -1060,7 +1164,7 @@ void VAEEncoderWrapper::encode(
       images_fp32_buffer_->data(), (const void*)images, images_elements * sizeof(float),
       cudaMemcpyDeviceToDevice, stream);
 
-  cudaStreamSynchronize(stream);
+  /* LRD-PERF: redundant pre-enqueue sync removed (same-stream async copies already ordered) */
 
   if(!context_->allInputDimensionsSpecified())
   {

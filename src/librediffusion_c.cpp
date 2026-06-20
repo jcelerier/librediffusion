@@ -270,6 +270,15 @@ librediffusion_config_set_denoising_batch(
 }
 
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_config_set_cuda_graph(librediffusion_config_handle config, int enabled)
+{
+  if (!config)
+    return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  config->cpp_config.use_cuda_graph = (enabled != 0);
+  return LIBREDIFFUSION_SUCCESS;
+}
+
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_seed(librediffusion_config_handle config, uint64_t seed)
 {
   if (!config)
@@ -497,6 +506,43 @@ LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
 librediffusion_pipeline_destroy(librediffusion_pipeline_handle pipeline)
 {
   delete pipeline;
+}
+
+/*===========================================================================*/
+/* Engine cache management                                                   */
+/*===========================================================================*/
+// Host control over the shared TensorRT engine LRU cache. Engines still held by a LIVE pipeline stay
+// resident (their VRAM is freed only when that pipeline is destroyed); these only release engines the
+// cache alone holds — i.e. unused/previously-loaded models. Use before loading a model through another
+// framework to hand back the VRAM our cache is sitting on.
+
+LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+librediffusion_engine_cache_clear(void)
+{
+  try
+  {
+    auto& engines = librediffusion::GlobalEngineCache::instance().engines();
+    int n = (int)engines.size();
+    engines.clear();   // drops the cache's refs; unused engines' VRAM is freed now, in-use ones survive
+    return n;
+  }
+  catch (...)
+  {
+    return -1;
+  }
+}
+
+LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+librediffusion_engine_cache_count(void)
+{
+  return (int)librediffusion::GlobalEngineCache::instance().engines().size();
+}
+
+LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
+librediffusion_engine_cache_set_max_entries(unsigned long long max_entries)
+{
+  // Caps the LRU; evicts the least-recently-used UNUSED engines down to the cap immediately.
+  librediffusion::GlobalEngineCache::instance().engines().set_max_entries((size_t)max_entries);
 }
 
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL

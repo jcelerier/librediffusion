@@ -594,8 +594,16 @@ class GlobalEngineCache
 public:
   static GlobalEngineCache& instance()
   {
-    static GlobalEngineCache cache;
-    return cache;
+    // INTENTIONALLY LEAKED (heap, never deleted). A function-local `static GlobalEngineCache cache;`
+    // would register an atexit destructor that runs `delete engine_/runtime_` on every cached TRT
+    // object at process exit — but the CUDA runtime installs its OWN atexit handlers, so the driver /
+    // primary context is frequently torn down BEFORE this destructor runs, and the TRT teardown then
+    // segfaults inside libnvinfer (observed: GlobalEngineCache::~GlobalEngineCache -> SIGSEGV). The OS
+    // reclaims all GPU memory on process exit regardless, so skipping final teardown is free. Runtime
+    // VRAM management is unaffected: clear()/evict_one()/evict_if_needed() still destroy engines while
+    // CUDA is alive. Call clear() explicitly before shutdown if deterministic teardown is ever needed.
+    static GlobalEngineCache* cache = new GlobalEngineCache();
+    return *cache;
   }
 
   TensorRTEngineCache& engines()

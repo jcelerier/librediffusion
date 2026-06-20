@@ -3,6 +3,7 @@
 #include "kernels.hpp"
 
 #include <cassert>
+#include <iostream>
 namespace librediffusion
 {
 
@@ -19,7 +20,12 @@ void LibreDiffusionPipeline::run_controlnets(
 
   const __half* net_down[ControlNetWrapper::MAX_DOWN];
   const __half* net_mid = nullptr;
-  CUDATensor<__half> cond_tiled((size_t)unet_batch_size * cond_row);
+  // Persistent (grow-on-first-use): a per-frame stack CUDATensor here would do an illegal cudaMalloc inside
+  // CUDA-graph capture. Same shape every frame for a fixed config.
+  const size_t cond_tiled_n = (size_t)unet_batch_size * cond_row;
+  if(!controlnet_cond_tiled_ || controlnet_cond_tiled_->size() < cond_tiled_n)
+    controlnet_cond_tiled_ = std::make_unique<CUDATensor<__half>>(cond_tiled_n);
+  __half* cond_tiled = controlnet_cond_tiled_->data();
   int nd = 0;
 
   for(size_t k = 0; k < controlnets_.size(); k++)
@@ -29,10 +35,10 @@ void LibreDiffusionPipeline::run_controlnets(
                                "(call set_controlnet_cond[_rgba])");
     // Tile this net's single cond row to unet_batch_size.
     for(int i = 0; i < unet_batch_size; i++)
-      cudaMemcpyAsync(cond_tiled.data() + (size_t)i * cond_row, controlnet_cond_[k]->data(),
+      cudaMemcpyAsync(cond_tiled + (size_t)i * cond_row, controlnet_cond_[k]->data(),
                       cond_row * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
     controlnets_[k]->forward(
-        sample_fp16, timestep, ehs, cond_tiled.data(), controlnet_scales_[k],
+        sample_fp16, timestep, ehs, cond_tiled, controlnet_scales_[k],
         text_embeds, time_ids, unet_batch_size, config_.latent_height, config_.latent_width,
         img_h, img_w, seq_len, hidden_dim, pooled_dim, net_down, &net_mid, stream);
     nd = controlnets_[k]->numDown();
@@ -148,19 +154,27 @@ void LibreDiffusionPipeline::scheduler_step_batch(
 void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
     const __half* x_t_latent_in, __half* x_0_pred_out, cudaStream_t stream)
 {
-  // FIXME there's still a lot of spurious copies and allocations in there
   const int latent_size
       = config_.batch_size * 4 * config_.latent_height * config_.latent_width;
 
-  // Allocate temporary buffers
-  CUDATensor<__half> x_t_latent(latent_size);
-  CUDATensor<__half> model_pred(latent_size);
+  // Persistent scratch (hoisted from per-call stack CUDATensors -> no per-frame cudaMalloc; same
+  // device buffer reused every frame). model_pred + denoised are sized to the batched post-cfg-merge
+  // size (single_size == denoised_size) so the cfg branches below WRITE into model_pred rather than
+  // reallocating it. Each is a reference to its persistent buffer so all downstream uses are unchanged.
+  if(!mp_x_t_latent_ || (int)mp_x_t_latent_->size() < latent_size)
+    mp_x_t_latent_ = std::make_unique<CUDATensor<__half>>(latent_size);
+  CUDATensor<__half>& x_t_latent = *mp_x_t_latent_;
 
   // denoised buffer needs to be large enough for batched denoising
   int total_batch
       = config_.batch_size + (config_.denoising_steps - 1) * config_.frame_buffer_size;
   int denoised_size = total_batch * 4 * config_.latent_height * config_.latent_width;
-  CUDATensor<__half> denoised(denoised_size);
+  if(!mp_model_pred_ || (int)mp_model_pred_->size() < denoised_size)
+    mp_model_pred_ = std::make_unique<CUDATensor<__half>>(denoised_size);
+  CUDATensor<__half>& model_pred = *mp_model_pred_;
+  if(!mp_denoised_ || (int)mp_denoised_->size() < denoised_size)
+    mp_denoised_ = std::make_unique<CUDATensor<__half>>(denoised_size);
+  CUDATensor<__half>& denoised = *mp_denoised_;
 
   x_t_latent.load_d2d(x_t_latent_in, latent_size, stream);
 
@@ -173,11 +187,13 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
     size_t input_sizes[2]
         = {latent_size * sizeof(__half), x_t_latent_buffer_->size() * sizeof(__half)};
 
-    CUDATensor<__half> concatenated(latent_size + x_t_latent_buffer_->size());
+    const size_t concat_n = (size_t)latent_size + x_t_latent_buffer_->size();
+    if(!mp_concatenated_ || mp_concatenated_->size() < concat_n)
+      mp_concatenated_ = std::make_unique<CUDATensor<__half>>(concat_n);
+    CUDATensor<__half>& concatenated = *mp_concatenated_;
     launch_concat(input_ptrs, 2, input_sizes, concatenated.data(), stream);
 
-    // DEBUG: Verify concatenation worked
-    cudaStreamSynchronize(stream);
+    // LRD-PERF: removed leftover DEBUG sync (concat is stream-ordered before its consumer)
 
     int total_batch
         = config_.batch_size + (config_.denoising_steps - 1) * config_.frame_buffer_size;
@@ -278,12 +294,14 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
     // Convert FP16 latent input to FP32 for TensorRT engine
     int latent_elements
         = unet_batch_size * 4 * config_.latent_height * config_.latent_width;
-    CUDATensor<float> unet_input_latent_fp32(latent_elements);
+    if(!mp_unet_input_latent_fp32_ || (int)mp_unet_input_latent_fp32_->size() < latent_elements)
+      mp_unet_input_latent_fp32_ = std::make_unique<CUDATensor<float>>(latent_elements);
+    CUDATensor<float>& unet_input_latent_fp32 = *mp_unet_input_latent_fp32_;
     launch_fp16_to_fp32(
         unet_input_latent_ptr, unet_input_latent_fp32.data(), latent_elements,
         stream);
-
-    cudaStreamSynchronize(stream);
+    // LRD-PERF: removed a redundant in-region cudaStreamSynchronize here — fp16->fp32 is stream-ordered
+    // before its consumers, and an in-region sync is illegal during CUDA-graph capture.
 
     // Prepare encoder_hidden_states: Must match unet_batch_size
     // For CFG "full" and "initialize", need [negative, positive] embeddings
@@ -356,8 +374,14 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
       // unet_batch_size here. (Single-step turbo never hit this: unet_batch_size==1==batch_size.)
       const int pooled_dim = config_.pooled_embedding_dim;
       const int time_ids_dim = config_.time_ids_dim;
-      CUDATensor<__half> tiled_text_embeds((size_t)unet_batch_size * pooled_dim);
-      CUDATensor<__half> tiled_time_ids((size_t)unet_batch_size * time_ids_dim);
+      const size_t tte_n = (size_t)unet_batch_size * pooled_dim;
+      const size_t tti_n = (size_t)unet_batch_size * time_ids_dim;
+      if(!mp_tiled_text_embeds_ || mp_tiled_text_embeds_->size() < tte_n)
+        mp_tiled_text_embeds_ = std::make_unique<CUDATensor<__half>>(tte_n);
+      if(!mp_tiled_time_ids_ || mp_tiled_time_ids_->size() < tti_n)
+        mp_tiled_time_ids_ = std::make_unique<CUDATensor<__half>>(tti_n);
+      CUDATensor<__half>& tiled_text_embeds = *mp_tiled_text_embeds_;
+      CUDATensor<__half>& tiled_time_ids = *mp_tiled_time_ids_;
       for(int i = 0; i < unet_batch_size; i++)
       {
         cudaMemcpyAsync(tiled_text_embeds.data() + (size_t)i * pooled_dim, text_embeds_->data(),
@@ -427,7 +451,10 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
       if(!pos)
         throw std::runtime_error("IP-Adapter enabled but no image tokens set (set_ipadapter_tokens)");
 
-      CUDATensor<__half> ext_ehs((size_t)unet_batch_size * ext_row);
+      const size_t ext_n = (size_t)unet_batch_size * ext_row;
+      if(!mp_ext_ehs_ || mp_ext_ehs_->size() < ext_n)
+        mp_ext_ehs_ = std::make_unique<CUDATensor<__half>>(ext_n);
+      CUDATensor<__half>& ext_ehs = *mp_ext_ehs_;
       const bool full = (config_.guidance_scale > 1.0f && config_.cfg_type == 1);
       const bool init = (config_.guidance_scale > 1.0f && config_.cfg_type == 3);
       for(int r = 0; r < unet_batch_size; r++)
@@ -482,7 +509,8 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
           noise_pred_uncond.data(), noise_pred_text.data(), model_pred_tmp_->data(),
           single_size, stream);
       // Create model_pred with the result
-      model_pred = CUDATensor<__half>(single_size);
+      // model_pred is the persistent buffer (sized denoised_size >= single_size): write the CFG
+      // result into it instead of reallocating (a per-frame malloc would block CUDA-graph capture).
       cudaMemcpyAsync(model_pred.data(), model_pred_tmp_->data(),
                       single_size * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
     }
@@ -518,7 +546,8 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
       apply_cfg(
           noise_pred_uncond.data(), noise_pred_text.data(), model_pred_tmp_->data(),
           single_size, stream);
-      model_pred = CUDATensor<__half>(single_size);
+      // model_pred is the persistent buffer (sized denoised_size >= single_size): write the CFG
+      // result into it instead of reallocating (a per-frame malloc would block CUDA-graph capture).
       cudaMemcpyAsync(model_pred.data(), model_pred_tmp_->data(),
                       single_size * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
     }
@@ -541,16 +570,15 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
       apply_cfg(
           noise_pred_uncond.data(), noise_pred_text.data(), model_pred_tmp_->data(),
           single_size, stream);
-      model_pred = CUDATensor<__half>(single_size);
+      // model_pred is the persistent buffer (sized denoised_size >= single_size): write the CFG
+      // result into it instead of reallocating (a per-frame malloc would block CUDA-graph capture).
       cudaMemcpyAsync(model_pred.data(), model_pred_tmp_->data(),
                       single_size * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
     }
     else
     {
-      // No CFG (cfg_type="none" or guidance_scale <= 1.0)
-      auto model_pred_tmp = std::make_unique<CUDATensor<__half>>(latent_elements);
-      model_pred_tmp->load_d2d(unet_output_ptr, latent_elements, stream);
-      model_pred = std::move(*model_pred_tmp);
+      // No CFG (cfg_type="none") -> model_pred (persistent buffer) = the UNet output.
+      model_pred.load_d2d(unet_output_ptr, latent_elements, stream);
     }
 
     // Scheduler step - process each timestep separately with its own scheduler parameters
@@ -995,13 +1023,37 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
         cudaMemcpyAsync(tiled_time_ids.data() + (size_t)i * time_ids_dim, time_ids_->data(),
                         time_ids_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
       }
-      unet_->forward_sdxl(
-          unet_input_latent_fp32_seq.data(), unet_input_timestep->data(),
-          unet_encoder_hidden_states_seq->data(),
-          tiled_text_embeds.data(), tiled_time_ids.data(),
-          unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
-          config_.text_seq_len, config_.text_hidden_dim,
-          config_.pooled_embedding_dim, stream);
+      if(controlnet_enabled_)
+      {
+        // SDXL + ControlNet in the sequential multi-step path (mirrors the batched site ~386):
+        // run every net with the tiled SDXL conditioning, SUM residuals, inject via
+        // forward_controlnet_sdxl. The SD1.5 forward_controlnet would leave text_embeds/time_ids
+        // unset on this control-aware SDXL engine -> "Not all input dimensions specified".
+        const __half* down_ptrs[ControlNetWrapper::MAX_DOWN];
+        const __half* mid_ptr = nullptr;
+        int down_count = 0;
+        run_controlnets(unet_input_latent->data(), unet_input_timestep->data(),
+                        unet_encoder_hidden_states_seq->data(),
+                        tiled_text_embeds.data(), tiled_time_ids.data(), unet_batch_size,
+                        config_.text_seq_len, config_.text_hidden_dim, pooled_dim,
+                        down_ptrs, &mid_ptr, down_count, stream);
+        unet_->forward_controlnet_sdxl(
+            unet_input_latent_fp32_seq.data(), unet_input_timestep->data(),
+            unet_encoder_hidden_states_seq->data(),
+            tiled_text_embeds.data(), tiled_time_ids.data(), down_ptrs, mid_ptr,
+            unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
+            config_.text_seq_len, config_.text_hidden_dim, config_.pooled_embedding_dim, stream);
+      }
+      else
+      {
+        unet_->forward_sdxl(
+            unet_input_latent_fp32_seq.data(), unet_input_timestep->data(),
+            unet_encoder_hidden_states_seq->data(),
+            tiled_text_embeds.data(), tiled_time_ids.data(),
+            unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
+            config_.text_seq_len, config_.text_hidden_dim,
+            config_.pooled_embedding_dim, stream);
+      }
     }
     else if(controlnet_enabled_)
     {
@@ -1234,7 +1286,120 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
   current_latent.store_d2d(x_0_pred_out, latent_size, stream);
 }
 
+// ---- CUDA-graph capture/replay wrapper around the 1-step device work ----
+// capture_signature(): recapture key. Bakes everything the graph fixes — config geometry + the persistent
+// buffer device addresses the body reads/writes. If any address moves (resolution change, engine swap,
+// IP token resize), the signature changes -> recapture. Mirrors the Python allocate_buffers() graph-reset rule.
+uint64_t LibreDiffusionPipeline::capture_signature() const
+{
+  auto mix = [](uint64_t h, uint64_t v) { return (h ^ (v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2))); };
+  auto ptr = [&](const void* p) { return mix(0, reinterpret_cast<uint64_t>(p)); };
+  uint64_t h = 1469598103934665603ULL;
+  h = mix(h, (uint64_t)config_.batch_size);
+  h = mix(h, (uint64_t)config_.latent_height);
+  h = mix(h, (uint64_t)config_.latent_width);
+  h = mix(h, (uint64_t)config_.cfg_type);
+  h = mix(h, (uint64_t)(int)config_.model_type);
+  h = mix(h, (uint64_t)controlnet_enabled_);
+  h = mix(h, (uint64_t)ipadapter_enabled_);
+  h = mix(h, (uint64_t)ipadapter_num_tokens_);
+  h = mix(h, (uint64_t)config_.text_seq_len);
+  h = mix(h, (uint64_t)config_.text_hidden_dim);
+  // persistent buffers the body touches:
+  if(graph_in_staging_) h = mix(h, ptr(graph_in_staging_->data()));
+  if(predict_x0_batch_x_t_latent) h = mix(h, ptr(predict_x0_batch_x_t_latent->data()));
+  if(predict_x0_batch_unet_input_latent) h = mix(h, ptr(predict_x0_batch_unet_input_latent->data()));
+  if(predict_x0_batch_unet_output) h = mix(h, ptr(predict_x0_batch_unet_output->data()));
+  if(predict_x0_batch_model_pred) h = mix(h, ptr(predict_x0_batch_model_pred->data()));
+  if(predict_x0_batch_denoised) h = mix(h, ptr(predict_x0_batch_denoised->data()));
+  if(ip_ext_ehs_) h = mix(h, ptr(ip_ext_ehs_->data()));
+  if(controlnet_cond_tiled_) h = mix(h, ptr(controlnet_cond_tiled_->data()));
+  // Per-net cond source buffers the captured tiling-copy reads (now updated in place, so stable; a
+  // resize still moves the address -> a changed signature -> recapture, which is the correct response).
+  for(const auto& c : controlnet_cond_) if(c) h = mix(h, ptr(c->data()));
+  return h;
+}
+
 void LibreDiffusionPipeline::predict_x0_batch_impl_single_step(
+    const __half* x_t_latent_in, __half* x_0_pred_out, cudaStream_t stream)
+{
+  // Graph path: only for 1-step, non-V2V, cfg-none (graph_enabled_ already gates 1-step+non-V2V; cfg-none
+  // because the cfg-full/self/init post-process allocates per-frame scratch -> not capturable). All other
+  // configs fall through to a direct body call (per-call enqueue), unchanged behavior.
+  if(!graph_enabled_ || config_.cfg_type != 0)
+  {
+    run_single_step_body(x_t_latent_in, x_0_pred_out, stream);
+    return;
+  }
+
+  const int latent_size
+      = config_.batch_size * 4 * config_.latent_height * config_.latent_width;
+  if(!graph_in_staging_ || (int)graph_in_staging_->size() < latent_size)
+  {
+    graph_in_staging_ = std::make_unique<CUDATensor<__half>>(latent_size);
+    graph_ready_ = false;  // staging buffer (re)allocated -> any prior graph is stale
+  }
+  // Stage the volatile caller input into the FIXED buffer the graph reads from (outside the captured region).
+  graph_in_staging_->load_d2d(x_t_latent_in, latent_size, stream);
+
+  const uint64_t sig = capture_signature();
+  if(!graph_ready_ || sig != graph_sig_)
+  {
+    if(graph_exec_) { cudaGraphExecDestroy(graph_exec_); graph_exec_ = nullptr; }
+    if(graph_)      { cudaGraphDestroy(graph_);          graph_ = nullptr; }
+    // Warm enqueue (TRT requires a real enqueue before capture; also primes shapes/addresses). This run
+    // also produces a VALID output for THIS frame, so we return after capturing.
+    run_single_step_body(graph_in_staging_->data(), x_0_pred_out, stream);
+    cudaStreamSynchronize(stream);
+    cudaError_t cap = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+    if(cap != cudaSuccess)
+    {
+      // Capture unavailable -> permanent fallback to per-call enqueue (already produced this frame above).
+      std::cerr << "Note: CUDA graph capture unavailable (" << cudaGetErrorString(cap)
+                << "); using per-call enqueue" << std::endl;
+      graph_enabled_ = false;
+      return;
+    }
+    run_single_step_body(graph_in_staging_->data(), x_0_pred_out, stream);
+    cudaError_t end = cudaStreamEndCapture(stream, &graph_);
+    if(end != cudaSuccess || !graph_)
+    {
+      std::cerr << "Note: CUDA graph capture aborted (" << cudaGetErrorString(end)
+                << "); using per-call enqueue" << std::endl;
+      if(graph_) { cudaGraphDestroy(graph_); graph_ = nullptr; }
+      graph_enabled_ = false;
+      cudaGetLastError();  // clear sticky capture error so this frame still returns success (warm run did it)
+      return;
+    }
+    // Instantiate the captured graph. This can FAIL even when endCapture succeeded — e.g. the captured
+    // body recorded a node that can't be instantiated (observed with the ControlNet/IP control-aware
+    // engines). Its return was previously UNCHECKED, so the sticky CUDA error surfaced as an opaque
+    // CUDA_ERROR (-4) from the caller. Check it + fall back to per-call enqueue (the warm run above
+    // already produced THIS frame's output, so correctness is preserved).
+    cudaError_t inst = cudaGraphInstantiate(&graph_exec_, graph_, 0);
+    if(inst != cudaSuccess || !graph_exec_)
+    {
+      std::cerr << "Note: CUDA graph instantiate failed (" << cudaGetErrorString(inst)
+                << "); using per-call enqueue" << std::endl;
+      if(graph_exec_) { cudaGraphExecDestroy(graph_exec_); graph_exec_ = nullptr; }
+      if(graph_)      { cudaGraphDestroy(graph_);          graph_ = nullptr; }
+      graph_enabled_ = false;
+      cudaGetLastError();  // clear the sticky error so the caller doesn't see a spurious CUDA_ERROR
+      return;
+    }
+    // Recompute the signature AFTER the warm run, NOT the pre-warm-run `sig`. The warm run lazily
+    // allocates persistent buffers the body touches (controlnet_cond_tiled_, the per-net cond buffers,
+    // ip_ext_ehs_), so their device addresses only exist now. Storing the pre-warm-run sig made the
+    // very next frame's signature differ -> a forced recapture, and that recapture frame faulted
+    // (ControlNet illegal memory access). Storing the post-alloc sig makes frame 2 match -> replay.
+    graph_sig_ = capture_signature();
+    graph_ready_ = true;
+    return;  // warm run already wrote x_0_pred_out for this frame
+  }
+  cudaGraphLaunch(graph_exec_, stream);
+}
+
+void LibreDiffusionPipeline::run_single_step_body(
     const __half* x_t_latent_in, __half* x_0_pred_out, cudaStream_t stream)
 {
   const int latent_size
@@ -1388,14 +1553,41 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_single_step(
       cudaMemcpyAsync(tiled_time_ids.data() + (size_t)i * time_ids_dim, time_ids_->data(),
                       time_ids_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
     }
-    unet_->forward_sdxl(
-        predict_x0_batch_unet_input_latent_fp32_single->data(),
-        predict_x0_batch_unet_input_timestep->data(),
-        predict_x0_batch_unet_encoder_hidden_states_single->data(),
-        tiled_text_embeds.data(), tiled_time_ids.data(),
-        predict_x0_batch_unet_output->data(), unet_batch_size, config_.latent_height,
-        config_.latent_width, config_.text_seq_len, config_.text_hidden_dim,
-        config_.pooled_embedding_dim, stream);
+    if(controlnet_enabled_)
+    {
+      // SDXL + ControlNet in the single-step path (mirrors the batched site ~386): run every net
+      // with the tiled SDXL conditioning, SUM residuals, inject via forward_controlnet_sdxl. The
+      // SD1.5 forward_controlnet would leave text_embeds/time_ids unset on this control-aware SDXL
+      // engine -> "Not all input dimensions specified".
+      const __half* down_ptrs[ControlNetWrapper::MAX_DOWN];
+      const __half* mid_ptr = nullptr;
+      int down_count = 0;
+      run_controlnets(predict_x0_batch_unet_input_latent->data(),
+                      predict_x0_batch_unet_input_timestep->data(),
+                      predict_x0_batch_unet_encoder_hidden_states_single->data(),
+                      tiled_text_embeds.data(), tiled_time_ids.data(), unet_batch_size,
+                      config_.text_seq_len, config_.text_hidden_dim, pooled_dim,
+                      down_ptrs, &mid_ptr, down_count, stream);
+      unet_->forward_controlnet_sdxl(
+          predict_x0_batch_unet_input_latent_fp32_single->data(),
+          predict_x0_batch_unet_input_timestep->data(),
+          predict_x0_batch_unet_encoder_hidden_states_single->data(),
+          tiled_text_embeds.data(), tiled_time_ids.data(), down_ptrs, mid_ptr,
+          predict_x0_batch_unet_output->data(), unet_batch_size, config_.latent_height,
+          config_.latent_width, config_.text_seq_len, config_.text_hidden_dim,
+          config_.pooled_embedding_dim, stream);
+    }
+    else
+    {
+      unet_->forward_sdxl(
+          predict_x0_batch_unet_input_latent_fp32_single->data(),
+          predict_x0_batch_unet_input_timestep->data(),
+          predict_x0_batch_unet_encoder_hidden_states_single->data(),
+          tiled_text_embeds.data(), tiled_time_ids.data(),
+          predict_x0_batch_unet_output->data(), unet_batch_size, config_.latent_height,
+          config_.latent_width, config_.text_seq_len, config_.text_hidden_dim,
+          config_.pooled_embedding_dim, stream);
+    }
   }
   else if(controlnet_enabled_)
   {
@@ -1433,24 +1625,32 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_single_step(
     const __half* neg = ipadapter_tokens_neg_ ? ipadapter_tokens_neg_->data() : pos;
     if(!pos)
       throw std::runtime_error("IP-Adapter enabled but no image tokens set (set_ipadapter_tokens)");
-    CUDATensor<__half> ext_ehs((size_t)unet_batch_size * ext_row);
+    // Persistent (was a per-frame stack CUDATensor): a per-call cudaMalloc is illegal inside CUDA-graph
+    // capture. Grow-on-first-use, same shape every frame for a fixed config (see ipadapter_scale_buffer_).
+    const size_t ext_n = (size_t)unet_batch_size * ext_row;
+    if(!ip_ext_ehs_ || ip_ext_ehs_->size() < ext_n)
+    {
+      ip_ext_ehs_ = std::make_unique<CUDATensor<__half>>(ext_n);
+      graph_ready_ = false;  // buffer (re)allocated -> invalidate any captured graph (address moved)
+    }
+    __half* ext_ehs = ip_ext_ehs_->data();
     const bool full = (config_.guidance_scale > 1.0f && config_.cfg_type == 1);
     const bool init = (config_.guidance_scale > 1.0f && config_.cfg_type == 3);
     for(int r = 0; r < unet_batch_size; r++)
     {
-      cudaMemcpyAsync(ext_ehs.data() + (size_t)r * ext_row,
+      cudaMemcpyAsync(ext_ehs + (size_t)r * ext_row,
                       predict_x0_batch_unet_encoder_hidden_states_single->data() + (size_t)r * text_row,
                       text_row * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
       bool is_neg = full ? (r < config_.batch_size) : (init ? (r == 0) : false);
       const __half* img = is_neg ? neg : pos;
-      cudaMemcpyAsync(ext_ehs.data() + (size_t)r * ext_row + text_row, img,
+      cudaMemcpyAsync(ext_ehs + (size_t)r * ext_row + text_row, img,
                       img_row * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
     }
     int nlay = unet_->numIpLayers();
     if(nlay <= 0) nlay = (int)ipadapter_scale_vec_.size();
     unet_->forward_ipadapter(
         predict_x0_batch_unet_input_latent_fp32_single->data(),
-        predict_x0_batch_unet_input_timestep->data(), ext_ehs.data(),
+        predict_x0_batch_unet_input_timestep->data(), ext_ehs,
         ipadapter_scale_vec_.data(), nlay,
         predict_x0_batch_unet_output->data(), unet_batch_size, config_.latent_height,
         config_.latent_width, ext_tok, config_.text_hidden_dim, stream);
