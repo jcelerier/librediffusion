@@ -137,11 +137,20 @@ void UNetWrapper::loadEngine(const std::string& engine_path)
       else if(nm == "ipadapter_scale" && eng->getTensorIOMode(tn) == nvinfer1::TensorIOMode::kINPUT)
       {
         has_ipadapter_ = true;
-        // The scale vector length = num IP layers. Its profile max gives the length (dynamic -1 dim).
+        // The scale vector length = num IP layers (fixed per engine: SD1.5 = 16, SDXL = 70). A static
+        // engine exposes it directly; a DYNAMIC ipadapter_scale (-1) must be read from the optimization
+        // profile MAX (the SDXL IP engine is built dynamic [1..70] -> 70). Previously the dynamic case
+        // silently kept the default (16), so SDXL IP under-fed 16 of 70 scales -> OOB read of the other
+        // 54 layers' scales -> wrong conditioning.
         nvinfer1::Dims d = eng->getTensorShape(tn);
         if(d.nbDims == 1 && d.d[0] > 0)
           num_ip_layers_ = (int)d.d[0];
-        // else dynamic: resolved from the caller's num_ip_layers at forward time.
+        else if(d.nbDims == 1)
+        {
+          nvinfer1::Dims dmax = eng->getProfileShape(tn, 0, nvinfer1::OptProfileSelector::kMAX);
+          if(dmax.nbDims == 1 && dmax.d[0] > 0)
+            num_ip_layers_ = (int)dmax.d[0];
+        }
         std::cout << "Note: engine is IP-Adapter (ipadapter_scale input, "
                   << (num_ip_layers_ ? std::to_string(num_ip_layers_) : std::string("dynamic"))
                   << " layers) for " << engine_path << std::endl;
@@ -562,6 +571,117 @@ void UNetWrapper::forward_ipadapter(
 
   if(!context_->enqueueV3(stream))
     throw std::runtime_error("Failed to enqueue inference (IP-Adapter UNet)");
+
+  cudaMemcpyAsync(output, output_buffer_->data(), output_size * sizeof(__half),
+                  cudaMemcpyDeviceToDevice, stream);
+}
+
+void UNetWrapper::forward_ipadapter_sdxl(
+    const float* sample, const float* timestep, const __half* encoder_hidden_states,
+    const __half* text_embeds, const __half* time_ids,
+    const float* ipadapter_scale, int num_ip_layers,
+    __half* output, int batch, int height, int width, int seq_len, int hidden_dim,
+    int pooled_dim, cudaStream_t stream)
+{
+  // = forward_sdxl (sample/timestep/ehs/text_embeds/time_ids) + forward_ipadapter (ipadapter_scale).
+  int sample_size = batch * 4 * height * width;
+  int timestep_extent = (timestep_fixed_extent_ > 0) ? timestep_fixed_extent_ : batch;
+  int encoder_size = batch * seq_len * hidden_dim;  // seq_len = 77 + num_image_tokens
+  int output_size = batch * 4 * height * width;
+  int text_embeds_size = batch * pooled_dim;
+  int time_ids_size = batch * 6;
+
+  bool needs_realloc = needsReallocation(batch, height, width, seq_len, hidden_dim, pooled_dim);
+  if(needs_realloc)
+  {
+    sample_buffer_ = std::make_unique<CUDATensor<float>>(sample_size);
+    timestep_buffer_ = std::make_unique<CUDATensor<float>>(timestep_extent);
+    encoder_hidden_states_buffer_ = std::make_unique<CUDATensor<__half>>(encoder_size);
+    text_embeds_buffer_ = std::make_unique<CUDATensor<__half>>(text_embeds_size);
+    time_ids_buffer_ = std::make_unique<CUDATensor<__half>>(time_ids_size);
+    output_buffer_ = std::make_unique<CUDATensor<__half>>(output_size);
+    shape_cache_.batch = batch;
+    shape_cache_.height = height;
+    shape_cache_.width = width;
+    shape_cache_.seq_len = seq_len;
+    shape_cache_.hidden_dim = hidden_dim;
+    shape_cache_.pooled_dim = pooled_dim;
+    shape_cache_.initialized = true;
+  }
+  if(!ipadapter_scale_buffer_ || (int)ipadapter_scale_buffer_->size() < num_ip_layers)
+    ipadapter_scale_buffer_ = std::make_unique<CUDATensor<float>>(num_ip_layers);
+
+  cudaMemcpyAsync(sample_buffer_->data(), sample, sample_size * sizeof(float),
+                  cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(timestep_buffer_->data(), timestep, timestep_extent * sizeof(float),
+                  cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(encoder_hidden_states_buffer_->data(), encoder_hidden_states,
+                  encoder_size * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(text_embeds_buffer_->data(), text_embeds,
+                  text_embeds_size * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(time_ids_buffer_->data(), time_ids,
+                  time_ids_size * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+
+  // ipadapter_scale H2D via PINNED host + skip-when-unchanged (CUDA-graph-capture-safe), as forward_ipadapter.
+  if(ipadapter_scale_pinned_cap_ < num_ip_layers)
+  {
+    if(ipadapter_scale_pinned_) cudaFreeHost(ipadapter_scale_pinned_);
+    cudaMallocHost((void**)&ipadapter_scale_pinned_, num_ip_layers * sizeof(float));
+    ipadapter_scale_pinned_cap_ = num_ip_layers;
+    ipadapter_scale_last_.clear();
+  }
+  bool scale_changed = (int)ipadapter_scale_last_.size() != num_ip_layers
+      || std::memcmp(ipadapter_scale_last_.data(), ipadapter_scale, num_ip_layers * sizeof(float)) != 0;
+  if(scale_changed)
+  {
+    std::memcpy(ipadapter_scale_pinned_, ipadapter_scale, num_ip_layers * sizeof(float));
+    cudaMemcpyAsync(ipadapter_scale_buffer_->data(), ipadapter_scale_pinned_,
+                    num_ip_layers * sizeof(float), cudaMemcpyHostToDevice, stream);
+    ipadapter_scale_last_.assign(ipadapter_scale, ipadapter_scale + num_ip_layers);
+  }
+
+  nvinfer1::Dims4 sample_dims{batch, 4, height, width};
+  nvinfer1::Dims timestep_dims; timestep_dims.nbDims = 1; timestep_dims.d[0] = timestep_extent;
+  nvinfer1::Dims3 hidden_states_dims{batch, seq_len, hidden_dim};
+  nvinfer1::Dims text_embeds_dims; text_embeds_dims.nbDims = 2;
+  text_embeds_dims.d[0] = batch; text_embeds_dims.d[1] = pooled_dim;
+  nvinfer1::Dims time_ids_dims; time_ids_dims.nbDims = 2;
+  time_ids_dims.d[0] = batch; time_ids_dims.d[1] = 6;
+  nvinfer1::Dims scale_dims; scale_dims.nbDims = 1; scale_dims.d[0] = num_ip_layers;
+
+  if(!context_->setInputShape("sample", sample_dims))
+    throw std::runtime_error("Failed to set sample shape");
+  if(!context_->setInputShape("timestep", timestep_dims))
+    throw std::runtime_error("Failed to set timestep shape");
+  if(!context_->setInputShape("encoder_hidden_states", hidden_states_dims))
+    throw std::runtime_error("Failed to set encoder_hidden_states shape");
+  if(!context_->setInputShape("text_embeds", text_embeds_dims))
+    throw std::runtime_error("Failed to set text_embeds shape");
+  if(!context_->setInputShape("time_ids", time_ids_dims))
+    throw std::runtime_error("Failed to set time_ids shape");
+  if(!context_->setInputShape("ipadapter_scale", scale_dims))
+    throw std::runtime_error("Failed to set ipadapter_scale shape");
+
+  if(!context_->allInputDimensionsSpecified())
+    throw std::runtime_error("Not all input dimensions specified (SDXL IP-Adapter UNet)");
+
+  if(!context_->setTensorAddress("sample", sample_buffer_->data()))
+    throw std::runtime_error("Failed to set sample tensor address");
+  if(!context_->setTensorAddress("timestep", timestep_buffer_->data()))
+    throw std::runtime_error("Failed to set timestep tensor address");
+  if(!context_->setTensorAddress("encoder_hidden_states", encoder_hidden_states_buffer_->data()))
+    throw std::runtime_error("Failed to set encoder_hidden_states tensor address");
+  if(!context_->setTensorAddress("text_embeds", text_embeds_buffer_->data()))
+    throw std::runtime_error("Failed to set text_embeds tensor address");
+  if(!context_->setTensorAddress("time_ids", time_ids_buffer_->data()))
+    throw std::runtime_error("Failed to set time_ids tensor address");
+  if(!context_->setTensorAddress("ipadapter_scale", ipadapter_scale_buffer_->data()))
+    throw std::runtime_error("Failed to set ipadapter_scale tensor address");
+  if(!context_->setTensorAddress("latent", output_buffer_->data()))
+    throw std::runtime_error("Failed to set latent tensor address");
+
+  if(!context_->enqueueV3(stream))
+    throw std::runtime_error("Failed to enqueue inference (SDXL IP-Adapter UNet)");
 
   cudaMemcpyAsync(output, output_buffer_->data(), output_size * sizeof(__half),
                   cudaMemcpyDeviceToDevice, stream);

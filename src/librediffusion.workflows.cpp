@@ -144,6 +144,38 @@ void LibreDiffusionPipeline::txt2img_sd_turbo_impl(
           config_.text_seq_len, config_.text_hidden_dim,
           config_.pooled_embedding_dim, stream);
     }
+    else if(ipadapter_enabled_)
+    {
+      // SDXL + IP-Adapter (turbo 1-step txt2img path, batch_size rows): extended ehs
+      // [batch, 77+N, 2048] = text tokens (prompt_embeds_) ++ N pos image tokens, + SDXL conditioning.
+      const int dim = config_.text_hidden_dim;
+      const int N = ipadapter_num_tokens_;
+      const int text_tok = config_.text_seq_len;
+      const int ext_tok = text_tok + N;
+      const int text_row = text_tok * dim, img_row = N * dim, ext_row = ext_tok * dim;
+      const __half* pos = ipadapter_tokens_pos_ ? ipadapter_tokens_pos_->data() : nullptr;
+      if(!pos)
+        throw std::runtime_error("IP-Adapter enabled but no image tokens set (set_ipadapter_tokens)");
+      const size_t ext_n = (size_t)config_.batch_size * ext_row;
+      if(!ip_ext_ehs_ || ip_ext_ehs_->size() < ext_n)
+        ip_ext_ehs_ = std::make_unique<CUDATensor<__half>>(ext_n);
+      __half* ext_ehs = ip_ext_ehs_->data();
+      for(int r = 0; r < config_.batch_size; r++)
+      {
+        cudaMemcpyAsync(ext_ehs + (size_t)r * ext_row, prompt_embeds_->data() + (size_t)r * text_row,
+                        text_row * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(ext_ehs + (size_t)r * ext_row + text_row, pos,
+                        img_row * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+      }
+      int nlay = unet_->numIpLayers();
+      if(nlay <= 0) nlay = (int)ipadapter_scale_vec_.size();
+      unet_->forward_ipadapter_sdxl(
+          unet_input_latent_fp32.data(), sub_timesteps_->data(), ext_ehs,
+          text_embeds_->data(), time_ids_->data(),
+          ipadapter_scale_vec_.data(), nlay,
+          model_pred.data(), config_.batch_size, config_.latent_height, config_.latent_width,
+          ext_tok, config_.text_hidden_dim, config_.pooled_embedding_dim, stream);
+    }
     else
     {
       unet_->forward_sdxl(

@@ -51,6 +51,7 @@ from streamdiffusion.acceleration.tensorrt.export_wrappers.unet_controlnet_expor
 from streamdiffusion.acceleration.tensorrt.models.controlnet_models import create_controlnet_model
 from streamdiffusion.acceleration.tensorrt.models.models import (
     CLIP, CLIPSDXLPooled, VAE, UNet, VAEEncoder, SDXLUNet, SDXLUNetWrapper, SDXLUNetControlWrapper,
+    SDXLUNetIPAdapterWrapper,
 )
 
 
@@ -372,6 +373,20 @@ def main():
         print(f"SDXL ControlNet UNet: control inputs -> "
               f"{[n for n in unet_model.get_input_names() if n.startswith('input_control')]}")
         wrapped_unet = SDXLUNetControlWrapper(stream.unet)
+    elif is_sdxl and args.ipadapter:
+        # SDXL + IP-Adapter: UNION of the SDXL spec (text_embeds/time_ids) and the IP-Adapter spec
+        # (encoder_hidden_states seq extended to 77+num_tokens + an ipadapter_scale[num_ip_layers] fp32
+        # input). The IP attention processors were already BAKED onto stream.unet by the IPAdapter load
+        # above; SDXLUNetIPAdapterWrapper converts them to runtime-scale TRT variants (preserving the
+        # loaded to_k_ip/to_v_ip weights) and routes ipadapter_scale + added_cond_kwargs.
+        unet_model = SDXLUNet(stream.unet, fp16=True, device=device, max_batch_size=args.max_batch,
+                              min_batch_size=args.min_batch, embedding_dim=embedding_dim,
+                              unet_dim=stream.unet.config.in_channels,
+                              use_ipadapter=True, num_image_tokens=ip_num_tokens,
+                              num_ip_layers=ip_num_layers)
+        print(f"SDXL IP-Adapter UNet: inputs -> {unet_model.get_input_names()} "
+              f"(text_maxlen={unet_model.text_maxlen}, num_ip_layers={ip_num_layers})")
+        wrapped_unet = SDXLUNetIPAdapterWrapper(stream.unet, num_tokens=ip_num_tokens)
     elif is_sdxl:
         # SDXL needs the extra text_embeds/time_ids inputs. daydream's base UNet spec lacks them →
         # use the ported SDXLUNet spec + SDXLUNetWrapper (takes them as positional args).
