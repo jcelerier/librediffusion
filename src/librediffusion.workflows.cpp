@@ -64,6 +64,23 @@ void LibreDiffusionPipeline::img2img_impl(
   // Encode
   encode_image(image_in, vae_encoded_x_t_latent_->data(), stream);
 
+  // StreamV2V: cache x_t_latent for temporal coherence + advance the frame counter. This is the path
+  // the node's CPU-RGBA img2img takes (float input); it must keep temporal state in sync with the
+  // __half overload above, otherwise frame_id stays 0 and the cache never fills.
+  if(config_.mode == PipelineMode::TEMPORAL_V2V)
+  {
+    if((temporal_state_.frame_id % config_.cache_interval) == 0)
+    {
+      int latent_size = config_.batch_size * 4 * config_.latent_height * config_.latent_width;
+      auto cached_latent = std::make_unique<CUDATensor<__half>>(latent_size);
+      cached_latent->load_d2d(vae_encoded_x_t_latent_->data(), latent_size, stream);
+      temporal_state_.cached_x_t_latent.push_back(std::move(cached_latent));
+      while(temporal_state_.cached_x_t_latent.size() > static_cast<size_t>(config_.cache_maxframes))
+        temporal_state_.cached_x_t_latent.pop_front();
+    }
+    temporal_state_.frame_id++;
+  }
+
   // Predict
   predict_x0_batch(
       vae_encoded_x_t_latent_->data(), unet_output_x_0_pred_->data(), stream);

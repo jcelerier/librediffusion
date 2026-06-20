@@ -757,6 +757,111 @@ void launch_blend_features(
     );
 }
 
+// ============================ StreamV2V ToMe bank merge ============================
+// Token Merging (random_bipartite_soft_matching) with a DETERMINISTIC even/odd split (replaces the
+// original's torch.rand().argsort() so C++ and Python match bit-for-bit when both use this split).
+// Input cat_{k,v,o}: [B, N, h] (N even) = concat(bank, new). Partition: src = even positions, dst = odd
+// positions (r = N/2 each). For each src token, find its cosine-nearest dst token (metric = keys), then
+// scatter-mean each src into its matched dst (include_self). Output dst_{k,v,o}: [B, r, h] = compacted bank.
+
+// one thread per (batch, src token) -> argmax cosine over dst tokens (keys as metric)
+__global__ void tome_match_kernel(const __half* cat_k, int B, int N, int h, int* match)
+{
+    int r = N / 2;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= B * r) return;
+    int b = idx / r, i = idx % r;                       // src token i (even position 2i)
+    const __half* a = cat_k + ((size_t)b * N + (size_t)2 * i) * h;
+    float na = 0.f;
+    for(int c = 0; c < h; c++) { float v = __half2float(a[c]); na += v * v; }
+    na = sqrtf(na) + 1e-12f;
+    float best = -1e30f; int bestj = 0;
+    for(int j = 0; j < r; j++) {
+        const __half* bj = cat_k + ((size_t)b * N + (size_t)(2 * j + 1)) * h;
+        float dot = 0.f, nb = 0.f;
+        for(int c = 0; c < h; c++) { float av = __half2float(a[c]), bv = __half2float(bj[c]); dot += av * bv; nb += bv * bv; }
+        float cos = dot / (na * (sqrtf(nb) + 1e-12f));
+        if(cos > best) { best = cos; bestj = j; }
+    }
+    match[idx] = bestj;
+}
+
+// init dst accumulators from the dst (odd) tokens; count = 1 (include_self)
+__global__ void tome_init_kernel(const __half* cat_k, const __half* cat_v, const __half* cat_o,
+                                 int B, int N, int h, float* ak, float* av, float* ao, int* cnt)
+{
+    int r = N / 2;
+    long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long tot = (long)B * r * h;
+    if(t >= tot) return;
+    int c = t % h, j = (t / h) % r, b = t / (h * (long)r);
+    size_t src = ((size_t)b * N + (size_t)(2 * j + 1)) * h + c;
+    ak[t] = __half2float(cat_k[src]); av[t] = __half2float(cat_v[src]); ao[t] = __half2float(cat_o[src]);
+    if(c == 0) cnt[b * r + j] = 1;
+}
+
+// scatter-add each src token into its matched dst accumulator (atomic)
+__global__ void tome_scatter_kernel(const __half* cat_k, const __half* cat_v, const __half* cat_o,
+                                    const int* match, int B, int N, int h,
+                                    float* ak, float* av, float* ao, int* cnt)
+{
+    int r = N / 2;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;   // one thread per (batch, src token)
+    if(idx >= B * r) return;
+    int b = idx / r, i = idx % r;
+    int j = match[idx];
+    size_t s = ((size_t)b * N + (size_t)2 * i) * h;
+    size_t d = ((size_t)b * r + j) * h;
+    for(int c = 0; c < h; c++) {
+        atomicAdd(&ak[d + c], __half2float(cat_k[s + c]));
+        atomicAdd(&av[d + c], __half2float(cat_v[s + c]));
+        atomicAdd(&ao[d + c], __half2float(cat_o[s + c]));
+    }
+    atomicAdd(&cnt[b * r + j], 1);
+}
+
+// finalize: out = accum / count  -> __half
+__global__ void tome_finalize_kernel(const float* ak, const float* av, const float* ao, const int* cnt,
+                                     int B, int N, int h, __half* ok, __half* ov, __half* oo)
+{
+    int r = N / 2;
+    long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long tot = (long)B * r * h;
+    if(t >= tot) return;
+    int j = (t / h) % r, b = t / (h * (long)r);
+    float inv = 1.f / (float)cnt[b * r + j];
+    ok[t] = __float2half(ak[t] * inv); ov[t] = __float2half(av[t] * inv); oo[t] = __float2half(ao[t] * inv);
+}
+
+void launch_tome_merge(const void* cat_k, const void* cat_v, const void* cat_o,
+                       void* dst_k, void* dst_v, void* dst_o,
+                       int B, int N, int h, void* stream_ptr)
+{
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    int r = N / 2;
+    size_t accN = (size_t)B * r * h;
+    int *match = nullptr, *cnt = nullptr;
+    float *ak = nullptr, *av = nullptr, *ao = nullptr;
+    cudaMallocAsync(&match, (size_t)B * r * sizeof(int), stream);
+    cudaMallocAsync(&cnt, (size_t)B * r * sizeof(int), stream);
+    cudaMallocAsync(&ak, accN * sizeof(float), stream);
+    cudaMallocAsync(&av, accN * sizeof(float), stream);
+    cudaMallocAsync(&ao, accN * sizeof(float), stream);
+
+    int th = 256;
+    tome_match_kernel<<<(B * r + th - 1) / th, th, 0, stream>>>((const __half*)cat_k, B, N, h, match);
+    long tot = (long)B * r * h;
+    tome_init_kernel<<<(tot + th - 1) / th, th, 0, stream>>>(
+        (const __half*)cat_k, (const __half*)cat_v, (const __half*)cat_o, B, N, h, ak, av, ao, cnt);
+    tome_scatter_kernel<<<(B * r + th - 1) / th, th, 0, stream>>>(
+        (const __half*)cat_k, (const __half*)cat_v, (const __half*)cat_o, match, B, N, h, ak, av, ao, cnt);
+    tome_finalize_kernel<<<(tot + th - 1) / th, th, 0, stream>>>(
+        ak, av, ao, cnt, B, N, h, (__half*)dst_k, (__half*)dst_v, (__half*)dst_o);
+
+    cudaFreeAsync(match, stream); cudaFreeAsync(cnt, stream);
+    cudaFreeAsync(ak, stream); cudaFreeAsync(av, stream); cudaFreeAsync(ao, stream);
+}
+
 // Weighted accumulate functor: acc = acc + weight * src
 struct WeightedAccumulateFunctor {
     float weight;

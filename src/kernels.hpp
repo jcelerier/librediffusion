@@ -69,6 +69,13 @@ void launch_blend_features(
     int N,
     void* stream_ptr);
 
+// StreamV2V ToMe: bipartite soft matching (deterministic even/odd split) + scatter-mean merge.
+// cat_{k,v,o}: [B, N, h] (N even) = concat(bank, new); dst_{k,v,o}: [B, N/2, h] = compacted bank.
+void launch_tome_merge(
+    const void* cat_k, const void* cat_v, const void* cat_o,
+    void* dst_k, void* dst_v, void* dst_o,
+    int B, int N, int h, void* stream_ptr);
+
 // RGBA to RGB normalization kernels
 void launch_rgba_to_rgb_normalized_fp32(
     const void* rgba_in,
