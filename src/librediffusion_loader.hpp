@@ -179,6 +179,9 @@ public:
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux2_stream_create);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux2_stream_destroy);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux2_stream_set_steps);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux2_stream_set_strength);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux2_stream_set_schedule);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux2_stream_set_mask);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux2_stream_set_bn);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux2_stream_set_prompt);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux2_stream_frame);
@@ -448,6 +451,9 @@ private:
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_create);
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_destroy);
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_set_steps);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_set_strength);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_set_schedule);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_set_mask);
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_set_bn);
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_set_prompt);
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_frame);

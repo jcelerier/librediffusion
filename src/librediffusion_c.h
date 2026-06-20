@@ -1133,6 +1133,29 @@ librediffusion_flux2_stream_destroy(librediffusion_flux2_stream_handle s);
 LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
 librediffusion_flux2_stream_set_steps(librediffusion_flux2_stream_handle s, int num_steps);
 
+/* img2img strength [0..1] (default 1.0). 1.0 = edit from pure noise (reference as conditioning only);
+ * <1.0 = flow-match img2img — start the latent from a noised reference x_s=(1-s)*ref+s*noise with the
+ * sigma schedule truncated to [s,0], so smaller values preserve more of the reference frame. */
+LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
+librediffusion_flux2_stream_set_strength(librediffusion_flux2_stream_handle s, float strength);
+
+/* Explicit FlowMatch sigma SCHEDULE in klein's native scale: `sigmas` is a list of n values in [0,1],
+ * HIGH->LOW (terminal 0 appended internally). This is the unit klein/FLUX uses (e.g. {1.0, 0.64} = the
+ * 2-step default; {0.95, 0.6} = img2img at strength 0.95; {1.0} = 1 step). It SUBSUMES set_steps +
+ * set_strength: n = number of steps, sigmas[0] = start noise level (=strength). The node's Timesteps
+ * control feeds this directly for klein bundles. Pass n<=0 to clear -> fall back to set_steps/strength. */
+LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
+librediffusion_flux2_stream_set_schedule(
+    librediffusion_flux2_stream_handle s, const float* sigmas, int n);
+
+/* Inpaint mask: host RGBA [H,W,4]; WHITE (high luminance) = regenerate, BLACK = keep. Area-averaged to
+ * the Th x Tw token grid and applied each denoise step (latents = mask*generated + (1-mask)*noised_ref).
+ * Combine with set_reference (the source frame = the kept latent) + set_prompt + set_schedule. Pass
+ * mask_rgba=NULL (or H/W<=0) to disable inpainting. */
+LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
+librediffusion_flux2_stream_set_mask(
+    librediffusion_flux2_stream_handle s, const unsigned char* mask_rgba, int H, int W);
+
 /* Set the VAE batch-norm buffers (model constants) once after create. host fp32 [128] each.
  * Required before stream_frame (the reference VAE encode + the decode both need them).
  * Obtain from vae.bn.running_mean and sqrt(vae.bn.running_var + 1e-4). */
