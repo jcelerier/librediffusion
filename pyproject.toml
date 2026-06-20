@@ -45,7 +45,9 @@ dependencies = [
     # Certified at torch 2.12.0+cu132 / torchvision 0.27.0+cu132 (bundles nccl 2.29.7).
     "torch>=2.12.0",
     "torchvision>=0.27.0",
-    "transformers>=5.10"
+    "transformers>=5.10",
+    "opencv-python-headless>=4.13.0.92",
+    "controlnet-aux>=0.0.10",
 ]
 
 [[tool.uv.index]]

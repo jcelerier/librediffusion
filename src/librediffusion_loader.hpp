@@ -52,6 +52,7 @@ public:
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, config_set_delta);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, config_set_add_noise);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, config_set_denoising_batch);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, config_set_cuda_graph);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, config_set_seed);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, config_set_cfg_type);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, config_set_text_config);
@@ -318,6 +319,7 @@ private:
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, config_set_delta);
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, config_set_add_noise);
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, config_set_denoising_batch);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, config_set_cuda_graph);
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, config_set_seed);
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, config_set_cfg_type);
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, config_set_text_config);

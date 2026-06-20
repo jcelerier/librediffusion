@@ -18,6 +18,7 @@ class ControlNetTRT(BaseModel):
                  embedding_dim: int = 768,
                  unet_dim: int = 4,
                  conditioning_channels: int = 3,
+                 num_down_blocks: int = 12,
                  **kwargs):
         super().__init__(
             fp16=fp16,
@@ -29,6 +30,10 @@ class ControlNetTRT(BaseModel):
         )
         self.unet_dim = unet_dim
         self.conditioning_channels = conditioning_channels
+        # Number of down-block control residuals the ControlNet emits. SD1.5/SD2.1 (4 down
+        # blocks) -> 12; SDXS (3 down blocks, pruned UNet) -> 9. Drives output names + axes so
+        # the engine declares exactly as many outputs as the diffusers ControlNet returns.
+        self.num_down_blocks = num_down_blocks
         self.name = "ControlNet"
         
     def get_input_names(self) -> List[str]:
@@ -42,9 +47,9 @@ class ControlNetTRT(BaseModel):
         
     def get_output_names(self) -> List[str]:
         """Get output names for ControlNet TensorRT engine"""
-        down_names = [f"down_block_{i:02d}" for i in range(12)]
+        down_names = [f"down_block_{i:02d}" for i in range(self.num_down_blocks)]
         return down_names + ["mid_block"]
-        
+
     def get_dynamic_axes(self) -> Dict[str, Dict[int, str]]:
         """Get dynamic axes configuration for variable input shapes"""
         return {
@@ -52,7 +57,7 @@ class ControlNetTRT(BaseModel):
             "encoder_hidden_states": {0: "B"},
             "timestep": {0: "B"},
             "controlnet_cond": {0: "B", 2: "H_ctrl", 3: "W_ctrl"},
-            **{f"down_block_{i:02d}": {0: "B", 2: "H", 3: "W"} for i in range(12)},
+            **{f"down_block_{i:02d}": {0: "B", 2: "H", 3: "W"} for i in range(self.num_down_blocks)},
             "mid_block": {0: "B", 2: "H", 3: "W"}
         }
     
@@ -294,7 +299,21 @@ def create_controlnet_model(model_type: str = "sd15",
                            **kwargs) -> ControlNetTRT:
     """Factory function to create appropriate ControlNet TensorRT model"""
     if model_type.lower() in ["sdxl"]:
-        return ControlNetSDXLTRT(unet=unet, model_path=model_path, 
+        return ControlNetSDXLTRT(unet=unet, model_path=model_path,
                                 conditioning_channels=conditioning_channels, **kwargs)
     else:
+        # SD1.5-family path. The number of down-block control residuals the diffusers ControlNet
+        # emits = 1 (conv_in) + n_blocks*layers_per_block + (n_blocks-1) downsamplers. So:
+        #   SD1.5  (4 blocks, lpb 2) -> 1+8+3 = 12
+        #   SDXS   (3 blocks, lpb 1) -> 1+3+2 = 6   (pruned UNet)
+        # Mirrors UNet.get_control's generic layout so engine outputs == UNet control inputs.
+        num_down = 12
+        if unet is not None:
+            try:
+                n_blocks = len(unet.config.block_out_channels)
+                lpb = int(unet.config.layers_per_block)
+                num_down = 1 + n_blocks * lpb + (n_blocks - 1)
+            except Exception:
+                pass
+        kwargs.setdefault("num_down_blocks", num_down)
         return ControlNetTRT(conditioning_channels=conditioning_channels, **kwargs) 

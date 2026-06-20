@@ -172,7 +172,13 @@ def parse_args():
     p.add_argument("--opt-height", type=int, default=None)
     p.add_argument("--opt-width", type=int, default=None)
     p.add_argument("--builder-optimization-level", type=int, default=5,
-                   help="TRT builder optimization level 0-5 (our Phase 3.x knob; user-facing toggle)")
+                   help="TRT builder optimization level 0-5 (user-facing toggle)")
+    # FP8 (e4m3) UNet: modelopt-calibrate + quantize the heavy attention/FF/conv compute to FP8 (the
+    # diffusion FP8 recipe — sensitive embedders/conv_in/out stay fp16). Targets the 41-58% tensor-GEMM
+    # slice that profiling found DRAM-bound on SDXL. Needs nvidia-modelopt. Engine I/O is unchanged
+    # (the C++ node loads it like any unet.engine). SDXL is the intended target; works for SD too.
+    p.add_argument("--fp8", action="store_true",
+                   help="FP8-quantize the UNet compute (modelopt e4m3, diffusion recipe). SDXL/SD only.")
     a = p.parse_args()
     # librediffusion fork: square --min/--max-resolution act as shortcuts that set both
     # axes when the per-axis flags aren't given.
@@ -379,7 +385,8 @@ def main():
         # (ControlNetUNetExportWrapper). The C++ pipeline runs the controlnet engine, then injects its
         # 12 down + 1 mid residuals into these inputs. block_out_channels drives the residual shapes
         # (SD1.5 = 4 blocks (320,640,1280,1280) -> 12 down + mid; see UNet.get_control).
-        arch = {"block_out_channels": tuple(stream.unet.config.block_out_channels)}
+        arch = {"block_out_channels": tuple(stream.unet.config.block_out_channels),
+                "layers_per_block": int(stream.unet.config.layers_per_block)}
         unet_model = UNet(stream.unet, fp16=True, device=device, max_batch_size=args.max_batch,
                           min_batch_size=args.min_batch, embedding_dim=embedding_dim,
                           unet_dim=stream.unet.config.in_channels,
@@ -411,9 +418,36 @@ def main():
                           unet_dim=stream.unet.config.in_channels)
         wrapped_unet = UnifiedExportWrapper(stream.unet, use_controlnet=False, use_ipadapter=False,
                                             control_input_names=None, num_tokens=4, kvo_cache_structure=[])
+    # ---- FP8 (e4m3) UNet quantization (modelopt) — weave FP8 into the trace BEFORE export ----
+    # Inserts Q/DQ on the heavy attention/FF/conv compute; sensitive embedders/conv_in-out stay fp16.
+    # The TRT-11 build is strongly-typed, so the Q/DQ in the ONNX is honored per-tensor automatically
+    # (no builder flag). LRD_FP8_EXPORT tells export_onnx/optimize_onnx to preserve Q/DQ (no
+    # constant-folding, no onnxslim). FP8 + ControlNet/IP-Adapter not validated yet -> guard it.
+    if args.fp8:
+        if args.controlnet or args.ipadapter:
+            raise SystemExit("--fp8 with --controlnet/--ipadapter is not supported yet "
+                             "(quantize the plain UNet first).")
+        from streamdiffusion.acceleration.tensorrt.fp8_quantize import (
+            quantize_unet_fp8, build_sdxl_calib_inputs, SDXL_SENSITIVE)
+        print("FP8: building calibration inputs + quantizing UNet (e4m3, diffusion recipe)...")
+        if is_sdxl:
+            calib = build_sdxl_calib_inputs(stream.pipe, args.opt_height, args.opt_width, device, dtype)
+        else:
+            # SD1.5/SD-turbo: UnifiedExportWrapper.forward(sample, timestep, encoder_hidden_states)
+            lh, lw = args.opt_height // 8, args.opt_width // 8
+            cdim = stream.text_encoder.config.hidden_size
+            calib = []
+            for t in (999.0, 800.0, 600.0, 400.0, 200.0, 20.0):
+                s = torch.randn((1, 4, lh, lw), device=device, dtype=dtype)
+                ehs = torch.randn((1, 77, cdim), device=device, dtype=dtype)
+                calib.append((s, torch.tensor([t], device=device, dtype=torch.float32), ehs))
+        quantize_unet_fp8(wrapped_unet, calib, high_precision="Half", sensitive=SDXL_SENSITIVE)
+        os.environ["LRD_FP8_EXPORT"] = "1"   # gate export_onnx/optimize_onnx to preserve Q/DQ
+
     o, oo = onnx_pair("unet")
     compile_unet(wrapped_unet, unet_model, o, oo, f"{args.output}/unet.engine",
                  opt_batch_size=args.opt_batch, engine_build_options=build_opts)
+    os.environ.pop("LRD_FP8_EXPORT", None)   # scope the flag to the UNet build only
 
     # ---- VAE decoder ----
     # The decoder engine traces latent(4ch)->image, but vae.forward is encode->decode. EngineManager

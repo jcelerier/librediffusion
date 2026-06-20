@@ -24,14 +24,16 @@ class ControlNetUNetExportWrapper(torch.nn.Module):
         
         # Detect if this is SDXL based on UNet config
         self.is_sdxl = self._detect_sdxl_architecture(unet)
-        
-        # SDXL ControlNet has different structure than SD1.5
-        if self.is_sdxl:
-            # SDXL has 1 initial + 3 down blocks producing 9 control tensors total
-            self.expected_down_blocks = 9
-        else:
-            # SD1.5 has 12 down blocks
-            self.expected_down_blocks = 12
+
+        # The number of down-block control residuals is whatever get_control declared (== the
+        # count of input_control_* names, excluding the middle). This is the single source of
+        # truth and works for every arch: SD1.5=12, SDXL=9, SDXS(pruned, lpb1)=6. Do NOT hardcode
+        # per-architecture — SDXS and SDXL are both 3-block but differ (6 vs 9) by layers_per_block.
+        self.expected_down_blocks = sum(
+            1 for n in self.control_names if "input_control" in n and "middle" not in n
+        )
+        if self.expected_down_blocks == 0:  # fallback for legacy naming
+            self.expected_down_blocks = 9 if self.is_sdxl else 12
     
     def _detect_sdxl_architecture(self, unet):
         """Detect if UNet is SDXL based on architecture"""
@@ -123,82 +125,21 @@ class ControlNetUNetExportWrapper(torch.nn.Module):
             raise
     
     def _adapt_control_tensors(self, control_tensors, sample):
-        """Adapt control tensor shapes to match UNet expectations"""
-        if not control_tensors:
-            return control_tensors
-            
-        adapted_tensors = []
-        sample_height, sample_width = sample.shape[-2:]
-        
-        # Updated factors to match the corrected control tensor generation
-        # SDXL: 9 tensors [88x88, 88x88, 88x88, 44x44, 44x44, 44x44, 22x22, 22x22, 22x22]
-        # Factors: [1, 1, 1, 2, 2, 2, 4, 4, 4] to match UNet down_block_res_samples structure
-        if self.is_sdxl:
-            expected_downsample_factors = [1, 1, 1, 2, 2, 2, 4, 4, 4]  # 9 tensors for SDXL
-        else:
-            expected_downsample_factors = [1, 1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8]  # 12 tensors for SD1.5
-        
-        for i, control_tensor in enumerate(control_tensors):
-            if control_tensor is None:
-                adapted_tensors.append(control_tensor)
-                continue
-                
-            # Check if tensor needs spatial adaptation
-            if len(control_tensor.shape) >= 4:
-                control_height, control_width = control_tensor.shape[-2:]
-                
-                # Use the correct downsampling factor for this tensor index
-                if i < len(expected_downsample_factors):
-                    downsample_factor = expected_downsample_factors[i]
-                    expected_height = sample_height // downsample_factor
-                    expected_width = sample_width // downsample_factor
-                    
-                    if control_height != expected_height or control_width != expected_width:
-                        # Use interpolation to adapt size
-                        import torch.nn.functional as F
-                        adapted_tensor = F.interpolate(
-                            control_tensor, 
-                            size=(expected_height, expected_width),
-                            mode='bilinear', 
-                            align_corners=False
-                        )
-                        adapted_tensors.append(adapted_tensor)
-                    else:
-                        adapted_tensors.append(control_tensor)
-                else:
-                    # Fallback for unexpected tensor count
-                    adapted_tensors.append(control_tensor)
-            else:
-                adapted_tensors.append(control_tensor)
-                
-        return adapted_tensors
-    
+        """Pass control residuals through unchanged.
+
+        The control inputs are declared by UNet.get_control() at EXACTLY the spatial/channel
+        shapes of the diffusers UNet's down_block_res_samples (verified against the real
+        ControlNetModel trace for SD1.5/SDXL/SDXS). The sample tensors fed during ONNX export
+        already carry those correct shapes, so NO interpolation is needed — and arch-guessed
+        per-index factor lists were WRONG for pruned arches (e.g. SDXS 3-block/lpb1 has factors
+        [1,1,2,2,4,4], not SDXL's [1,1,1,2,2,2,4,4,4]), which corrupted residual[i] to the wrong
+        resolution and broke the element-wise add in unet_2d_condition.forward. Keep this a
+        no-op: down_block_additional_residuals[i] must equal down_block_res_samples[i] as-is.
+        """
+        return list(control_tensors)
+
     def _adapt_middle_control_tensor(self, mid_control, sample):
-        """Adapt middle control tensor shape to match UNet expectations"""
-        if mid_control is None:
-            return mid_control
-            
-        # Middle control is typically at the bottleneck, so heavily downsampled
-        if len(mid_control.shape) >= 4 and len(sample.shape) >= 4:
-            sample_height, sample_width = sample.shape[-2:]
-            control_height, control_width = mid_control.shape[-2:]
-            
-            # For SDXL: middle block is at 4x downsampling (22x22 from 88x88)
-            # For SD1.5: middle block is at 8x downsampling
-            expected_factor = 4 if self.is_sdxl else 8
-            expected_height = sample_height // expected_factor
-            expected_width = sample_width // expected_factor
-            
-            if control_height != expected_height or control_width != expected_width:
-                import torch.nn.functional as F
-                adapted_tensor = F.interpolate(
-                    mid_control,
-                    size=(expected_height, expected_width),
-                    mode='bilinear',
-                    align_corners=False
-                )
-                return adapted_tensor
-                
+        """Pass the mid-block control residual through unchanged (see _adapt_control_tensors)."""
         return mid_control
 
 

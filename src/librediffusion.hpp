@@ -115,6 +115,11 @@ struct LibreDiffusionConfig
   int cache_maxframes = 1;                  // Max frames to cache
   bool use_tome_cache = false;              // Enable token merging (advanced)
   float tome_ratio = 0.5f;                  // Token merging ratio
+
+  // CUDA graph: capture the 1-step single_step path as one graph and replay per frame (~+18% on
+  // SD-Turbo/CN/IP 1-step; no-op/skip on multi-step, SDXL@1024, klein, V2V). Default OFF — enable per
+  // 1-step bundle after validation.
+  bool use_cuda_graph = false;
 };
 
 /**
@@ -398,6 +403,19 @@ public:
   std::unique_ptr<CUDATensor<__half>> model_pred_tmp_;
   std::unique_ptr<CUDATensor<__half>> unet_output_buffer_;
 
+  // Multi-step batched persistent scratch — hoisted from per-call stack CUDATensors so the batched
+  // denoise path does NO per-frame cudaMalloc (was the "spurious allocations" FIXME); grow-on-first-use.
+  // Prerequisite for capturing the multi-step path into a CUDA graph (a per-call malloc is illegal
+  // during capture). Behaviour-neutral: same buffers, just reused across frames.
+  std::unique_ptr<CUDATensor<__half>> mp_x_t_latent_;
+  std::unique_ptr<CUDATensor<__half>> mp_model_pred_;
+  std::unique_ptr<CUDATensor<__half>> mp_denoised_;
+  std::unique_ptr<CUDATensor<__half>> mp_concatenated_;
+  std::unique_ptr<CUDATensor<float>>  mp_unet_input_latent_fp32_;
+  std::unique_ptr<CUDATensor<__half>> mp_tiled_text_embeds_;
+  std::unique_ptr<CUDATensor<__half>> mp_tiled_time_ids_;
+  std::unique_ptr<CUDATensor<__half>> mp_ext_ehs_;
+
   // Scheduler parameters
   std::unique_ptr<CUDATensor<float>> alpha_prod_t_sqrt_;
   std::unique_ptr<CUDATensor<float>> beta_prod_t_sqrt_;
@@ -445,6 +463,9 @@ public:
   // Accumulators for the multi-net residual sum (allocated lazily to unet_batch_size geometry).
   std::vector<std::unique_ptr<CUDATensor<__half>>> controlnet_sum_down_;
   std::unique_ptr<CUDATensor<__half>> controlnet_sum_mid_;
+  // Persistent tiled-cond buffer (was a per-frame stack CUDATensor in run_controlnets -> illegal cudaMalloc
+  // during CUDA-graph capture). Grown on first use.
+  std::unique_ptr<CUDATensor<__half>> controlnet_cond_tiled_;
   bool controlnet_enabled_ = false;
 
   // IP-Adapter (baked UNet variant). Host-fed image tokens [num_tokens, dim] (pos + neg) + the per-layer
@@ -456,6 +477,23 @@ public:
   int ipadapter_num_tokens_ = 0;
   // On-device image encoder (optional): turns a raw style image into the pos/neg tokens above.
   std::unique_ptr<CLIPImageEncoderWrapper> ipadapter_image_encoder_;
+
+  // ---- CUDA graph (whole-frame capture of the 1-step single_step path) ----
+  // Gated, default OFF (librediffusion_config_set_cuda_graph). Capturable only for denoising_steps==1,
+  // mode != TEMPORAL_V2V (multi-step has per-step host branches + changing timestep).
+  // ~+18% on SD-Turbo/CN/IP, ~0 on multi-step/SDXL/klein.
+  bool graph_enabled_ = false;
+  bool graph_ready_ = false;
+  cudaGraph_t graph_ = nullptr;
+  cudaGraphExec_t graph_exec_ = nullptr;
+  uint64_t graph_sig_ = 0;
+  // Fixed staging buffer for the single_step input latent: the graph bakes the load_d2d SOURCE pointer,
+  // so the volatile caller pointer must be staged into THIS persistent buffer before the captured region.
+  std::unique_ptr<CUDATensor<__half>> graph_in_staging_;
+  // Hoisted IP-Adapter extended-ehs buffer (was a per-frame stack CUDATensor -> illegal cudaMalloc in capture).
+  std::unique_ptr<CUDATensor<__half>> ip_ext_ehs_;
+  uint64_t capture_signature() const;            // recapture key: config + persistent-buffer device addresses
+  void run_single_step_body(const __half* x_t_latent_in, __half* x_0_pred_out, cudaStream_t stream);
 
   // StreamV2V temporal state
   TemporalState temporal_state_;

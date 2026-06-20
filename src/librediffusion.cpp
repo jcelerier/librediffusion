@@ -37,6 +37,10 @@ LibreDiffusionPipeline::LibreDiffusionPipeline(const LibreDiffusionConfig& confi
 
 LibreDiffusionPipeline::~LibreDiffusionPipeline()
 {
+  if(graph_exec_)
+    cudaGraphExecDestroy(graph_exec_);
+  if(graph_)
+    cudaGraphDestroy(graph_);
   if(stream_)
   {
     cudaStreamDestroy(stream_);
@@ -158,7 +162,11 @@ void LibreDiffusionPipeline::set_controlnet_cond(int index, const __half* cond, 
   if(index < 0 || index >= (int)controlnet_cond_.size())
     throw std::runtime_error("set_controlnet_cond: index out of range");
   size_t n = (size_t)3 * img_h * img_w;
-  controlnet_cond_[index] = std::make_unique<CUDATensor<__half>>(n);
+  // Update IN PLACE (allocate only if absent/too small). Reallocating every frame moves the device
+  // address, which silently breaks CUDA-graph replay: the captured cond-tiling D2D copy bakes the
+  // capture-time address and would read a stale buffer forever (observed as "graph bakes the cond").
+  if(!controlnet_cond_[index] || controlnet_cond_[index]->size() < n)
+    controlnet_cond_[index] = std::make_unique<CUDATensor<__half>>(n);
   cudaMemcpyAsync(controlnet_cond_[index]->data(), cond, n * sizeof(__half),
                   cudaMemcpyDeviceToDevice, stream_);
   cudaStreamSynchronize(stream_);
@@ -176,7 +184,9 @@ void LibreDiffusionPipeline::set_controlnet_cond_rgba(
   cudaMemcpyAsync(controlnet_rgba_tmp_->data(), cpu_rgba, rgba_n * sizeof(uint8_t),
                   cudaMemcpyHostToDevice, stream_);
   size_t n = (size_t)3 * img_h * img_w;
-  controlnet_cond_[index] = std::make_unique<CUDATensor<__half>>(n);
+  // In place (see set_controlnet_cond): a stable device address is required for CUDA-graph replay.
+  if(!controlnet_cond_[index] || controlnet_cond_[index]->size() < n)
+    controlnet_cond_[index] = std::make_unique<CUDATensor<__half>>(n);
   launch_rgba_to_rgb_chw_01_fp16(controlnet_rgba_tmp_->data(), controlnet_cond_[index]->data(),
                                  1, img_h, img_w, stream_);
   cudaStreamSynchronize(stream_);
