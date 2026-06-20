@@ -146,6 +146,11 @@ void launch_klein_bn(const void* in, void* out, const void* mean, const void* st
 void launch_klein_img_ids(void* out, int Th, int Tw, void* stream_ptr);
 void launch_klein_txt_ids(void* out, int Lt, void* stream_ptr);
 void launch_klein_euler_axpy(void* x, const void* v, float dt, long N, void* stream_ptr);
+// out = (1-t)*a + t*b (bf16) — flow-match img2img start blend
+void launch_klein_lerp(void* out, const void* a, const void* b, float t, long N, void* stream_ptr);
+// inpaint per-step blend: x = mask*x + (1-mask)*(sigma_next*noise + (1-sigma_next)*ref); mask per-token [Lp]
+void launch_klein_inpaint_blend(void* x, const void* ref, const void* noise, const float* mask,
+                                float sigma_next, long Lp, int hidden, void* stream_ptr);
 void launch_klein_randn_bf16(void* out, unsigned long long seed, long N, void* stream_ptr);
 void launch_klein_bf16_to_fp32(const void* in, void* out, long N, void* stream_ptr);
 void launch_klein_fp32_to_bf16(const void* in, void* out, long N, void* stream_ptr);

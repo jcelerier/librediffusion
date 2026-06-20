@@ -187,12 +187,18 @@ void LibreDiffusionPipeline::set_ipadapter_tokens(
 {
   size_t n = (size_t)num_tokens * dim;
   ipadapter_num_tokens_ = num_tokens;
-  ipadapter_tokens_pos_ = std::make_unique<CUDATensor<__half>>(n);
+  // Grow-only: reuse the existing device buffer when the shape is unchanged so its address stays
+  // stable across frames. A moving address would silently desync a captured CUDA graph whose body
+  // memcpy's from these buffers (see run_single_step_body IP path + capture_signature). Reallocate
+  // only when the buffer is absent or too small.
+  if(!ipadapter_tokens_pos_ || ipadapter_tokens_pos_->size() < n)
+    ipadapter_tokens_pos_ = std::make_unique<CUDATensor<__half>>(n);
   cudaMemcpyAsync(ipadapter_tokens_pos_->data(), pos, n * sizeof(__half),
                   cudaMemcpyDeviceToDevice, stream_);
   if(neg)
   {
-    ipadapter_tokens_neg_ = std::make_unique<CUDATensor<__half>>(n);
+    if(!ipadapter_tokens_neg_ || ipadapter_tokens_neg_->size() < n)
+      ipadapter_tokens_neg_ = std::make_unique<CUDATensor<__half>>(n);
     cudaMemcpyAsync(ipadapter_tokens_neg_->data(), neg, n * sizeof(__half),
                     cudaMemcpyDeviceToDevice, stream_);
   }

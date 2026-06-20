@@ -73,13 +73,17 @@ void LibreDiffusionPipeline::run_controlnets(
                        * (config_.latent_width / midFac);
     if(k == 0)
     {
+      // Grow-only: reuse the persistent sum buffers when the geometry is unchanged (fixed config =
+      // zero cudaMalloc per denoising step, and a stable address for the captured single-step graph).
       for(int i = 0; i < nd; i++)
       {
-        controlnet_sum_down_[i] = std::make_unique<CUDATensor<__half>>(down_elems(i));
+        if(!controlnet_sum_down_[i] || controlnet_sum_down_[i]->size() < down_elems(i))
+          controlnet_sum_down_[i] = std::make_unique<CUDATensor<__half>>(down_elems(i));
         cudaMemcpyAsync(controlnet_sum_down_[i]->data(), net_down[i],
                         down_elems(i) * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
       }
-      controlnet_sum_mid_ = std::make_unique<CUDATensor<__half>>(mid_elems);
+      if(!controlnet_sum_mid_ || controlnet_sum_mid_->size() < mid_elems)
+        controlnet_sum_mid_ = std::make_unique<CUDATensor<__half>>(mid_elems);
       cudaMemcpyAsync(controlnet_sum_mid_->data(), net_mid, mid_elems * sizeof(__half),
                       cudaMemcpyDeviceToDevice, stream);
     }
@@ -1364,10 +1368,19 @@ uint64_t LibreDiffusionPipeline::capture_signature() const
   if(predict_x0_batch_model_pred) h = mix(h, ptr(predict_x0_batch_model_pred->data()));
   if(predict_x0_batch_denoised) h = mix(h, ptr(predict_x0_batch_denoised->data()));
   if(ip_ext_ehs_) h = mix(h, ptr(ip_ext_ehs_->data()));
+  // IP token source buffers: the captured body memcpy's from these into ip_ext_ehs_, so a moved
+  // address (set_ipadapter_tokens/_image reallocating) must force a recapture. Grow-only allocation
+  // keeps the address stable for a fixed shape, so this only changes when the shape actually changes.
+  if(ipadapter_tokens_pos_) h = mix(h, ptr(ipadapter_tokens_pos_->data()));
+  if(ipadapter_tokens_neg_) h = mix(h, ptr(ipadapter_tokens_neg_->data()));
   if(controlnet_cond_tiled_) h = mix(h, ptr(controlnet_cond_tiled_->data()));
   // Per-net cond source buffers the captured tiling-copy reads (now updated in place, so stable; a
   // resize still moves the address -> a changed signature -> recapture, which is the correct response).
   for(const auto& c : controlnet_cond_) if(c) h = mix(h, ptr(c->data()));
+  // Summed-residual buffers the captured forward_controlnet reads from (grow-only -> stable address;
+  // a geometry change moves them -> changed signature -> recapture, which is correct).
+  for(const auto& c : controlnet_sum_down_) if(c) h = mix(h, ptr(c->data()));
+  if(controlnet_sum_mid_) h = mix(h, ptr(controlnet_sum_mid_->data()));
   return h;
 }
 

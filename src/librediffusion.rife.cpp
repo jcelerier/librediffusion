@@ -48,13 +48,24 @@ void RifeInterpolator::ensureScratch(int H, int W, int exp)
   int total_out = 1; for(int i = 0; i < exp; ++i) total_out *= 2;   // 2^exp
   const int max_frames = total_out + 1;                            // 2^exp + 1 (both endpoints)
   int maxB = 1; for(int i = 1; i < exp; ++i) maxB *= 2;            // (count-1=1) * 2^(exp-1)
-  cudaMalloc(&scratch_prev_dev_, hw4);
-  cudaMalloc(&scratch_cur_dev_,  hw4);
-  cudaMalloc(&scratch_out_dev_,  (long)total_out * hw4);
-  cudaMalloc(&scratch_seq_a_,    (long)max_frames * per * sizeof(__half));
-  cudaMalloc(&scratch_seq_b_,    (long)max_frames * per * sizeof(__half));
-  cudaMalloc(&scratch_packed_,   (long)maxB * 6 * H * W * sizeof(__half));
-  cudaMalloc(&scratch_mids_,     (long)maxB * per * sizeof(__half));
+  // Checked allocation: on OOM, free whatever already succeeded and throw rather than dereferencing
+  // a null scratch pointer later (freeScratch is null-safe, so partial state cleans up correctly).
+  auto checked_malloc = [&](void** p, long bytes) {
+    cudaError_t e = cudaMalloc(p, (size_t)bytes);
+    if(e != cudaSuccess)
+    {
+      freeScratch();
+      throw std::runtime_error(std::string("RifeInterpolator: scratch cudaMalloc failed (")
+                               + cudaGetErrorString(e) + ")");
+    }
+  };
+  checked_malloc(&scratch_prev_dev_, hw4);
+  checked_malloc(&scratch_cur_dev_,  hw4);
+  checked_malloc(&scratch_out_dev_,  (long)total_out * hw4);
+  checked_malloc(&scratch_seq_a_,    (long)max_frames * per * sizeof(__half));
+  checked_malloc(&scratch_seq_b_,    (long)max_frames * per * sizeof(__half));
+  checked_malloc(&scratch_packed_,   (long)maxB * 6 * H * W * sizeof(__half));
+  checked_malloc(&scratch_mids_,     (long)maxB * per * sizeof(__half));
   scratch_H_ = H; scratch_W_ = W; scratch_exp_ = exp;
 }
 
