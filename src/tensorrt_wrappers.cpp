@@ -1601,4 +1601,122 @@ SDXLPromptEmbeddings computeClipEmbeddings_SDXL(
   return ret;
 }
 
+// ============================================================================
+// CLIPImageEncoderWrapper (IP-Adapter on-device image encode + projection)
+// ============================================================================
+
+CLIPImageEncoderWrapper::CLIPImageEncoderWrapper(
+    const std::string& encoder_engine_path, const std::string& proj_engine_path)
+{
+  loadEngines(encoder_engine_path, proj_engine_path);
+}
+
+CLIPImageEncoderWrapper::~CLIPImageEncoderWrapper()
+{
+  proj_context_.reset();
+  enc_context_.reset();
+}
+
+void CLIPImageEncoderWrapper::loadEngines(
+    const std::string& encoder_engine_path, const std::string& proj_engine_path)
+{
+  enc_engine_ = getCachedEngine(encoder_engine_path);
+  if(!enc_engine_ || !enc_engine_->isValid())
+    throw std::runtime_error(
+        "Failed to load IP-Adapter image encoder engine: " + encoder_engine_path);
+  enc_context_.reset(enc_engine_->createExecutionContext());
+  if(!enc_context_)
+    throw std::runtime_error("Failed to create IP-Adapter image encoder context");
+
+  proj_engine_ = getCachedEngine(proj_engine_path);
+  if(!proj_engine_ || !proj_engine_->isValid())
+    throw std::runtime_error(
+        "Failed to load IP-Adapter image projection engine: " + proj_engine_path);
+  proj_context_.reset(proj_engine_->createExecutionContext());
+  if(!proj_context_)
+    throw std::runtime_error("Failed to create IP-Adapter image projection context");
+
+  // Discover num_tokens / token_dim from the proj engine's ip_tokens output [B, num_tokens, dim].
+  nvinfer1::Dims in_dims;
+  in_dims.nbDims = 2;
+  in_dims.d[0] = 1;
+  in_dims.d[1] = 1024; // CLIP projection_dim
+  proj_context_->setInputShape("image_embeds", in_dims);
+  nvinfer1::Dims out = proj_context_->getTensorShape("ip_tokens");
+  if(out.nbDims == 3)
+  {
+    num_tokens_ = out.d[1];
+    token_dim_ = out.d[2];
+  }
+  else
+  {
+    num_tokens_ = 4;
+    token_dim_ = 768;
+  }
+}
+
+void CLIPImageEncoderWrapper::encodeImage(
+    const uint8_t* cpu_rgba, int in_h, int in_w, __half* pos_out, __half* neg_out,
+    cudaStream_t stream)
+{
+  // 1. Upload host RGBA and preprocess (Lanczos-3 resize 224 + CLIP normalize) -> [1,3,224,224] fp16.
+  size_t rgba_n = (size_t)in_h * in_w * 4;
+  if(!d_rgba_ || d_rgba_->size() < rgba_n)
+    d_rgba_ = std::make_unique<CUDATensor<uint8_t>>(rgba_n);
+  cudaMemcpyAsync(
+      d_rgba_->data(), cpu_rgba, rgba_n * sizeof(uint8_t), cudaMemcpyHostToDevice, stream);
+
+  const size_t pixel_n = (size_t)1 * 3 * 224 * 224;
+  if(!d_pixel_)
+    d_pixel_ = std::make_unique<CUDATensor<__half>>(pixel_n);
+  launch_clip_image_preprocess_fp16(
+      d_rgba_->data(), d_pixel_->data(), in_h, in_w, stream);
+
+  // 2. CLIP image encode: pixel_values [1,3,224,224] -> image_embeds [1,1024].
+  if(!d_image_embeds_)
+    d_image_embeds_ = std::make_unique<CUDATensor<__half>>(1024);
+  {
+    nvinfer1::Dims d;
+    d.nbDims = 4;
+    d.d[0] = 1; d.d[1] = 3; d.d[2] = 224; d.d[3] = 224;
+    if(!enc_context_->setInputShape("pixel_values", d))
+      throw std::runtime_error("Failed to set CLIP image encoder pixel_values shape");
+    if(!enc_context_->allInputDimensionsSpecified())
+      throw std::runtime_error("CLIP image encoder: not all input dims specified");
+    enc_context_->setTensorAddress("pixel_values", d_pixel_->data());
+    enc_context_->setTensorAddress("image_embeds", d_image_embeds_->data());
+    if(!enc_context_->enqueueV3(stream))
+      throw std::runtime_error("Failed to enqueue CLIP image encoder");
+  }
+
+  // 3a. Project the image_embeds -> positive tokens [num_tokens, dim].
+  auto run_proj = [&](const __half* embeds, __half* out) {
+    nvinfer1::Dims d;
+    d.nbDims = 2;
+    d.d[0] = 1; d.d[1] = 1024;
+    if(!proj_context_->setInputShape("image_embeds", d))
+      throw std::runtime_error("Failed to set ip_image_proj image_embeds shape");
+    if(!proj_context_->allInputDimensionsSpecified())
+      throw std::runtime_error("ip_image_proj: not all input dims specified");
+    proj_context_->setTensorAddress("image_embeds", const_cast<__half*>(embeds));
+    proj_context_->setTensorAddress("ip_tokens", out);
+    if(!proj_context_->enqueueV3(stream))
+      throw std::runtime_error("Failed to enqueue ip_image_proj");
+  };
+  run_proj(d_image_embeds_->data(), pos_out);
+
+  // 3b. NEGATIVE tokens = projection of ZEROS image_embeds (encoder NOT re-run; base IP-Adapter).
+  if(neg_out)
+  {
+    if(!d_zero_embeds_)
+    {
+      d_zero_embeds_ = std::make_unique<CUDATensor<__half>>(1024);
+      cudaMemsetAsync(d_zero_embeds_->data(), 0, 1024 * sizeof(__half), stream);
+    }
+    run_proj(d_zero_embeds_->data(), neg_out);
+  }
+
+  cudaStreamSynchronize(stream);
+}
+
 } // namespace librediffusion

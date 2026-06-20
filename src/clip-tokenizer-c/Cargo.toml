@@ -10,6 +10,10 @@ crate-type = ["staticlib", "cdylib"]
 regex = "1.10"
 flate2 = "1.0"
 lazy_static = "1.4"
+# FLUX.2-klein-4B Qwen tokenizer (Phase 4): loads tokenizer.json (Qwen2 byte-level pretokenizer
+# regex + BPE merges + special-token table). Kept in this crate so there is a SINGLE Rust staticlib
+# linked into liblibrediffusion.so (two Rust staticlibs would duplicate the Rust std runtime).
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 
 [profile.release]
 opt-level = 3

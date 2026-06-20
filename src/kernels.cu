@@ -973,6 +973,88 @@ void launch_rgba_to_rgb_chw_01_fp16(
         (const uint8_t*)rgba_in, (__half*)rgb_out, n, h, w);
 }
 
+// ---- IP-Adapter CLIP image preprocess: separable Lanczos-3 resize RGBA->224 + CLIP normalize ----
+// Matches PIL LANCZOS (a=3) downscale + HF CLIPImageProcessor (rescale 1/255, mean/std). One thread
+// per output (c, y, x) of the [1,3,224,224] result; computes both separable passes inline (cheap at
+// 224x224). For a square input the shortest-edge-224 resize + center crop reduces to a direct resize.
+#define IPCLIP_OUT 224
+__device__ __forceinline__ float lanczos3(float x)
+{
+    // a = 3 windowed sinc. lanczos(0)=1.
+    if(x < 0.0f) x = -x;
+    if(x >= 3.0f) return 0.0f;
+    if(x < 1e-7f) return 1.0f;
+    const float pix = 3.14159265358979323846f * x;
+    return 3.0f * sinf(pix) * sinf(pix / 3.0f) / (pix * pix);
+}
+
+__global__ void clip_image_preprocess_kernel(
+    const uint8_t* __restrict__ rgba_in, __half* __restrict__ chw_out, int in_h, int in_w)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int HW = IPCLIP_OUT * IPCLIP_OUT;
+    if(idx >= 3 * HW) return;
+    int c = idx / HW;
+    int pix = idx % HW;
+    int oy = pix / IPCLIP_OUT;
+    int ox = pix % IPCLIP_OUT;
+
+    // PIL-style separable resampling: per-axis scale = in/out, filterscale = max(scale,1).
+    const float scale_x = (float)in_w / (float)IPCLIP_OUT;
+    const float scale_y = (float)in_h / (float)IPCLIP_OUT;
+    const float fsx = scale_x > 1.0f ? scale_x : 1.0f;
+    const float fsy = scale_y > 1.0f ? scale_y : 1.0f;
+    const float supx = 3.0f * fsx;
+    const float supy = 3.0f * fsy;
+
+    const float cx = (ox + 0.5f) * scale_x;
+    const float cy = (oy + 0.5f) * scale_y;
+    int lx = (int)floorf(cx - supx), rx = (int)ceilf(cx + supx);
+    int ly = (int)floorf(cy - supy), ry = (int)ceilf(cy + supy);
+
+    // Precompute and normalize the y weights into the accumulation, x weights inline.
+    float wsum_y = 0.0f;
+    for(int sy = ly; sy < ry; ++sy)
+        wsum_y += lanczos3((sy + 0.5f - cy) / fsy);
+    float wsum_x = 0.0f;
+    for(int sx = lx; sx < rx; ++sx)
+        wsum_x += lanczos3((sx + 0.5f - cx) / fsx);
+    if(wsum_y == 0.0f) wsum_y = 1.0f;
+    if(wsum_x == 0.0f) wsum_x = 1.0f;
+
+    float acc = 0.0f;
+    for(int sy = ly; sy < ry; ++sy)
+    {
+        float wy = lanczos3((sy + 0.5f - cy) / fsy) / wsum_y;
+        int cyi = sy < 0 ? 0 : (sy >= in_h ? in_h - 1 : sy);
+        float row = 0.0f;
+        for(int sx = lx; sx < rx; ++sx)
+        {
+            float wx = lanczos3((sx + 0.5f - cx) / fsx) / wsum_x;
+            int cxi = sx < 0 ? 0 : (sx >= in_w ? in_w - 1 : sx);
+            uint8_t v = rgba_in[(cyi * in_w + cxi) * 4 + c];
+            row += wx * (float)v;
+        }
+        acc += wy * row;
+    }
+    // acc is in [0,255]; rescale + CLIP normalize.
+    const float mean[3] = {0.48145466f, 0.4578275f, 0.40821073f};
+    const float istd[3] = {1.0f / 0.26862954f, 1.0f / 0.26130258f, 1.0f / 0.27577711f};
+    float val = (acc / 255.0f - mean[c]) * istd[c];
+    chw_out[idx] = __float2half(val);
+}
+
+void launch_clip_image_preprocess_fp16(
+    const void* rgba_in, void* chw_out, int in_h, int in_w, void* stream_ptr)
+{
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    int total = 3 * IPCLIP_OUT * IPCLIP_OUT;
+    int block = 256, grid = (total + block - 1) / block;
+    clip_image_preprocess_kernel<<<grid, block, 0, stream>>>(
+        (const uint8_t*)rgba_in, (__half*)chw_out, in_h, in_w);
+}
+#undef IPCLIP_OUT
+
 // Multi-ControlNet residual sum: acc[i] += src[i].
 __global__ void tensor_add_fp16_kernel(__half* acc, const __half* src, int n)
 {
