@@ -2,6 +2,8 @@
 #include "tensorrt_wrappers.hpp"
 #include "kernels.hpp"
 
+#include <stdexcept>
+
 namespace librediffusion
 {
 
