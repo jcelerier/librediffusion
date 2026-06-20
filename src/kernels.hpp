@@ -82,6 +82,18 @@ void launch_rgba_to_rgb_normalized_fp16(
     int n, int h, int w,
     void* stream_ptr);
 
+// ControlNet control image: RGBA uint8 (NHWC [N,H,W,4]) -> RGB fp16 NCHW [N,3,H,W] in [0,1]
+// (ToTensor semantics: /255, no [-1,1] shift, channels-first). Alpha ignored.
+void launch_rgba_to_rgb_chw_01_fp16(
+    const void* rgba_in,
+    void* rgb_out,
+    int n, int h, int w,
+    void* stream_ptr);
+
+// Add a control residual into an accumulator (multi-ControlNet sum): acc[i] += src[i] (fp16).
+void launch_tensor_add_fp16(
+    void* acc, const void* src, int n, void* stream_ptr);
+
 // Weighted accumulate for embedding blending: acc += weight * src
 void launch_weighted_accumulate_fp16(
     void* accumulator,        // In/out: accumulated result

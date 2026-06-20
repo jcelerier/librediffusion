@@ -152,4 +152,41 @@ void LibreDiffusionPipeline::set_init_noise(const __half* noise)
   cudaStreamSynchronize(stream_);
 }
 
+void LibreDiffusionPipeline::set_controlnet_cond(int index, const __half* cond, int img_h, int img_w)
+{
+  // Store ONE [3, img_h, img_w] row (device, [0,1]); tiled to unet_batch_size at inference time.
+  if(index < 0 || index >= (int)controlnet_cond_.size())
+    throw std::runtime_error("set_controlnet_cond: index out of range");
+  size_t n = (size_t)3 * img_h * img_w;
+  controlnet_cond_[index] = std::make_unique<CUDATensor<__half>>(n);
+  cudaMemcpyAsync(controlnet_cond_[index]->data(), cond, n * sizeof(__half),
+                  cudaMemcpyDeviceToDevice, stream_);
+  cudaStreamSynchronize(stream_);
+}
+
+void LibreDiffusionPipeline::set_controlnet_cond_rgba(
+    int index, const uint8_t* cpu_rgba, int img_h, int img_w)
+{
+  // Convenience path: host RGBA uint8 [H,W,4] -> RGB fp16 NCHW [3,H,W] in [0,1] on-device.
+  if(index < 0 || index >= (int)controlnet_cond_.size())
+    throw std::runtime_error("set_controlnet_cond_rgba: index out of range");
+  size_t rgba_n = (size_t)img_h * img_w * 4;
+  if(!controlnet_rgba_tmp_ || controlnet_rgba_tmp_->size() < rgba_n)
+    controlnet_rgba_tmp_ = std::make_unique<CUDATensor<uint8_t>>(rgba_n);
+  cudaMemcpyAsync(controlnet_rgba_tmp_->data(), cpu_rgba, rgba_n * sizeof(uint8_t),
+                  cudaMemcpyHostToDevice, stream_);
+  size_t n = (size_t)3 * img_h * img_w;
+  controlnet_cond_[index] = std::make_unique<CUDATensor<__half>>(n);
+  launch_rgba_to_rgb_chw_01_fp16(controlnet_rgba_tmp_->data(), controlnet_cond_[index]->data(),
+                                 1, img_h, img_w, stream_);
+  cudaStreamSynchronize(stream_);
+}
+
+void LibreDiffusionPipeline::set_controlnet_scale(int index, float scale)
+{
+  if(index < 0 || index >= (int)controlnet_scales_.size())
+    throw std::runtime_error("set_controlnet_scale: index out of range");
+  controlnet_scales_[index] = scale;
+}
+
 }

@@ -24,6 +24,7 @@ namespace librediffusion
 
 // Forward declarations
 class UNetWrapper;
+class ControlNetWrapper;
 class VAEEncoderWrapper;
 class VAEDecoderWrapper;
 
@@ -76,6 +77,17 @@ struct LibreDiffusionConfig
   std::string unet_engine_path = "engines/unet.engine";
   std::string vae_encoder_path = "engines/vae_encoder.engine";
   std::string vae_decoder_path = "engines/vae_decoder.engine";
+
+  // ControlNet (multi). Each entry = one ControlNet engine + its conditioning scale. When non-empty
+  // AND the UNet engine is control-aware (declares input_control_* inputs), the pipeline runs every
+  // ControlNet each UNet step and SUMS their residuals before injection. conditioning_scale is BAKED
+  // by each engine. Preprocessing is EXTERNAL: the host feeds each net's control image via the C-API.
+  struct ControlNetSpec
+  {
+    std::string engine_path;
+    float conditioning_scale = 1.0f;
+  };
+  std::vector<ControlNetSpec> controlnets;
 
   std::vector<int> timestep_indices;
 
@@ -196,6 +208,15 @@ public:
 
   // Set initial noise from Python (for testing/validation)
   void set_init_noise(const __half* noise); // [denoising_steps, 4, latent_h, latent_w]
+
+  // Set ControlNet `index`'s image-space control input. Two overloads:
+  //  - device fp16 [1,3,img_h,img_w] in [0,1] (already preprocessed).
+  //  - host RGBA uint8 [img_h,img_w,4] — converted on-device to RGB fp16 NCHW [0,1].
+  // Stored as a single row; tiled to unet_batch_size internally each step.
+  void set_controlnet_cond(int index, const __half* cond, int img_h, int img_w);
+  void set_controlnet_cond_rgba(int index, const uint8_t* cpu_rgba, int img_h, int img_w);
+  // Live-adjust a net's conditioning scale (re-baked each step via the engine's scale input).
+  void set_controlnet_scale(int index, float scale);
 
   void reseed(int64_t seed);
 
@@ -376,6 +397,27 @@ public:
   std::unique_ptr<UNetWrapper> unet_;
   std::unique_ptr<VAEEncoderWrapper> vae_encoder_;
   std::unique_ptr<VAEDecoderWrapper> vae_decoder_;
+
+  // Run every configured ControlNet on the current step's inputs and SUM their residuals into
+  // controlnet_sum_down_/_mid_. Fills out_down[down_count]/out_mid with the summed residual pointers.
+  // SDXL passes text_embeds/time_ids (else nullptr/0). down_count set to 12 (SD1.5) / 9 (SDXL).
+  void run_controlnets(
+      const __half* sample_fp16, const float* timestep, const __half* ehs,
+      const __half* text_embeds, const __half* time_ids,
+      int unet_batch_size, int seq_len, int hidden_dim, int pooled_dim,
+      const __half** out_down, const __half** out_mid, int& down_count, void* stream);
+
+  // ControlNet (multi, optional). One wrapper + one [1,3,H,W] [0,1] cond buffer + one live scale per
+  // net. Each UNet step: run every net, SUM their residuals (controlnet_sum_down_/_mid_), inject once.
+  // Preprocessing is EXTERNAL — host feeds each net's cond via set_controlnet_cond[_rgba](index,...).
+  std::vector<std::unique_ptr<ControlNetWrapper>> controlnets_;
+  std::vector<std::unique_ptr<CUDATensor<__half>>> controlnet_cond_;  // per-net [1,3,H,W] [0,1]
+  std::vector<float> controlnet_scales_;                              // per-net (live-adjustable)
+  std::unique_ptr<CUDATensor<uint8_t>> controlnet_rgba_tmp_;          // RGBA upload scratch
+  // Accumulators for the multi-net residual sum (allocated lazily to unet_batch_size geometry).
+  std::vector<std::unique_ptr<CUDATensor<__half>>> controlnet_sum_down_;
+  std::unique_ptr<CUDATensor<__half>> controlnet_sum_mid_;
+  bool controlnet_enabled_ = false;
 
   // StreamV2V temporal state
   TemporalState temporal_state_;

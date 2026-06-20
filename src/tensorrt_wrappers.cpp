@@ -10,6 +10,7 @@
 #include "librediffusion.hpp" // For CUDATensor
 
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -107,6 +108,21 @@ void UNetWrapper::loadEngine(const std::string& engine_path)
       timestep_fixed_extent_ = static_cast<int>(ts.d[0]);
       std::cout << "Note: engine declares a fixed timestep extent of "
                 << timestep_fixed_extent_ << " for " << engine_path << std::endl;
+    }
+
+    // Detect a control-aware UNet engine: it declares input_control_00 (+ ..11 + _middle). When
+    // present, forward_controlnet() binds the ControlNet residuals; plain forward() leaves them unset
+    // (which would fail allInputDimensionsSpecified — callers must use forward_controlnet for these).
+    for(int i = 0; i < eng->getNbIOTensors(); i++)
+    {
+      const char* tn = eng->getIOTensorName(i);
+      if(tn && std::string(tn) == "input_control_00")
+      {
+        has_control_inputs_ = true;
+        std::cout << "Note: engine is control-aware (input_control_* inputs) for " << engine_path
+                  << std::endl;
+        break;
+      }
     }
   }
 }
@@ -260,6 +276,247 @@ void UNetWrapper::forward(
   // These will be used for feature injection in LibreDiffusionPipeline
 }
 
+void UNetWrapper::forward_controlnet(
+    const float* sample, const float* timestep, const __half* encoder_hidden_states,
+    const __half* const* down_residuals, const __half* mid_residual,
+    __half* output, int batch, int height, int width, int seq_len, int hidden_dim,
+    cudaStream_t stream)
+{
+  // SD1.5 ControlNet residual geometry (matches UNet.get_control / the engine's input_control_*):
+  //   down idx:  0   1   2    3    4    5    6     7     8     9    10    11
+  //   channels: 320 320 320  320  640  640  640  1280  1280  1280  1280  1280
+  //   factor:    1   1   1    2    2    2    4     4     4     8     8     8
+  //   mid: 1280 @ factor 8
+  static const int kDownCh[NUM_CONTROL_DOWN]
+      = {320, 320, 320, 320, 640, 640, 640, 1280, 1280, 1280, 1280, 1280};
+  static const int kDownFac[NUM_CONTROL_DOWN] = {1, 1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8};
+  const int kMidCh = 1280, kMidFac = 8;
+
+  int sample_size = batch * 4 * height * width;
+  int timestep_extent = (timestep_fixed_extent_ > 0) ? timestep_fixed_extent_ : batch;
+  int encoder_size = batch * seq_len * hidden_dim;
+  int output_size = batch * 4 * height * width;
+
+  bool needs_realloc = needsReallocation(batch, height, width, seq_len, hidden_dim);
+  if(needs_realloc)
+  {
+    sample_buffer_ = std::make_unique<CUDATensor<float>>(sample_size);
+    timestep_buffer_ = std::make_unique<CUDATensor<float>>(timestep_extent);
+    encoder_hidden_states_buffer_ = std::make_unique<CUDATensor<__half>>(encoder_size);
+    output_buffer_ = std::make_unique<CUDATensor<__half>>(output_size);
+    control_down_buffers_.clear();
+    control_down_buffers_.resize(NUM_CONTROL_DOWN);
+    for(int i = 0; i < NUM_CONTROL_DOWN; i++)
+    {
+      int h = height / kDownFac[i], w = width / kDownFac[i];
+      control_down_buffers_[i]
+          = std::make_unique<CUDATensor<__half>>(batch * kDownCh[i] * h * w);
+    }
+    control_mid_buffer_ = std::make_unique<CUDATensor<__half>>(
+        batch * kMidCh * (height / kMidFac) * (width / kMidFac));
+    shape_cache_.batch = batch;
+    shape_cache_.height = height;
+    shape_cache_.width = width;
+    shape_cache_.seq_len = seq_len;
+    shape_cache_.hidden_dim = hidden_dim;
+    shape_cache_.initialized = true;
+  }
+
+  // Copy core inputs into persistent buffers.
+  cudaMemcpyAsync(sample_buffer_->data(), sample, sample_size * sizeof(float),
+                  cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(timestep_buffer_->data(), timestep, timestep_extent * sizeof(float),
+                  cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(encoder_hidden_states_buffer_->data(), encoder_hidden_states,
+                  encoder_size * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+  // Copy the control residuals into persistent buffers (stable addresses for setTensorAddress).
+  for(int i = 0; i < NUM_CONTROL_DOWN; i++)
+  {
+    int h = height / kDownFac[i], w = width / kDownFac[i];
+    cudaMemcpyAsync(control_down_buffers_[i]->data(), down_residuals[i],
+                    (size_t)batch * kDownCh[i] * h * w * sizeof(__half),
+                    cudaMemcpyDeviceToDevice, stream);
+  }
+  cudaMemcpyAsync(control_mid_buffer_->data(), mid_residual,
+                  (size_t)batch * kMidCh * (height / kMidFac) * (width / kMidFac) * sizeof(__half),
+                  cudaMemcpyDeviceToDevice, stream);
+  cudaStreamSynchronize(stream);
+
+  // Set core shapes.
+  nvinfer1::Dims4 sample_dims{batch, 4, height, width};
+  nvinfer1::Dims timestep_dims;
+  timestep_dims.nbDims = 1;
+  timestep_dims.d[0] = timestep_extent;
+  nvinfer1::Dims3 hidden_states_dims{batch, seq_len, hidden_dim};
+  if(!context_->setInputShape("sample", sample_dims))
+    throw std::runtime_error("Failed to set sample shape");
+  if(!context_->setInputShape("timestep", timestep_dims))
+    throw std::runtime_error("Failed to set timestep shape");
+  if(!context_->setInputShape("encoder_hidden_states", hidden_states_dims))
+    throw std::runtime_error("Failed to set encoder_hidden_states shape");
+
+  // Set control residual shapes + addresses.
+  for(int i = 0; i < NUM_CONTROL_DOWN; i++)
+  {
+    char name[24];
+    std::snprintf(name, sizeof(name), "input_control_%02d", i);
+    int h = height / kDownFac[i], w = width / kDownFac[i];
+    nvinfer1::Dims4 d{batch, kDownCh[i], h, w};
+    if(!context_->setInputShape(name, d))
+      throw std::runtime_error(std::string("Failed to set ") + name + " shape");
+    if(!context_->setTensorAddress(name, control_down_buffers_[i]->data()))
+      throw std::runtime_error(std::string("Failed to set ") + name + " address");
+  }
+  {
+    nvinfer1::Dims4 dmid{batch, kMidCh, height / kMidFac, width / kMidFac};
+    if(!context_->setInputShape("input_control_middle", dmid))
+      throw std::runtime_error("Failed to set input_control_middle shape");
+    if(!context_->setTensorAddress("input_control_middle", control_mid_buffer_->data()))
+      throw std::runtime_error("Failed to set input_control_middle address");
+  }
+
+  if(!context_->allInputDimensionsSpecified())
+    throw std::runtime_error("Not all input dimensions specified (controlnet UNet)");
+
+  if(!context_->setTensorAddress("sample", sample_buffer_->data()))
+    throw std::runtime_error("Failed to set sample tensor address");
+  if(!context_->setTensorAddress("timestep", timestep_buffer_->data()))
+    throw std::runtime_error("Failed to set timestep tensor address");
+  if(!context_->setTensorAddress("encoder_hidden_states", encoder_hidden_states_buffer_->data()))
+    throw std::runtime_error("Failed to set encoder_hidden_states tensor address");
+  if(!context_->setTensorAddress("latent", output_buffer_->data()))
+    throw std::runtime_error("Failed to set latent tensor address");
+
+  if(!context_->enqueueV3(stream))
+    throw std::runtime_error("Failed to enqueue inference (controlnet UNet)");
+
+  cudaMemcpyAsync(output, output_buffer_->data(), output_size * sizeof(__half),
+                  cudaMemcpyDeviceToDevice, stream);
+}
+
+void UNetWrapper::forward_controlnet_sdxl(
+    const float* sample, const float* timestep, const __half* encoder_hidden_states,
+    const __half* text_embeds, const __half* time_ids,
+    const __half* const* down_residuals, const __half* mid_residual,
+    __half* output, int batch, int height, int width, int seq_len, int hidden_dim,
+    int pooled_dim, cudaStream_t stream)
+{
+  // SDXL ControlNet residual geometry: 9 down + mid, factors [1,1,1,2,2,2,4,4,4] + mid 4.
+  static const int kDownCh[9] = {320, 320, 320, 320, 640, 640, 640, 1280, 1280};
+  static const int kDownFac[9] = {1, 1, 1, 2, 2, 2, 4, 4, 4};
+  const int kNumDown = 9, kMidCh = 1280, kMidFac = 4;
+
+  int sample_size = batch * 4 * height * width;
+  int timestep_extent = (timestep_fixed_extent_ > 0) ? timestep_fixed_extent_ : batch;
+  int encoder_size = batch * seq_len * hidden_dim;
+  int output_size = batch * 4 * height * width;
+
+  bool needs_realloc = needsReallocation(batch, height, width, seq_len, hidden_dim, pooled_dim);
+  if(needs_realloc)
+  {
+    sample_buffer_ = std::make_unique<CUDATensor<float>>(sample_size);
+    timestep_buffer_ = std::make_unique<CUDATensor<float>>(timestep_extent);
+    encoder_hidden_states_buffer_ = std::make_unique<CUDATensor<__half>>(encoder_size);
+    text_embeds_buffer_ = std::make_unique<CUDATensor<__half>>(batch * pooled_dim);
+    time_ids_buffer_ = std::make_unique<CUDATensor<__half>>(batch * 6);
+    output_buffer_ = std::make_unique<CUDATensor<__half>>(output_size);
+    control_down_buffers_.clear();
+    control_down_buffers_.resize(kNumDown);
+    for(int i = 0; i < kNumDown; i++)
+    {
+      int h = height / kDownFac[i], w = width / kDownFac[i];
+      control_down_buffers_[i] = std::make_unique<CUDATensor<__half>>(batch * kDownCh[i] * h * w);
+    }
+    control_mid_buffer_ = std::make_unique<CUDATensor<__half>>(
+        batch * kMidCh * (height / kMidFac) * (width / kMidFac));
+    shape_cache_.batch = batch;
+    shape_cache_.height = height;
+    shape_cache_.width = width;
+    shape_cache_.seq_len = seq_len;
+    shape_cache_.hidden_dim = hidden_dim;
+    shape_cache_.pooled_dim = pooled_dim;
+    shape_cache_.initialized = true;
+  }
+
+  cudaMemcpyAsync(sample_buffer_->data(), sample, sample_size * sizeof(float),
+                  cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(timestep_buffer_->data(), timestep, timestep_extent * sizeof(float),
+                  cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(encoder_hidden_states_buffer_->data(), encoder_hidden_states,
+                  encoder_size * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(text_embeds_buffer_->data(), text_embeds, batch * pooled_dim * sizeof(__half),
+                  cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(time_ids_buffer_->data(), time_ids, batch * 6 * sizeof(__half),
+                  cudaMemcpyDeviceToDevice, stream);
+  for(int i = 0; i < kNumDown; i++)
+  {
+    int h = height / kDownFac[i], w = width / kDownFac[i];
+    cudaMemcpyAsync(control_down_buffers_[i]->data(), down_residuals[i],
+                    (size_t)batch * kDownCh[i] * h * w * sizeof(__half),
+                    cudaMemcpyDeviceToDevice, stream);
+  }
+  cudaMemcpyAsync(control_mid_buffer_->data(), mid_residual,
+                  (size_t)batch * kMidCh * (height / kMidFac) * (width / kMidFac) * sizeof(__half),
+                  cudaMemcpyDeviceToDevice, stream);
+  cudaStreamSynchronize(stream);
+
+  nvinfer1::Dims4 sample_dims{batch, 4, height, width};
+  nvinfer1::Dims timestep_dims; timestep_dims.nbDims = 1; timestep_dims.d[0] = timestep_extent;
+  nvinfer1::Dims3 hidden_states_dims{batch, seq_len, hidden_dim};
+  nvinfer1::Dims2 te_dims{batch, pooled_dim};
+  nvinfer1::Dims2 ti_dims{batch, 6};
+  if(!context_->setInputShape("sample", sample_dims))
+    throw std::runtime_error("Failed to set sample shape");
+  if(!context_->setInputShape("timestep", timestep_dims))
+    throw std::runtime_error("Failed to set timestep shape");
+  if(!context_->setInputShape("encoder_hidden_states", hidden_states_dims))
+    throw std::runtime_error("Failed to set encoder_hidden_states shape");
+  if(!context_->setInputShape("text_embeds", te_dims))
+    throw std::runtime_error("Failed to set text_embeds shape");
+  if(!context_->setInputShape("time_ids", ti_dims))
+    throw std::runtime_error("Failed to set time_ids shape");
+  for(int i = 0; i < kNumDown; i++)
+  {
+    char name[24];
+    std::snprintf(name, sizeof(name), "input_control_%02d", i);
+    int h = height / kDownFac[i], w = width / kDownFac[i];
+    nvinfer1::Dims4 d{batch, kDownCh[i], h, w};
+    if(!context_->setInputShape(name, d))
+      throw std::runtime_error(std::string("Failed to set ") + name + " shape");
+    if(!context_->setTensorAddress(name, control_down_buffers_[i]->data()))
+      throw std::runtime_error(std::string("Failed to set ") + name + " address");
+  }
+  {
+    nvinfer1::Dims4 dmid{batch, kMidCh, height / kMidFac, width / kMidFac};
+    if(!context_->setInputShape("input_control_middle", dmid))
+      throw std::runtime_error("Failed to set input_control_middle shape");
+    if(!context_->setTensorAddress("input_control_middle", control_mid_buffer_->data()))
+      throw std::runtime_error("Failed to set input_control_middle address");
+  }
+
+  if(!context_->allInputDimensionsSpecified())
+    throw std::runtime_error("Not all input dimensions specified (controlnet SDXL UNet)");
+
+  if(!context_->setTensorAddress("sample", sample_buffer_->data()))
+    throw std::runtime_error("Failed to set sample tensor address");
+  if(!context_->setTensorAddress("timestep", timestep_buffer_->data()))
+    throw std::runtime_error("Failed to set timestep tensor address");
+  if(!context_->setTensorAddress("encoder_hidden_states", encoder_hidden_states_buffer_->data()))
+    throw std::runtime_error("Failed to set encoder_hidden_states tensor address");
+  if(!context_->setTensorAddress("text_embeds", text_embeds_buffer_->data()))
+    throw std::runtime_error("Failed to set text_embeds tensor address");
+  if(!context_->setTensorAddress("time_ids", time_ids_buffer_->data()))
+    throw std::runtime_error("Failed to set time_ids tensor address");
+  if(!context_->setTensorAddress("latent", output_buffer_->data()))
+    throw std::runtime_error("Failed to set latent tensor address");
+
+  if(!context_->enqueueV3(stream))
+    throw std::runtime_error("Failed to enqueue inference (controlnet SDXL UNet)");
+
+  cudaMemcpyAsync(output, output_buffer_->data(), output_size * sizeof(__half),
+                  cudaMemcpyDeviceToDevice, stream);
+}
+
 void UNetWrapper::forward_sdxl(
     const float* sample, const float* timestep, const __half* encoder_hidden_states,
     const __half* text_embeds, const __half* time_ids,
@@ -395,6 +652,196 @@ void UNetWrapper::forward_sdxl(
   cudaMemcpyAsync(
       output, output_buffer_->data(), output_size * sizeof(__half),
       cudaMemcpyDeviceToDevice, stream);
+}
+
+// ============================================================================
+// ControlNetWrapper Implementation
+// ============================================================================
+
+ControlNetWrapper::ControlNetWrapper(const std::string& engine_path)
+{
+  loadEngine(engine_path);
+}
+
+ControlNetWrapper::~ControlNetWrapper() = default;
+
+void ControlNetWrapper::loadEngine(const std::string& engine_path)
+{
+  cached_engine_ = getCachedEngine(engine_path);
+  if(!cached_engine_ || !cached_engine_->isValid())
+    throw std::runtime_error("Failed to load ControlNet engine from cache: " + engine_path);
+  std::cout << "Note: Using cached TensorRT engine for " << engine_path << std::endl;
+  context_ = std::unique_ptr<nvinfer1::IExecutionContext>(cached_engine_->createExecutionContext());
+  if(!context_)
+    throw std::runtime_error("Failed to create ControlNet execution context");
+
+  // Detect at load: (1) the conditioning_scale scalar input (name varies — SD1.5 trace = "onnx::Cast_4",
+  // SDXL = "conditioning_scale"; find the lone 0-dim FP32 input), (2) the down_block_* output COUNT
+  // (12 SD1.5 / 9 SDXL), (3) whether the engine is SDXL (has text_embeds + time_ids inputs).
+  nvinfer1::ICudaEngine* eng = cached_engine_->getEngine();
+  num_down_ = 0;
+  bool has_text_embeds = false, has_time_ids = false;
+  for(int i = 0; eng && i < eng->getNbIOTensors(); i++)
+  {
+    const char* tn = eng->getIOTensorName(i);
+    if(!tn) continue;
+    std::string nm = tn;
+    if(eng->getTensorIOMode(tn) == nvinfer1::TensorIOMode::kINPUT)
+    {
+      nvinfer1::Dims d = eng->getTensorShape(tn);
+      if(d.nbDims == 0 && eng->getTensorDataType(tn) == nvinfer1::DataType::kFLOAT)
+        scale_input_name_ = tn;
+      if(nm == "text_embeds") has_text_embeds = true;
+      if(nm == "time_ids") has_time_ids = true;
+    }
+    else if(nm.rfind("down_block_", 0) == 0)
+    {
+      num_down_++;
+    }
+  }
+  is_sdxl_ = has_text_embeds && has_time_ids;
+  if(num_down_ <= 0 || num_down_ > MAX_DOWN) num_down_ = 12;  // sane fallback
+  std::cout << "Note: ControlNet engine " << (is_sdxl_ ? "SDXL" : "SD1.5") << ", " << num_down_
+            << " down residuals, scale input = '"
+            << (scale_input_name_.empty() ? "(none)" : scale_input_name_) << "'" << std::endl;
+}
+
+void ControlNetWrapper::forward(
+    const __half* sample, const float* timestep, const __half* encoder_hidden_states,
+    const __half* controlnet_cond, float conditioning_scale,
+    const __half* text_embeds, const __half* time_ids,
+    int batch, int height, int width, int img_height, int img_width, int seq_len, int hidden_dim,
+    int pooled_dim, const __half** down_out, const __half** mid_out, cudaStream_t stream)
+{
+  // Per-arch residual geometry. SD1.5: 12 down, factors up to 8. SDXL: 9 down, factors up to 4.
+  static const int kSD15Ch[12] = {320,320,320,320,640,640,640,1280,1280,1280,1280,1280};
+  static const int kSD15Fac[12] = {1,1,1,2,2,2,4,4,4,8,8,8};
+  static const int kSDXLCh[9] = {320,320,320,320,640,640,640,1280,1280};
+  static const int kSDXLFac[9] = {1,1,1,2,2,2,4,4,4};
+  const int* kDownCh = is_sdxl_ ? kSDXLCh : kSD15Ch;
+  const int* kDownFac = is_sdxl_ ? kSDXLFac : kSD15Fac;
+  const int kMidCh = 1280, kMidFac = is_sdxl_ ? 4 : 8;
+  const int nd = num_down_;
+
+  const int sample_size = batch * 4 * height * width;
+  const int ehs_size = batch * seq_len * hidden_dim;
+  const int cond_size = batch * 3 * img_height * img_width;
+
+  const bool realloc = !shape_cache_.init || shape_cache_.batch != batch
+                       || shape_cache_.height != height || shape_cache_.width != width
+                       || shape_cache_.img_h != img_height || shape_cache_.img_w != img_width
+                       || shape_cache_.seq_len != seq_len || shape_cache_.hidden_dim != hidden_dim
+                       || shape_cache_.pooled_dim != pooled_dim;
+  if(realloc)
+  {
+    sample_buffer_ = std::make_unique<CUDATensor<__half>>(sample_size);
+    timestep_buffer_ = std::make_unique<CUDATensor<float>>(batch);
+    ehs_buffer_ = std::make_unique<CUDATensor<__half>>(ehs_size);
+    cond_buffer_ = std::make_unique<CUDATensor<__half>>(cond_size);
+    scale_buffer_ = std::make_unique<CUDATensor<float>>(1);
+    if(is_sdxl_)
+    {
+      text_embeds_buffer_ = std::make_unique<CUDATensor<__half>>(batch * pooled_dim);
+      time_ids_buffer_ = std::make_unique<CUDATensor<__half>>(batch * 6);
+    }
+    down_buffers_.clear();
+    down_buffers_.resize(nd);
+    for(int i = 0; i < nd; i++)
+    {
+      int h = height / kDownFac[i], w = width / kDownFac[i];
+      down_buffers_[i] = std::make_unique<CUDATensor<__half>>(batch * kDownCh[i] * h * w);
+    }
+    mid_buffer_ = std::make_unique<CUDATensor<__half>>(
+        batch * kMidCh * (height / kMidFac) * (width / kMidFac));
+    shape_cache_ = {batch, height, width, img_height, img_width, seq_len, hidden_dim, pooled_dim, true};
+  }
+
+  cudaMemcpyAsync(sample_buffer_->data(), sample, sample_size * sizeof(__half),
+                  cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(timestep_buffer_->data(), timestep, batch * sizeof(float),
+                  cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(ehs_buffer_->data(), encoder_hidden_states, ehs_size * sizeof(__half),
+                  cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(cond_buffer_->data(), controlnet_cond, cond_size * sizeof(__half),
+                  cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(scale_buffer_->data(), &conditioning_scale, sizeof(float),
+                  cudaMemcpyHostToDevice, stream);
+  if(is_sdxl_)
+  {
+    cudaMemcpyAsync(text_embeds_buffer_->data(), text_embeds, batch * pooled_dim * sizeof(__half),
+                    cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(time_ids_buffer_->data(), time_ids, batch * 6 * sizeof(__half),
+                    cudaMemcpyDeviceToDevice, stream);
+  }
+  cudaStreamSynchronize(stream);
+
+  nvinfer1::Dims4 sample_dims{batch, 4, height, width};
+  nvinfer1::Dims ts_dims; ts_dims.nbDims = 1; ts_dims.d[0] = batch;
+  nvinfer1::Dims3 ehs_dims{batch, seq_len, hidden_dim};
+  nvinfer1::Dims4 cond_dims{batch, 3, img_height, img_width};
+  if(!context_->setInputShape("sample", sample_dims))
+    throw std::runtime_error("CN: failed to set sample shape");
+  if(!context_->setInputShape("timestep", ts_dims))
+    throw std::runtime_error("CN: failed to set timestep shape");
+  if(!context_->setInputShape("encoder_hidden_states", ehs_dims))
+    throw std::runtime_error("CN: failed to set encoder_hidden_states shape");
+  if(!context_->setInputShape("controlnet_cond", cond_dims))
+    throw std::runtime_error("CN: failed to set controlnet_cond shape");
+  if(!scale_input_name_.empty())
+  {
+    nvinfer1::Dims scalar_dims; scalar_dims.nbDims = 0;
+    if(!context_->setInputShape(scale_input_name_.c_str(), scalar_dims))
+      throw std::runtime_error("CN: failed to set scale scalar shape");
+  }
+  if(is_sdxl_)
+  {
+    nvinfer1::Dims2 te{batch, pooled_dim};
+    nvinfer1::Dims2 ti{batch, 6};
+    if(!context_->setInputShape("text_embeds", te))
+      throw std::runtime_error("CN: failed to set text_embeds shape");
+    if(!context_->setInputShape("time_ids", ti))
+      throw std::runtime_error("CN: failed to set time_ids shape");
+  }
+
+  if(!context_->allInputDimensionsSpecified())
+    throw std::runtime_error("CN: not all input dimensions specified");
+
+  if(!context_->setTensorAddress("sample", sample_buffer_->data()))
+    throw std::runtime_error("CN: failed to set sample address");
+  if(!context_->setTensorAddress("timestep", timestep_buffer_->data()))
+    throw std::runtime_error("CN: failed to set timestep address");
+  if(!context_->setTensorAddress("encoder_hidden_states", ehs_buffer_->data()))
+    throw std::runtime_error("CN: failed to set encoder_hidden_states address");
+  if(!context_->setTensorAddress("controlnet_cond", cond_buffer_->data()))
+    throw std::runtime_error("CN: failed to set controlnet_cond address");
+  if(!scale_input_name_.empty())
+  {
+    if(!context_->setTensorAddress(scale_input_name_.c_str(), scale_buffer_->data()))
+      throw std::runtime_error("CN: failed to set scale address");
+  }
+  if(is_sdxl_)
+  {
+    if(!context_->setTensorAddress("text_embeds", text_embeds_buffer_->data()))
+      throw std::runtime_error("CN: failed to set text_embeds address");
+    if(!context_->setTensorAddress("time_ids", time_ids_buffer_->data()))
+      throw std::runtime_error("CN: failed to set time_ids address");
+  }
+
+  // Bind the down + mid outputs to our persistent buffers and report them back.
+  for(int i = 0; i < nd; i++)
+  {
+    char name[24];
+    std::snprintf(name, sizeof(name), "down_block_%02d", i);
+    if(!context_->setTensorAddress(name, down_buffers_[i]->data()))
+      throw std::runtime_error(std::string("CN: failed to set ") + name + " address");
+    down_out[i] = down_buffers_[i]->data();
+  }
+  if(!context_->setTensorAddress("mid_block", mid_buffer_->data()))
+    throw std::runtime_error("CN: failed to set mid_block address");
+  *mid_out = mid_buffer_->data();
+
+  if(!context_->enqueueV3(stream))
+    throw std::runtime_error("CN: failed to enqueue inference");
 }
 
 // ============================================================================
