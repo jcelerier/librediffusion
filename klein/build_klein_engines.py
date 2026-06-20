@@ -83,7 +83,10 @@ def build_transformer():
         "img_ids": ((1, 720, 4), (1, 1440, 4), (1, 1440, 4)),
         "txt_ids": ((1, 512, 4), (1, 512, 4), (1, 512, 4)),
     }
-    build(ONNX / "transformer/model.onnx", ENG / "transformer_bf16.plan", profiles, workspace_gb=14)
+    # Build from the dynamic-seq-FIXED ONNX (fix_klein_dynamic_seq.py rewrote the 50 baked Constant(1232)
+    # RoPE-reshape literals -> 0). Without this the engine comes out static-720 despite this profile,
+    # because TRT back-solves the baked 1232 and pins Lp=720.
+    build(ONNX / "transformer_dynseq/model.onnx", ENG / "transformer_bf16.plan", profiles, workspace_gb=14)
 
 
 def build_qwen():

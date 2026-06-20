@@ -259,6 +259,14 @@ void LibreDiffusionPipeline::init_buffers()
 
     temporal_state_.frame_id = 0;
   }
+
+  // CRITICAL: populate init_noise/stock_noise NOW. init_buffers() runs again from
+  // pipeline_init_all() AFTER the ctor's reseed(), re-allocating init_noise_ — so without this the
+  // freshly-allocated init_noise_ would be left UNFILLED (garbage) in the live img2img path (the
+  // shared-PCG noise generated in the ctor was thrown away by the re-alloc). reseed fills init_noise_
+  // with the shared launch_randn_fp16 PCG32 (matches Python pcg32_randn), zeros stock_noise, and
+  // seeds the v2v temporal buffers.
+  reseed(config_.seed);
 }
 
 void LibreDiffusionPipeline::init_npp()

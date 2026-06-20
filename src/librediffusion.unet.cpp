@@ -519,6 +519,18 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
           unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
           ext_tok, config_.text_hidden_dim, stream);
     }
+    else if(config_.mode == PipelineMode::TEMPORAL_V2V && unet_->hasV2VKvo())
+    {
+      // StreamV2V (live kvo): the UNet engine concatenates the previous frames' banked K/V into each
+      // self-attention. forward_v2v binds the rolling bank (kvo_cache_in_*), enqueues, reads this
+      // frame's K/V (kvo_cache_out_*), and rolls the bank — one UNet call per frame == one bank update.
+      unet_->forward_v2v(
+          unet_input_latent_fp32.data(), unet_input_timestep_ptr, unet_encoder_hidden_states_ptr,
+          unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
+          config_.text_seq_len, config_.text_hidden_dim, config_.cache_maxframes,
+          config_.use_tome_cache,
+          config_.feature_injection_strength, config_.feature_similarity_threshold, stream);
+    }
     else
     {
       unet_->forward(
@@ -1756,6 +1768,20 @@ void LibreDiffusionPipeline::run_single_step_body(
         predict_x0_batch_unet_output->data(), unet_batch_size, config_.latent_height,
         config_.latent_width, ext_tok, config_.text_hidden_dim, stream);
   }
+  else if(config_.mode == PipelineMode::TEMPORAL_V2V && unet_->hasV2VKvo())
+  {
+    // StreamV2V on the single-step (1-step) path. CUDA-graph capture is disabled for v2v (forward_v2v
+    // reconfigures input shapes + rolls the bank per frame, which a captured graph can't do), so this
+    // runs in eager replay. Mirrors the batched-path branch.
+    unet_->forward_v2v(
+        predict_x0_batch_unet_input_latent_fp32_single->data(),
+        predict_x0_batch_unet_input_timestep->data(),
+        predict_x0_batch_unet_encoder_hidden_states_single->data(),
+        predict_x0_batch_unet_output->data(), unet_batch_size, config_.latent_height,
+        config_.latent_width, config_.text_seq_len, config_.text_hidden_dim,
+        config_.cache_maxframes, config_.use_tome_cache,
+          config_.feature_injection_strength, config_.feature_similarity_threshold, stream);
+  }
   else
   {
     unet_->forward(
@@ -1767,95 +1793,13 @@ void LibreDiffusionPipeline::run_single_step_body(
         config_.latent_width, config_.text_seq_len, config_.text_hidden_dim, stream);
   }
 
-  // StreamV2V: Cache and apply attention feature injection
-  if(config_.mode == PipelineMode::TEMPORAL_V2V)
-  {
-    // Store current attention outputs in cache (every N frames)
-    if((temporal_state_.frame_id % config_.cache_interval) == 0)
-    {
-      const auto& attn_buffers = unet_->getAttentionBuffers();
-
-      if(!attn_buffers.empty())
-      {
-        // Create new cache entry
-        TemporalState::AttentionCache new_cache;
-        new_cache.frame_id = temporal_state_.frame_id;
-        new_cache.attention_layers.reserve(16);
-
-        // Copy all 16 attention outputs
-        for(size_t i = 0; i < attn_buffers.size(); i++)
-        {
-          size_t attn_size = attn_buffers[i]->size();
-          auto cached_attn = std::make_unique<CUDATensor<__half>>(attn_size);
-          cached_attn->load_d2d(attn_buffers[i]->data(), attn_size, stream);
-          new_cache.attention_layers.push_back(std::move(cached_attn));
-        }
-
-        // Add to cache deque
-        temporal_state_.cached_attentions.push_back(std::move(new_cache));
-
-        // Maintain max size
-        while(temporal_state_.cached_attentions.size()
-              > static_cast<size_t>(config_.cache_maxframes))
-        {
-          temporal_state_.cached_attentions.pop_front();
-        }
-      }
-    }
-
-    // Apply feature injection if we have cached attentions
-    if(config_.use_feature_injection && !temporal_state_.cached_attentions.empty())
-    {
-      const auto& current_attns = unet_->getAttentionBuffers();
-      const auto& cached_attns
-          = temporal_state_.cached_attentions.back().attention_layers;
-
-      // Apply feature injection per layer (only if buffers are ready)
-      if(!current_attns.empty() && !cached_attns.empty())
-      {
-        for(size_t layer = 0; layer < current_attns.size() && layer < cached_attns.size();
-            layer++)
-        {
-          // Get dimensions from tensor sizes
-          size_t current_size = current_attns[layer]->size();
-          size_t cached_size = cached_attns[layer]->size();
-
-          // Skip if sizes don't match
-          if(current_size != cached_size)
-            continue;
-
-          int seq_len = config_.latent_height * config_.latent_width;
-          // Infer hidden_dim from total size
-          int hidden_dim = current_size / (config_.batch_size * seq_len);
-
-          int batch = config_.batch_size;
-          int cached_seq_len = seq_len;
-
-          // Allocate temp buffers
-          CUDATensor<float> similarities(batch * seq_len * cached_seq_len);
-          CUDATensor<__half> nn_features(current_size);
-
-          // 1. Compute cosine similarities
-          launch_cosine_similarity(
-              current_attns[layer]->data(), cached_attns[layer]->data(),
-              similarities.data(), batch, seq_len, cached_seq_len, hidden_dim, stream);
-
-          // 2. Find nearest neighbors
-          launch_nearest_neighbor(
-              current_attns[layer]->data(), cached_attns[layer]->data(),
-              similarities.data(), nn_features.data(),
-              config_.feature_similarity_threshold, batch, seq_len, cached_seq_len,
-              hidden_dim, stream);
-
-          // 3. Blend current with nearest neighbors (in-place)
-          launch_blend_features(
-              current_attns[layer]->data(), nn_features.data(),
-              current_attns[layer]->data(), config_.feature_injection_strength,
-              current_size, stream);
-        }
-      }
-    }
-  }
+  // StreamV2V temporal coherence is handled by the live kvo_cache design (forward_v2v) on the
+  // batched denoising path (predict_x0_batch_impl_multi_step_batched). The legacy post-hoc
+  // attention-output feature injection that used to live here was removed: it operated on
+  // getAttentionBuffers() AFTER the whole engine ran (a no-op — a static TRT graph can't be
+  // re-injected from outside) and targeted attention_* outputs that only the dead tensorrt_orig
+  // exporter emitted. The 1-step single-step path does not yet drive forward_v2v (kvo is wired into
+  // the >1-step batched path that matches the validation golden).
 
   if(config_.guidance_scale > 1.0f && config_.cfg_type == 1)
   { // cfg_type="full"

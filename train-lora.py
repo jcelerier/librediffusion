@@ -159,6 +159,20 @@ def parse_args():
                         "into unet.engine")
     p.add_argument("--ipadapter-encoder", default=None, metavar="DIR",
                    help="CLIP image encoder dir for IP-Adapter (default: h94/IP-Adapter image_encoder)")
+    p.add_argument("--v2v", action="store_true",
+                   help="StreamV2V: export a kvo_cache extended-self-attention UNet (kvo_cache_in/out_*). "
+                        "Each frame banks its K/V; the next frame concatenates the banked K/V into self-"
+                        "attention for temporal coherence. SD1.5 only; not combinable with "
+                        "--controlnet/--ipadapter/--fp8. The C++ forward_v2v drives this engine.")
+    p.add_argument("--v2v-inject", action="store_true",
+                   help="StreamV2V FULL: extended self-attention + feature injection. Uses a 3-component "
+                        "cache [K,V,O] (also banks attention OUTPUTS) and bakes get_nn_feats into the "
+                        "up_blocks.1 / mid_block self-attn layers. Implies --v2v. ToMe bank compaction is "
+                        "host-side (C++). SD1.5 only.")
+    p.add_argument("--v2v-fi-strength", type=float, default=0.8,
+                   help="Feature-injection blend strength baked into the engine (original demo: 0.95).")
+    p.add_argument("--v2v-fi-threshold", type=float, default=0.98,
+                   help="Feature-injection cosine-NN threshold baked into the engine (original demo: 0.95).")
     p.add_argument("--min-batch", type=int, default=1)
     p.add_argument("--max-batch", type=int, default=2)
     p.add_argument("--opt-batch", type=int, default=2)
@@ -224,12 +238,19 @@ def export_klein(args):
     #     as COMPLEX128, which TRT rejects. fix_qwen_complex.py rewrites model.onnx -> model_fixed.onnx
     #     (which build_klein_engines.py's build_qwen consumes). REQUIRED before step 2.
     run("fix_qwen_complex.py")
+    # 1c. fix the transformer ONNX: torch.onnx tracing bakes the concatenated seq len (Lp+Lt=1232) as
+    #     50 inline Constant RoPE-reshape literals -> TRT pins Lp=720 STATIC (can't run the 1440-token
+    #     ref-edit streaming path). fix_klein_dynamic_seq.py rewrites 1232->0 -> transformer_dynseq/,
+    #     which build_klein_engines.py's build_transformer now consumes. REQUIRED or bf16 is static-720.
+    run("fix_klein_dynamic_seq.py")
     # 2. bf16 TRT engines (transformer/qwen/vae_decoder/vae_encoder)
     run("build_klein_engines.py", "--which", "all")
     # 3. FP8-calibrated transformer (speed) — modelopt calib -> ONNX, then build_one_fp8.py -> .plan
     if args.klein_quality in ("speed", "both"):
         run("export_klein_fp8_calib.py")
-        fp8_onnx = os.path.join(onnx_dir, "transformer_fp8_calib", "model.onnx")
+        # same static-720 fix for the fp8-calib ONNX (its own torch.onnx.export bakes 1232 too).
+        run("fix_klein_dynamic_seq.py", "transformer_fp8_calib", "transformer_fp8_calib_dynseq")
+        fp8_onnx = os.path.join(onnx_dir, "transformer_fp8_calib_dynseq", "model.onnx")
         fp8_plan = os.path.join(eng_dir, "transformer_fp8_calib.plan")
         run("build_one_fp8.py", fp8_onnx, fp8_plan)
 
@@ -266,7 +287,36 @@ def export_klein(args):
             run("build_rife.py", rife_onnx, rife_plan_out)
         else:
             print(f"[klein] WARNING no rife .plan and no vendored ONNX at {rife_onnx}")
+    # introspection sidecar: the node reads this (no GPU) to show what loaded + its features.
+    write_manifest(out, {
+        "model_type": "klein",
+        "model_family": "flux2",
+        "base_model": "black-forest-labs/FLUX.2-klein-4B",
+        "resolution": {"width": 320, "height": 576},
+        "denoising_steps": 2,
+        "precision": ("fp8+bf16" if args.klein_quality == "both"
+                      else ("fp8" if args.klein_quality == "speed" else "bf16")),
+        "hw_compat": args.hw_compat,
+        "features": {"controlnet": False, "ipadapter": False, "v2v": False, "rife": True,
+                     "reference_edit": True},
+    }, out)
     print(f"[klein] DONE -> bundle at {out}")
+
+
+def write_manifest(out_dir, meta, list_engines_dir=None):
+    """Write <out_dir>/bundle.json — a tiny introspection sidecar the node reads WITHOUT loading any
+    engine into VRAM, to show the user what was loaded (model type, resolution, available features:
+    controlnet / ipadapter / v2v / rife). Engine I/O can also be re-derived at load time, but this is
+    the zero-cost pre-load preview. Schema is intentionally flat + forward-compatible."""
+    import json
+    eng_dir = list_engines_dir or out_dir
+    engines = sorted(f for f in os.listdir(eng_dir)
+                     if f.endswith(".engine") or f.endswith(".plan")) if os.path.isdir(eng_dir) else []
+    doc = {"schema_version": 1, **meta, "engines": engines}
+    path = os.path.join(out_dir, "bundle.json")
+    with open(path, "w") as f:
+        json.dump(doc, f, indent=2)
+    print(f"  wrote {path}")
 
 
 def main():
@@ -361,8 +411,60 @@ def main():
             if isinstance(p, (IPAttnProcessor2_0, IPAttnProcessor)))
         print(f"IP-Adapter: num_tokens={ip_num_tokens} num_ip_layers={ip_num_layers}")
 
+    # ---- StreamV2V kvo: install the extended-self-attention TRT processor on the UNet's self-attn
+    # (attn1) modules BEFORE the trace, so the export emits kvo_cache_in_*/kvo_cache_out_* and the
+    # attention concatenates the banked K/V. This is the TRT variant (extended-attn only; feature-
+    # injection + ToMe are not bakeable into a static graph). SD1.5 only; the C++ forward_v2v drives it.
+    kvo_cache_structure = []
+    args.v2v = args.v2v or args.v2v_inject   # --v2v-inject implies --v2v
+    if args.v2v:
+        if is_sdxl or args.controlnet or args.ipadapter or args.fp8:
+            raise SystemExit("--v2v is SD1.5-only and not combinable with "
+                             "--controlnet/--ipadapter/--fp8 (extended-attn kvo path).")
+        from streamdiffusion.acceleration.tensorrt.models.attention_processors import (
+            CachedSTAttnProcessor2_0, CachedSTAttnInjectProcessor2_0)
+        from streamdiffusion.acceleration.tensorrt.models.utils import get_kvo_cache_info
+        from diffusers.models.attention_processor import AttnProcessor2_0
+        procs = stream.unet.attn_processors
+        n_inst = n_inject = 0
+        for name in procs:
+            if isinstance(procs[name], AttnProcessor2_0):
+                if args.v2v_inject:
+                    # feature injection fires on up_blocks.1 / mid_block self-attn (attn1) — the layer
+                    # groups the original streamv2v processor gates on. All layers still emit the
+                    # 3-component [K,V,O] cache (uniform I/O); only these consume cached_output.
+                    inj = name.endswith("attn1.processor") and (
+                        "up_blocks.1" in name or "mid_block" in name)
+                    procs[name] = CachedSTAttnInjectProcessor2_0(
+                        use_feature_injection=inj,
+                        feature_injection_strength=args.v2v_fi_strength,
+                        feature_similarity_threshold=args.v2v_fi_threshold)
+                    n_inject += int(inj)
+                else:
+                    procs[name] = CachedSTAttnProcessor2_0()
+                n_inst += 1
+        stream.unet.set_attn_processor(procs)
+        _, kvo_cache_structure, kvo_count = get_kvo_cache_info(stream.unet, args.opt_height, args.opt_width)
+        print(f"StreamV2V: installed {'INJECT ' if args.v2v_inject else ''}processor on {n_inst} attn "
+              f"modules ({n_inject} injection layers); {kvo_count} kvo_cache layers")
+
     # ---- UNet ----
-    if is_sdxl and args.controlnet:
+    if args.v2v:
+        # kvo UNet: UNet(use_cached_attn=True) declares kvo_cache_in_*/out_* + the cache input profile;
+        # UnifiedExportWrapper traces them via the installed processors. cache_components=3 ([K,V,O]) for
+        # the full injection variant (banks attention outputs too), 2 ([K,V]) for extended-attn only.
+        unet_model = UNet(stream.unet, fp16=True, device=device, max_batch_size=args.max_batch,
+                          min_batch_size=args.min_batch, embedding_dim=embedding_dim,
+                          unet_dim=stream.unet.config.in_channels,
+                          use_cached_attn=True, image_height=args.opt_height, image_width=args.opt_width,
+                          cache_components=3 if args.v2v_inject else 2)
+        print(f"StreamV2V UNet ({'inject' if args.v2v_inject else 'extended-attn'}): "
+              f"inputs -> {unet_model.get_input_names()}")
+        wrapped_unet = UnifiedExportWrapper(stream.unet, use_controlnet=False, use_ipadapter=False,
+                                            control_input_names=None, num_tokens=4,
+                                            kvo_cache_structure=kvo_cache_structure,
+                                            use_v2v_inject=args.v2v_inject)
+    elif is_sdxl and args.controlnet:
         # SDXL + ControlNet: SDXLUNet(use_control=True) declares the 9 down + mid input_control_* inputs
         # ALONGSIDE the SDXL text_embeds/time_ids; SDXLUNetControlWrapper feeds them as
         # added_cond_kwargs + down/mid residuals. The C++ pipeline runs the SDXL controlnet engine and
@@ -527,6 +629,27 @@ def main():
         o, oo = onnx_pair("controlnet")
         compile_controlnet(controlnet, cn_model, o, oo, f"{args.output}/controlnet.engine",
                            opt_batch_size=args.opt_batch, engine_build_options=build_opts)
+
+    # introspection sidecar (zero-GPU preview of what the bundle contains)
+    write_manifest(args.output, {
+        "model_type": args.type,                       # sd15 | sdxl
+        "model_family": "sdxl" if is_sdxl else "sd",
+        "base_model": args.model,
+        "embedding_dim": embedding_dim,
+        "resolution": {"min": args.min_resolution, "max": args.max_resolution,
+                       "opt_width": args.opt_width, "opt_height": args.opt_height},
+        "batch": {"min": args.min_batch, "opt": args.opt_batch, "max": args.max_batch},
+        "precision": "fp8" if args.fp8 else "fp16",
+        "loras": args.loras,
+        "features": {
+            "controlnet": bool(args.controlnet),
+            "ipadapter": bool(args.ipadapter),
+            "v2v": bool(args.v2v),                     # kvo extended-self-attention UNet (--v2v)
+            "rife": False,
+        },
+        "controlnet_repo": args.controlnet,
+        "ipadapter_ckpt": args.ipadapter,
+    })
 
     print(f"\nDONE. Engines in {args.output}:")
     for f in sorted(os.listdir(args.output)):

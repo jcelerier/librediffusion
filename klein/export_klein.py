@@ -215,7 +215,12 @@ class Qwen3Wrapper(torch.nn.Module):
 def export_qwen():
     from transformers import Qwen3ForCausalLM
     print("loading qwen3...")
-    te = Qwen3ForCausalLM.from_pretrained(KLEIN, subfolder="text_encoder", torch_dtype=DT).to(DEV).eval()
+    # attn_implementation="eager": force the plain additive-mask attention path. The SDPA/flash mask
+    # builders (transformers >=4.56 use torch.vmap; >=5.x use a fused mask) either (a) can't be traced
+    # by the legacy TorchScript ONNX exporter (RuntimeError: unordered_map::at on vmap) or (b) bake a
+    # mask that yields NaN through the bf16 TRT engine. Eager masking exports cleanly and stays finite.
+    te = Qwen3ForCausalLM.from_pretrained(KLEIN, subfolder="text_encoder", torch_dtype=DT,
+                                          attn_implementation="eager").to(DEV).eval()
     w = Qwen3Wrapper(te).eval()
     ids = torch.ones(1, LT, dtype=torch.int64, device=DEV)
     mask = torch.ones(1, LT, dtype=torch.int64, device=DEV)

@@ -63,6 +63,14 @@ UNetWrapper::UNetWrapper(const std::string& engine_path, bool use_v2v)
   // Initialize attention buffers for V2V mode
   if(use_v2v_)
   {
+    if(has_v2v_kvo_)
+      std::cout << "Note: TEMPORAL_V2V using the live kvo_cache extended-attention path (forward_v2v)."
+                << std::endl;
+    else if(!has_v2v_outputs_)
+      std::cerr << "Warning: TEMPORAL_V2V requested but engine '" << engine_path
+                << "' is neither a kvo (kvo_cache_in_*) nor a legacy attention_* StreamV2V UNet; "
+                   "temporal coherence is DISABLED (plain img2img is used). Export a v2v UNet to enable it."
+                << std::endl;
     attention_output_buffers_.reserve(NUM_ATTENTION_OUTPUTS);
     // Buffers will be allocated on first forward pass when we know the sizes
   }
@@ -133,6 +141,31 @@ void UNetWrapper::loadEngine(const std::string& engine_path)
         has_control_inputs_ = true;
         std::cout << "Note: engine is control-aware (input_control_* inputs) for " << engine_path
                   << std::endl;
+      }
+      else if(nm == "attention_0" && eng->getTensorIOMode(tn) == nvinfer1::TensorIOMode::kOUTPUT)
+      {
+        // StreamV2V-capable UNet: it exposes the per-block attention OUTPUTS (attention_0..N) that the
+        // temporal feature bank reads. Only engines exported via the tensorrt_orig UNetV2V path have
+        // these. Standard SD1.5/SDXL/turbo engines do NOT -> forward() must NOT try to bind them
+        // (getTensorShape/setTensorAddress on a missing tensor throws). Gate the v2v binding on this.
+        has_v2v_outputs_ = true;
+        std::cout << "Note: engine is StreamV2V-capable (attention_* outputs) for " << engine_path
+                  << std::endl;
+      }
+      else if(nm.rfind("kvo_cache_in_", 0) == 0
+              && eng->getTensorIOMode(tn) == nvinfer1::TensorIOMode::kINPUT)
+      {
+        // LIVE StreamV2V UNet: declares kvo_cache_in_0..15 (rolling K/V bank) + kvo_cache_out_*.
+        // forward_v2v binds the bank; plain forward() must NOT (allInputDimensionsSpecified would fail).
+        num_kvo_layers_++;
+        if(nm == "kvo_cache_in_0")
+          has_v2v_kvo_ = true;
+      }
+      else if(nm == "v2v_inject_params"
+              && eng->getTensorIOMode(tn) == nvinfer1::TensorIOMode::kINPUT)
+      {
+        // StreamV2V dynamic feature injection: [fi_strength, threshold] fp32 [2] bound at runtime.
+        has_v2v_inject_params_ = true;
       }
       else if(nm == "ipadapter_scale" && eng->getTensorIOMode(tn) == nvinfer1::TensorIOMode::kINPUT)
       {
@@ -213,6 +246,35 @@ void UNetWrapper::loadEngine(const std::string& engine_path)
       for(int i = 0; i < num_control_down_; i++)
         std::cout << control_down_fac_[i] << (i + 1 < num_control_down_ ? "," : "");
       std::cout << "}, mid factor " << control_mid_fac_ << " (" << engine_path << ")" << std::endl;
+    }
+
+    // StreamV2V kvo: enumerate kvo_cache_in_0.. and read each layer's baked (seq, hidden) =
+    // [2, maxframes, batch, seq, hidden]. maxframes/batch are dynamic; seq/hidden are static per layer.
+    if(has_v2v_kvo_)
+    {
+      // num_kvo_layers_ was counted in the IO loop above, so iterate exactly the existing bindings
+      // (probing kvo_cache_in_<N> past the end would log a TRT "invalid tensor name" error).
+      for(int i = 0; i < num_kvo_layers_; i++)
+      {
+        char nm[24];
+        std::snprintf(nm, sizeof(nm), "kvo_cache_in_%d", i);
+        nvinfer1::Dims d = eng->getTensorShape(nm);
+        kvo_seq_.push_back((d.nbDims == 5) ? (int)d.d[3] : 0);
+        kvo_hidden_.push_back((d.nbDims == 5) ? (int)d.d[4] : 0);
+        if(i == 0 && d.nbDims == 5 && d.d[0] > 0)
+          kvo_components_ = (int)d.d[0];  // 2 = [K,V] extended-attn; 3 = [K,V,O] feature injection
+      }
+      nvinfer1::Dims dmax
+          = eng->getProfileShape("kvo_cache_in_0", 0, nvinfer1::OptProfileSelector::kMAX);
+      if(dmax.nbDims == 5)
+      {
+        kvo_profile_max_frames_ = (int)dmax.d[1];
+        kvo_profile_max_batch_ = (int)dmax.d[2];
+      }
+      std::cout << "Note: engine is StreamV2V kvo (" << num_kvo_layers_ << " layers, "
+                << kvo_components_ << " components " << (kvo_components_ >= 3 ? "[K,V,O]+inject" : "[K,V]")
+                << ", max frames " << kvo_profile_max_frames_ << ", max batch " << kvo_profile_max_batch_
+                << ") for " << engine_path << std::endl;
     }
   }
 }
@@ -318,8 +380,9 @@ void UNetWrapper::forward(
     throw std::runtime_error("Failed to set latent tensor address");
   }
 
-  // StreamV2V: Set attention output tensor addresses
-  if(use_v2v_)
+  // StreamV2V: Set attention output tensor addresses. Gated on has_v2v_outputs_ — a standard engine
+  // (no attention_* outputs) would throw here (getTensorShape/setTensorAddress on a missing tensor).
+  if(use_v2v_ && has_v2v_outputs_)
   {
     // Allocate attention buffers on first call
     if(attention_output_buffers_.empty())
@@ -364,6 +427,207 @@ void UNetWrapper::forward(
 
   // TODO: StreamV2V attention outputs are now in attention_output_buffers_
   // These will be used for feature injection in LibreDiffusionPipeline
+}
+
+void UNetWrapper::forward_v2v(
+    const float* sample, const float* timestep, const __half* encoder_hidden_states,
+    __half* output, int batch, int height, int width, int seq_len, int hidden_dim,
+    int cache_maxframes, bool use_tome, float fi_strength, float fi_threshold,
+    cudaStream_t stream)
+{
+  if(!has_v2v_kvo_)
+    throw std::runtime_error("forward_v2v called on an engine without kvo_cache_in_* inputs");
+  // ToMe (token-merging bank compaction) needs the 3-component [K,V,O] cache (the inject engine) and a
+  // single compacted bank slot (maxframes=1): each frame merges concat(bank, new) -> bank.
+  use_tome = use_tome && (kvo_components_ >= 3);
+  if(use_tome)
+    cache_maxframes = 1;
+  if(cache_maxframes < 1)
+    cache_maxframes = 1;
+  if(kvo_profile_max_frames_ > 0 && cache_maxframes > kvo_profile_max_frames_)
+    cache_maxframes = kvo_profile_max_frames_;
+
+  const int timestep_extent = (timestep_fixed_extent_ > 0) ? timestep_fixed_extent_ : batch;
+  const int sample_size = batch * 4 * height * width;
+  const int encoder_size = batch * seq_len * hidden_dim;
+  const int output_size = batch * 4 * height * width;
+
+  // Reuse the shared sample/timestep/encoder/output buffers (same shapes as forward()).
+  if(needsReallocation(batch, height, width, seq_len, hidden_dim))
+  {
+    sample_buffer_ = std::make_unique<CUDATensor<float>>(sample_size);
+    timestep_buffer_ = std::make_unique<CUDATensor<float>>(timestep_extent);
+    encoder_hidden_states_buffer_ = std::make_unique<CUDATensor<__half>>(encoder_size);
+    output_buffer_ = std::make_unique<CUDATensor<__half>>(output_size);
+    shape_cache_.batch = batch;
+    shape_cache_.height = height;
+    shape_cache_.width = width;
+    shape_cache_.seq_len = seq_len;
+    shape_cache_.hidden_dim = hidden_dim;
+    shape_cache_.initialized = true;
+  }
+
+  // (Re)allocate the rolling bank + per-frame out buffers when (batch, maxframes) change. The bank is
+  // zeroed so frame 0 sees an empty temporal context (== plain attention, matching create_kvo_cache).
+  if((int)kvo_bank_.size() != num_kvo_layers_ || bank_batch_ != batch
+     || bank_maxframes_ != cache_maxframes || bank_tome_ != use_tome)
+  {
+    kvo_bank_.clear();
+    kvo_out_.clear();
+    tome_cat_k_.clear();
+    tome_cat_v_.clear();
+    tome_cat_o_.clear();
+    kvo_bank_.reserve(num_kvo_layers_);
+    kvo_out_.reserve(num_kvo_layers_);
+    for(int i = 0; i < num_kvo_layers_; i++)
+    {
+      const size_t slot = (size_t)batch * kvo_seq_[i] * kvo_hidden_[i];  // one component's frame slot
+      auto bank = std::make_unique<CUDATensor<__half>>((size_t)kvo_components_ * cache_maxframes * slot);
+      cudaMemsetAsync(bank->data(), 0, bank->size() * sizeof(__half), stream);
+      kvo_bank_.push_back(std::move(bank));
+      kvo_out_.push_back(std::make_unique<CUDATensor<__half>>((size_t)kvo_components_ * slot));  // [C,1,B,seq,h]
+      if(use_tome)
+      {
+        // concat(bank_slot, new) = [B, 2*seq, hidden] per component, reused each frame.
+        tome_cat_k_.push_back(std::make_unique<CUDATensor<__half>>(2u * slot));
+        tome_cat_v_.push_back(std::make_unique<CUDATensor<__half>>(2u * slot));
+        tome_cat_o_.push_back(std::make_unique<CUDATensor<__half>>(2u * slot));
+      }
+    }
+    bank_batch_ = batch;
+    bank_maxframes_ = cache_maxframes;
+    bank_tome_ = use_tome;
+  }
+
+  cudaMemcpyAsync(sample_buffer_->data(), sample, sample_size * sizeof(float),
+                  cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(timestep_buffer_->data(), timestep, timestep_extent * sizeof(float),
+                  cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(encoder_hidden_states_buffer_->data(), encoder_hidden_states,
+                  encoder_size * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+
+  nvinfer1::Dims4 sample_dims{batch, 4, height, width};
+  nvinfer1::Dims timestep_dims;
+  timestep_dims.nbDims = 1;
+  timestep_dims.d[0] = timestep_extent;
+  nvinfer1::Dims3 hidden_states_dims{batch, seq_len, hidden_dim};
+  if(!context_->setInputShape("sample", sample_dims))
+    throw std::runtime_error("forward_v2v: failed to set sample shape");
+  if(!context_->setInputShape("timestep", timestep_dims))
+    throw std::runtime_error("forward_v2v: failed to set timestep shape");
+  if(!context_->setInputShape("encoder_hidden_states", hidden_states_dims))
+    throw std::runtime_error("forward_v2v: failed to set encoder_hidden_states shape");
+
+  // Bind the rolling bank to kvo_cache_in_* and the per-frame outputs to kvo_cache_out_*.
+  for(int i = 0; i < num_kvo_layers_; i++)
+  {
+    char nin[24], nout[24];
+    std::snprintf(nin, sizeof(nin), "kvo_cache_in_%d", i);
+    std::snprintf(nout, sizeof(nout), "kvo_cache_out_%d", i);
+    nvinfer1::Dims din;
+    din.nbDims = 5;
+    din.d[0] = kvo_components_;
+    din.d[1] = cache_maxframes;
+    din.d[2] = batch;
+    din.d[3] = kvo_seq_[i];
+    din.d[4] = kvo_hidden_[i];
+    if(!context_->setInputShape(nin, din))
+      throw std::runtime_error(std::string("forward_v2v: failed to set ") + nin + " shape");
+    if(!context_->setTensorAddress(nin, kvo_bank_[i]->data()))
+      throw std::runtime_error(std::string("forward_v2v: failed to set ") + nin + " address");
+    if(!context_->setTensorAddress(nout, kvo_out_[i]->data()))
+      throw std::runtime_error(std::string("forward_v2v: failed to set ") + nout + " address");
+  }
+
+  // Dynamic feature-injection params: upload [fi_strength, threshold] to the engine input each frame.
+  if(has_v2v_inject_params_)
+  {
+    if(!v2v_inject_params_buffer_)
+      v2v_inject_params_buffer_ = std::make_unique<CUDATensor<float>>(2);
+    const float params[2] = {fi_strength, fi_threshold};
+    cudaMemcpyAsync(v2v_inject_params_buffer_->data(), params, 2 * sizeof(float),
+                    cudaMemcpyHostToDevice, stream);
+    nvinfer1::Dims pd;
+    pd.nbDims = 1;
+    pd.d[0] = 2;
+    if(!context_->setInputShape("v2v_inject_params", pd))
+      throw std::runtime_error("forward_v2v: failed to set v2v_inject_params shape");
+    if(!context_->setTensorAddress("v2v_inject_params", v2v_inject_params_buffer_->data()))
+      throw std::runtime_error("forward_v2v: failed to set v2v_inject_params address");
+  }
+
+  if(!context_->allInputDimensionsSpecified())
+    throw std::runtime_error("forward_v2v: not all input dimensions specified");
+  if(!context_->setTensorAddress("sample", sample_buffer_->data()))
+    throw std::runtime_error("forward_v2v: failed to set sample address");
+  if(!context_->setTensorAddress("timestep", timestep_buffer_->data()))
+    throw std::runtime_error("forward_v2v: failed to set timestep address");
+  if(!context_->setTensorAddress("encoder_hidden_states", encoder_hidden_states_buffer_->data()))
+    throw std::runtime_error("forward_v2v: failed to set encoder_hidden_states address");
+  if(!context_->setTensorAddress("latent", output_buffer_->data()))
+    throw std::runtime_error("forward_v2v: failed to set latent address");
+
+  if(!context_->enqueueV3(stream))
+    throw std::runtime_error("forward_v2v: failed to enqueue inference");
+
+  cudaMemcpyAsync(output, output_buffer_->data(), output_size * sizeof(__half),
+                  cudaMemcpyDeviceToDevice, stream);
+
+  // Roll the bank: shift each K/V group down one frame slot, write this frame's K/V at the last slot.
+  // (Attention is order-invariant over keys, so this exactly reproduces torch.roll(-1)+[:,−1]=new.)
+  for(int i = 0; i < num_kvo_layers_; i++)
+  {
+    const int seq = kvo_seq_[i], h = kvo_hidden_[i];
+    const size_t slot = (size_t)batch * seq * h;   // one component's frame slot [B,seq,h]
+    const size_t sh = (size_t)seq * h;             // one batch row [seq,h]
+    __half* bank = kvo_bank_[i]->data();
+    const __half* out = kvo_out_[i]->data();
+
+    if(use_tome)
+    {
+      // ToMe: per component, build cat = [B, 2*seq, h] = per-batch concat(bank_slot, new), token-merge
+      // it back down to [B, seq, h], and write the compacted result into the (single) bank slot.
+      __half* catk = tome_cat_k_[i]->data();
+      __half* catv = tome_cat_v_[i]->data();
+      __half* cato = tome_cat_o_[i]->data();
+      for(int b = 0; b < batch; b++)
+      {
+        for(int c = 0; c < 3; c++)
+        {
+          __half* cat = (c == 0) ? catk : (c == 1) ? catv : cato;
+          const __half* bk = bank + (size_t)c * slot;  // bank component c (maxframes==1)
+          const __half* nw = out + (size_t)c * slot;   // this frame's component c
+          cudaMemcpyAsync(cat + (size_t)b * 2 * sh, bk + (size_t)b * sh, sh * sizeof(__half),
+                          cudaMemcpyDeviceToDevice, stream);
+          cudaMemcpyAsync(cat + (size_t)b * 2 * sh + sh, nw + (size_t)b * sh, sh * sizeof(__half),
+                          cudaMemcpyDeviceToDevice, stream);
+        }
+      }
+      launch_tome_merge(catk, catv, cato, bank + 0 * slot, bank + 1 * slot, bank + 2 * slot,
+                        batch, 2 * seq, h, stream);
+    }
+    else
+    {
+      for(int c = 0; c < kvo_components_; c++)  // K, V (, O) — roll each independently
+      {
+        __half* base = bank + (size_t)c * cache_maxframes * slot;
+        for(int m = 0; m < cache_maxframes - 1; m++)
+          cudaMemcpyAsync(base + (size_t)m * slot, base + (size_t)(m + 1) * slot,
+                          slot * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(base + (size_t)(cache_maxframes - 1) * slot, out + (size_t)c * slot,
+                        slot * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+      }
+    }
+  }
+}
+
+void UNetWrapper::resetV2VBank()
+{
+  // Clear the rolling bank so the next frame starts an empty temporal context. Reset is between
+  // clips (not in the hot loop), so a default-stream memset is fine.
+  for(auto& b : kvo_bank_)
+    if(b)
+      cudaMemset(b->data(), 0, b->size() * sizeof(__half));
 }
 
 void UNetWrapper::forward_controlnet(

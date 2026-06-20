@@ -41,7 +41,16 @@ class UnifiedExportWrapper(torch.nn.Module):
             controlnet_kwargs = {k: v for k, v in kwargs.items() if k in ['num_controlnets', 'conditioning_scales']}
 
             self.controlnet_wrapper = create_controlnet_wrapper(self.unet, control_input_names, kvo_cache_structure, **controlnet_kwargs)
-        
+
+        # StreamV2V feature injection: collect the inject processors so forward() can feed them the
+        # runtime [fi_strength, threshold] via a v2v_inject_params input (mirrors ipadapter_scale).
+        self.use_v2v_inject = bool(kwargs.get('use_v2v_inject', False))
+        self._v2v_inject_procs = []
+        if self.use_v2v_inject:
+            from ..models.attention_processors import CachedSTAttnInjectProcessor2_0
+            self._v2v_inject_procs = [p for p in self.unet.attn_processors.values()
+                                      if isinstance(p, CachedSTAttnInjectProcessor2_0) and p.use_feature_injection]
+
     def _basic_unet_forward(self, sample, timestep, encoder_hidden_states, *kvo_cache, **kwargs):
         """Basic UNet forward that passes through all parameters to handle any model type"""
         formatted_kvo_cache = []
@@ -89,6 +98,16 @@ class UnifiedExportWrapper(torch.nn.Module):
             # assign per-layer scale tensors into processors
             self.ipadapter_wrapper.set_ipadapter_scale(ipadapter_scale)
             # remove it from control args before passing to controlnet wrapper
+            args = args[1:]
+
+        # StreamV2V feature injection: the v2v_inject_params [fi_strength, threshold] vector sits after
+        # the base/ipadapter inputs and before the kvo_cache tensors. Feed it into the inject processors
+        # so the baked get_nn_feats reads runtime-adjustable scalars (like ipadapter_scale).
+        if self.use_v2v_inject and len(args) > 0:
+            v2v_params = args[0]
+            for p in self._v2v_inject_procs:
+                p.fi_strength = v2v_params[0]
+                p.threshold = v2v_params[1]
             args = args[1:]
 
         if self.controlnet_wrapper:
