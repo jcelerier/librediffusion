@@ -1003,6 +1003,55 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
           config_.text_seq_len, config_.text_hidden_dim,
           config_.pooled_embedding_dim, stream);
     }
+    else if(controlnet_enabled_)
+    {
+      // ControlNet (SD1.5) in the sequential multi-step path (mirrors the batched impl).
+      const __half* down_ptrs[ControlNetWrapper::MAX_DOWN];
+      const __half* mid_ptr = nullptr;
+      int down_count = 0;
+      run_controlnets(unet_input_latent->data(), unet_input_timestep->data(),
+                      unet_encoder_hidden_states_seq->data(),
+                      nullptr, nullptr, unet_batch_size, config_.text_seq_len,
+                      config_.text_hidden_dim, 0, down_ptrs, &mid_ptr, down_count, stream);
+      unet_->forward_controlnet(
+          unet_input_latent_fp32_seq.data(), unet_input_timestep->data(),
+          unet_encoder_hidden_states_seq->data(), down_ptrs, mid_ptr,
+          unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
+          config_.text_seq_len, config_.text_hidden_dim, stream);
+    }
+    else if(ipadapter_enabled_)
+    {
+      // IP-Adapter (SD1.5) in the sequential multi-step path (mirrors the batched impl 415-453).
+      const int dim = config_.text_hidden_dim;
+      const int N = ipadapter_num_tokens_;
+      const int text_tok = config_.text_seq_len;
+      const int ext_tok = text_tok + N;
+      const int text_row = text_tok * dim, img_row = N * dim, ext_row = ext_tok * dim;
+      const __half* pos = ipadapter_tokens_pos_ ? ipadapter_tokens_pos_->data() : nullptr;
+      const __half* neg = ipadapter_tokens_neg_ ? ipadapter_tokens_neg_->data() : pos;
+      if(!pos)
+        throw std::runtime_error("IP-Adapter enabled but no image tokens set (set_ipadapter_tokens)");
+      CUDATensor<__half> ext_ehs((size_t)unet_batch_size * ext_row);
+      const bool full = (config_.guidance_scale > 1.0f && config_.cfg_type == 1);
+      const bool init = (config_.guidance_scale > 1.0f && config_.cfg_type == 3);
+      for(int r = 0; r < unet_batch_size; r++)
+      {
+        cudaMemcpyAsync(ext_ehs.data() + (size_t)r * ext_row,
+                        unet_encoder_hidden_states_seq->data() + (size_t)r * text_row,
+                        text_row * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+        bool is_neg = full ? (r < config_.batch_size) : (init ? (r == 0) : false);
+        const __half* img = is_neg ? neg : pos;
+        cudaMemcpyAsync(ext_ehs.data() + (size_t)r * ext_row + text_row, img,
+                        img_row * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+      }
+      int nlay = unet_->numIpLayers();
+      if(nlay <= 0) nlay = (int)ipadapter_scale_vec_.size();
+      unet_->forward_ipadapter(
+          unet_input_latent_fp32_seq.data(), unet_input_timestep->data(), ext_ehs.data(),
+          ipadapter_scale_vec_.data(), nlay,
+          unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
+          ext_tok, config_.text_hidden_dim, stream);
+    }
     else
     {
       unet_->forward(
@@ -1347,6 +1396,64 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_single_step(
         predict_x0_batch_unet_output->data(), unet_batch_size, config_.latent_height,
         config_.latent_width, config_.text_seq_len, config_.text_hidden_dim,
         config_.pooled_embedding_dim, stream);
+  }
+  else if(controlnet_enabled_)
+  {
+    // ControlNet (SD1.5) in the single-step path (mirrors the batched impl): run every net on the SAME
+    // fp16 latent/timestep/ehs the UNet sees, SUM residuals, inject via forward_controlnet. Without this
+    // branch a control-aware unet.engine hits plain forward() -> "Not all input dimensions specified".
+    const __half* down_ptrs[ControlNetWrapper::MAX_DOWN];
+    const __half* mid_ptr = nullptr;
+    int down_count = 0;
+    run_controlnets(predict_x0_batch_unet_input_latent->data(),
+                    predict_x0_batch_unet_input_timestep->data(),
+                    predict_x0_batch_unet_encoder_hidden_states_single->data(),
+                    nullptr, nullptr, unet_batch_size, config_.text_seq_len,
+                    config_.text_hidden_dim, 0, down_ptrs, &mid_ptr, down_count, stream);
+    unet_->forward_controlnet(
+        predict_x0_batch_unet_input_latent_fp32_single->data(),
+        predict_x0_batch_unet_input_timestep->data(),
+        predict_x0_batch_unet_encoder_hidden_states_single->data(),
+        down_ptrs, mid_ptr,
+        predict_x0_batch_unet_output->data(), unet_batch_size, config_.latent_height,
+        config_.latent_width, config_.text_seq_len, config_.text_hidden_dim, stream);
+  }
+  else if(ipadapter_enabled_)
+  {
+    // IP-Adapter (SD1.5) in the single-step path (mirrors the batched impl 415-453): build the EXTENDED
+    // encoder_hidden_states [unet_batch, 77+N, dim] = per row text tokens ++ N image tokens (neg/pos to
+    // match the row's text conditioning), then forward_ipadapter at seq_len = 77+N. Without this branch a
+    // detected IP unet (encoder_hidden_states [-1,81,768]) hits plain forward() at 77 -> shape mismatch.
+    const int dim = config_.text_hidden_dim;
+    const int N = ipadapter_num_tokens_;
+    const int text_tok = config_.text_seq_len;
+    const int ext_tok = text_tok + N;
+    const int text_row = text_tok * dim, img_row = N * dim, ext_row = ext_tok * dim;
+    const __half* pos = ipadapter_tokens_pos_ ? ipadapter_tokens_pos_->data() : nullptr;
+    const __half* neg = ipadapter_tokens_neg_ ? ipadapter_tokens_neg_->data() : pos;
+    if(!pos)
+      throw std::runtime_error("IP-Adapter enabled but no image tokens set (set_ipadapter_tokens)");
+    CUDATensor<__half> ext_ehs((size_t)unet_batch_size * ext_row);
+    const bool full = (config_.guidance_scale > 1.0f && config_.cfg_type == 1);
+    const bool init = (config_.guidance_scale > 1.0f && config_.cfg_type == 3);
+    for(int r = 0; r < unet_batch_size; r++)
+    {
+      cudaMemcpyAsync(ext_ehs.data() + (size_t)r * ext_row,
+                      predict_x0_batch_unet_encoder_hidden_states_single->data() + (size_t)r * text_row,
+                      text_row * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+      bool is_neg = full ? (r < config_.batch_size) : (init ? (r == 0) : false);
+      const __half* img = is_neg ? neg : pos;
+      cudaMemcpyAsync(ext_ehs.data() + (size_t)r * ext_row + text_row, img,
+                      img_row * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+    }
+    int nlay = unet_->numIpLayers();
+    if(nlay <= 0) nlay = (int)ipadapter_scale_vec_.size();
+    unet_->forward_ipadapter(
+        predict_x0_batch_unet_input_latent_fp32_single->data(),
+        predict_x0_batch_unet_input_timestep->data(), ext_ehs.data(),
+        ipadapter_scale_vec_.data(), nlay,
+        predict_x0_batch_unet_output->data(), unet_batch_size, config_.latent_height,
+        config_.latent_width, ext_tok, config_.text_hidden_dim, stream);
   }
   else
   {

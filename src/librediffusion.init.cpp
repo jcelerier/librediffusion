@@ -85,6 +85,19 @@ void LibreDiffusionPipeline::init_engines()
     ipadapter_num_tokens_ = config_.ipadapter_num_tokens;
     std::cout << "Note: IP-Adapter enabled (" << n << " layers, " << ipadapter_num_tokens_
               << " image tokens)" << std::endl;
+
+    // Optional on-device image encoder: when both engine paths are set, load the CLIP image encoder +
+    // projection so the host can feed a raw style image via set_ipadapter_image (instead of tokens).
+    ipadapter_image_encoder_.reset();
+    if(!config_.ipadapter_image_encoder_path.empty()
+       && !config_.ipadapter_image_proj_path.empty())
+    {
+      ipadapter_image_encoder_ = std::make_unique<CLIPImageEncoderWrapper>(
+          config_.ipadapter_image_encoder_path, config_.ipadapter_image_proj_path);
+      std::cout << "Note: IP-Adapter on-device image encoder loaded ("
+                << ipadapter_image_encoder_->numTokens() << " tokens x "
+                << ipadapter_image_encoder_->tokenDim() << ")" << std::endl;
+    }
   }
 }
 

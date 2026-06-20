@@ -475,6 +475,63 @@ private:
   bool needsReallocation(int batch);
 };
 
+/**
+ * IP-Adapter CLIP image encoder + projection.
+ *
+ * Two engines, run back to back to turn a raw style image into IP-Adapter image tokens:
+ *   1. clip_image_encoder: pixel_values [B,3,224,224] fp16 -> image_embeds [B,1024] fp16
+ *      (CLIP ViT-H/14 CLIPVisionModelWithProjection, from h94/IP-Adapter image_encoder).
+ *   2. ip_image_proj:      image_embeds [B,1024] fp16     -> ip_tokens [B,num_tokens,768] fp16
+ *      (ImageProjModel = Linear(1024 -> num_tokens*768) + LayerNorm, from the ip-adapter .bin).
+ *
+ * The pixel_values are produced on-device by launch_clip_image_preprocess_fp16 (Lanczos-3 resize +
+ * CLIP normalize). The NEGATIVE tokens (base IP-Adapter) = projection of ZEROS: run the SAME proj
+ * engine on a [B,1024] zero buffer (the encoder is NOT re-run). batch fixed to 1 here.
+ */
+class CLIPImageEncoderWrapper
+{
+public:
+  CLIPImageEncoderWrapper(
+      const std::string& encoder_engine_path, const std::string& proj_engine_path);
+  ~CLIPImageEncoderWrapper();
+
+  CLIPImageEncoderWrapper(const CLIPImageEncoderWrapper&) = delete;
+  CLIPImageEncoderWrapper& operator=(const CLIPImageEncoderWrapper&) = delete;
+
+  /// Number of image tokens the proj engine emits (queried from the ip_tokens output, e.g. 4).
+  int numTokens() const { return num_tokens_; }
+  /// Cross-attention dim of the image tokens (queried, e.g. 768).
+  int tokenDim() const { return token_dim_; }
+
+  /**
+   * Encode a host RGBA image into IP-Adapter tokens (pos + neg).
+   * @param cpu_rgba host RGBA uint8 [in_h, in_w, 4]
+   * @param pos_out  device fp16 [num_tokens, dim] (allocated by caller, sized numTokens()*tokenDim())
+   * @param neg_out  device fp16 [num_tokens, dim] (allocated by caller); projection of zeros
+   * @param stream   CUDA stream
+   */
+  void encodeImage(
+      const uint8_t* cpu_rgba, int in_h, int in_w, __half* pos_out, __half* neg_out,
+      cudaStream_t stream);
+
+private:
+  std::shared_ptr<CachedTensorRTEngine> enc_engine_;
+  std::unique_ptr<nvinfer1::IExecutionContext> enc_context_;
+  std::shared_ptr<CachedTensorRTEngine> proj_engine_;
+  std::unique_ptr<nvinfer1::IExecutionContext> proj_context_;
+
+  int num_tokens_ = 0;
+  int token_dim_ = 0;
+
+  // Scratch device buffers (lazily sized).
+  std::unique_ptr<CUDATensor<uint8_t>> d_rgba_;       // upload buffer for host RGBA
+  std::unique_ptr<CUDATensor<__half>> d_pixel_;       // [1,3,224,224] preprocessed
+  std::unique_ptr<CUDATensor<__half>> d_image_embeds_;// [1,1024]
+  std::unique_ptr<CUDATensor<__half>> d_zero_embeds_; // [1,1024] zeros (for neg)
+
+  void loadEngines(const std::string& encoder_engine_path, const std::string& proj_engine_path);
+};
+
 struct SDXLPromptEmbeddings
 {
   __half* embeddings{};

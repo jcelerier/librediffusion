@@ -55,6 +55,10 @@ corrosion_import_crate(
     CRATE_TYPES staticlib
 )
 
+# NOTE: the Qwen tokenizer (FLUX.2-klein-4B) lives INSIDE clip-tokenizer-c so there is a
+# single Rust staticlib (two Rust staticlibs would duplicate the Rust std runtime at link time).
+# The qwen_tokenizer_* C symbols are exported by clip_tokenizer_c.
+
 # Find required packages
 find_package(CUDAToolkit REQUIRED)
 
@@ -91,8 +95,10 @@ endif()
 # etc.
 
 # Add executable
-add_library(librediffusion_cuda STATIC 
+add_library(librediffusion_cuda STATIC
     src/kernels.cu
+    src/kernels_klein.cu
+    src/kernels_rife.cu
     src/nchw.cu
 )
 target_compile_options(librediffusion_cuda PRIVATE  -allow-unsupported-compiler)
@@ -114,9 +120,19 @@ add_library(librediffusion SHARED
     src/librediffusion.v2v.cpp
     src/librediffusion.vae.cpp
     src/librediffusion.workflows.cpp
+    src/librediffusion.flux2.cpp
+    src/librediffusion.flux2.hpp
     src/librediffusion.hpp
     src/tensorrt_wrappers.cpp
     src/tensorrt_wrappers.hpp
+    src/tensorrt_wrappers_klein.cpp
+    src/tensorrt_wrappers_klein.hpp
+    src/tensorrt_wrappers_rife.cpp
+    src/tensorrt_wrappers_rife.hpp
+    src/librediffusion.rife.cpp
+    src/librediffusion.rife.hpp
+    src/librediffusion_c.rife.cpp
+    src/librediffusion_c.flux2.cpp
     src/cuda_tensor.hpp 
     src/cuda_tensor.cpp
     src/pcg.hpp

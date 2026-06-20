@@ -210,6 +210,30 @@ void LibreDiffusionPipeline::set_ipadapter_tokens(
   cudaStreamSynchronize(stream_);
 }
 
+void LibreDiffusionPipeline::set_ipadapter_image(
+    const uint8_t* cpu_rgba, int img_h, int img_w)
+{
+  if(!ipadapter_image_encoder_)
+    throw std::runtime_error(
+        "set_ipadapter_image: no on-device image encoder configured (set "
+        "ipadapter_image_encoder_path + ipadapter_image_proj_path before init)");
+
+  int N = ipadapter_image_encoder_->numTokens();
+  int dim = ipadapter_image_encoder_->tokenDim();
+  size_t n = (size_t)N * dim;
+
+  // Encode directly into the persistent pos/neg token buffers (allocate if needed).
+  if(!ipadapter_tokens_pos_ || ipadapter_tokens_pos_->size() < n)
+    ipadapter_tokens_pos_ = std::make_unique<CUDATensor<__half>>(n);
+  if(!ipadapter_tokens_neg_ || ipadapter_tokens_neg_->size() < n)
+    ipadapter_tokens_neg_ = std::make_unique<CUDATensor<__half>>(n);
+
+  ipadapter_image_encoder_->encodeImage(
+      cpu_rgba, img_h, img_w, ipadapter_tokens_pos_->data(),
+      ipadapter_tokens_neg_->data(), stream_);
+  ipadapter_num_tokens_ = N;
+}
+
 void LibreDiffusionPipeline::set_ipadapter_scale(float scale)
 {
   int n = unet_ ? unet_->numIpLayers() : 0;

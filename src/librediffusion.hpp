@@ -27,12 +27,14 @@ class UNetWrapper;
 class ControlNetWrapper;
 class VAEEncoderWrapper;
 class VAEDecoderWrapper;
+class CLIPImageEncoderWrapper;
 
 enum class ModelType
 {
   SD_15,
   SD_TURBO,
-  SDXL_TURBO
+  SDXL_TURBO,
+  FLUX2_KLEIN_4B
 };
 
 enum class PipelineMode
@@ -94,6 +96,12 @@ struct LibreDiffusionConfig
   // Image tokens are computed HOST-SIDE and fed in via the C-API (external, like controlnet preproc).
   int ipadapter_num_tokens = 4;       // image tokens appended to the 77 text tokens (4 base / 16 plus)
   float ipadapter_scale = 1.0f;       // uniform per-layer scale (overridable per-layer via the C-API)
+  // On-device IP-Adapter image encoder (optional). When BOTH paths are set, the pipeline loads a
+  // CLIPImageEncoderWrapper so the host can feed a RAW style image (set_ipadapter_image) instead of
+  // precomputed tokens. clip_image_encoder = CLIP ViT-H/14 (pixel_values[1,3,224,224]->image_embeds
+  // [1,1024]); ip_image_proj = ImageProjModel (image_embeds[1,1024]->ip_tokens[1,N,768]).
+  std::string ipadapter_image_encoder_path;  // clip_image_encoder.engine
+  std::string ipadapter_image_proj_path;     // ip_image_proj.engine
 
   std::vector<int> timestep_indices;
 
@@ -231,6 +239,11 @@ public:
   // Uniform scale across all IP layers; or a per-layer vector of length num_ip_layers.
   void set_ipadapter_scale(float scale);
   void set_ipadapter_scale_vector(const float* per_layer, int num_ip_layers);
+  // On-device path: take a raw host RGBA style image [img_h,img_w,4], run the CLIP image encoder +
+  // projection engines, and set the pos tokens (+ neg tokens = projection of zeros). Requires the
+  // image encoder engines to be configured (ipadapter_image_encoder_path / _proj_path). Call once /
+  // on change (style is static); re-call only when the style image changes.
+  void set_ipadapter_image(const uint8_t* cpu_rgba, int img_h, int img_w);
 
   void reseed(int64_t seed);
 
@@ -440,6 +453,8 @@ public:
   std::unique_ptr<CUDATensor<__half>> ipadapter_tokens_neg_;  // [num_tokens, dim] (zeros-proj for base)
   std::vector<float> ipadapter_scale_vec_;                    // host, length num_ip_layers
   int ipadapter_num_tokens_ = 0;
+  // On-device image encoder (optional): turns a raw style image into the pos/neg tokens above.
+  std::unique_ptr<CLIPImageEncoderWrapper> ipadapter_image_encoder_;
 
   // StreamV2V temporal state
   TemporalState temporal_state_;

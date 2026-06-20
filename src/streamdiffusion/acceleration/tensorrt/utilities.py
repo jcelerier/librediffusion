@@ -19,15 +19,16 @@
 #
 
 import gc
-import os
 from collections import OrderedDict
-from typing import *
+from pathlib import Path
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
+import tensorrt as trt
 import torch
-from cuda.bindings import runtime as cudart
+from cuda.bindings import runtime as cudart  # cuda-python 13 (cu130): cudart moved under cuda.bindings.runtime
 from PIL import Image
 from polygraphy import cuda
 from polygraphy.backend.common import bytes_from_path
@@ -41,24 +42,15 @@ from polygraphy.backend.trt import (
 )
 from polygraphy.backend.trt import util as trt_util
 
-from .models import CLIP, VAE, BaseModel, UNet, VAEEncoder
+from .models.models import CLIP, VAE, BaseModel, UNet, VAEEncoder
 
-
-# Check if TensorRT-RTX should be used
-USE_TRT_RTX = os.environ.get("USE_TRT_RTX", "false").lower() in ("true", "1", "yes")
-
-if USE_TRT_RTX:
-    try:
-        import tensorrt_rtx as trt
-        print("Using TensorRT-RTX for acceleration")
-    except ImportError as e:
-        print(f"Warning: USE_TRT_RTX=true but tensorrt_rtx is not installed: {e}")
-        print("Falling back to standard TensorRT")
-        import tensorrt as trt
-else:
-    import tensorrt as trt
+# Set up logger for this module
+import logging
+logger = logging.getLogger(__name__)
 
 TRT_LOGGER = trt.Logger(trt.Logger.ERROR)
+
+from ...model_detection import detect_model
 
 # Map of numpy dtype -> torch dtype
 numpy_to_torch_dtype_dict = {
@@ -80,46 +72,6 @@ else:
 
 # Map of torch dtype -> numpy dtype
 torch_to_numpy_dtype_dict = {value: key for (key, value) in numpy_to_torch_dtype_dict.items()}
-
-# Map TensorRT DataType to numpy dtype (for TensorRT-RTX compatibility)
-trt_to_numpy_dtype_dict = {
-    trt.DataType.FLOAT: np.float32,
-    trt.DataType.HALF: np.float16,
-    trt.DataType.INT8: np.int8,
-    trt.DataType.INT32: np.int32,
-    trt.DataType.BOOL: np.bool_,
-}
-
-
-def trt_dtype_to_np(trt_dtype):
-    """
-    Convert TensorRT DataType to numpy dtype.
-    This provides compatibility between standard TensorRT and TensorRT-RTX.
-    """
-    # Try the standard TensorRT nptype function first
-    try:
-        return trt.nptype(trt_dtype)
-    except (TypeError, AttributeError, KeyError):
-        # Fallback for TensorRT-RTX or when nptype fails
-        if trt_dtype in trt_to_numpy_dtype_dict:
-            return trt_to_numpy_dtype_dict[trt_dtype]
-        else:
-            # Try to match by string name as last resort
-            dtype_str = str(trt_dtype)
-            if "FLOAT" in dtype_str and "HALF" not in dtype_str:
-                return np.float32
-            elif "HALF" in dtype_str or "FP16" in dtype_str:
-                return np.float16
-            elif "INT32" in dtype_str:
-                return np.int32
-            elif "INT8" in dtype_str:
-                return np.int8
-            elif "BOOL" in dtype_str:
-                return np.bool_
-            else:
-                # Default to float32 if we can't determine
-                print(f"Warning: Unknown TensorRT dtype {trt_dtype}, defaulting to float32")
-                return np.float32
 
 
 def CUASSERT(cuda_ret):
@@ -144,10 +96,28 @@ class Engine:
         self.buffers = OrderedDict()
         self.tensors = OrderedDict()
         self.cuda_graph_instance = None  # cuda graph
-        self.last_shapes = {}  # Cache for input shapes to avoid redundant API calls
+        
+        # Buffer reuse optimization tracking
+        self._last_shape_dict = None
+        self._last_device = None
 
     def __del__(self):
+        # Check if AttributeError: 'Engine' object has no attribute 'buffers'
+        if not hasattr(self, 'buffers'):
+            return
         [buf.free() for buf in self.buffers.values() if isinstance(buf, cuda.DeviceArray)]
+        
+        if hasattr(self, 'cuda_graph_instance') and self.cuda_graph_instance is not None:
+            try:
+                CUASSERT(cudart.cudaGraphExecDestroy(self.cuda_graph_instance))
+            except:
+                pass
+        if hasattr(self, 'graph') and self.graph is not None:
+            try:
+                CUASSERT(cudart.cudaGraphDestroy(self.graph))
+            except:
+                pass
+        
         del self.engine
         del self.context
         del self.buffers
@@ -167,7 +137,7 @@ class Engine:
                     values = convert_int64(values)
                 refit_dict[name] = values
 
-        print(f"Refitting TensorRT engine with {onnx_refit_path} weights")
+        logger.info(f"Refitting TensorRT engine with {onnx_refit_path} weights")
         refit_nodes = gs.import_onnx(onnx.load(onnx_refit_path)).toposort().nodes
 
         # Construct mapping from weight names in refit model -> original model
@@ -215,7 +185,6 @@ class Engine:
             # Constant nodes in ONNX do not have inputs but have a constant output
             if n.op == "Constant":
                 name = map_name(n.outputs[0].name)
-                print(f"Add Constant {name}\n")
                 add_to_map(refit_dict, name, n.outputs[0].values)
 
             # Handle scale and bias weights
@@ -250,11 +219,11 @@ class Engine:
             if refit_dict[custom_name] is not None:
                 refitter.set_weights(layer_name, weights_role, refit_dict[custom_name])
             else:
-                print(f"[W] No refit weights for layer: {layer_name}")
+                logger.warning(f"No refit weights for layer: {layer_name}")
 
         if not refitter.refit_cuda_engine():
-            print("Failed to refit!")
-            exit(0)
+            logger.error("Failed to refit!")
+            raise RuntimeError("TensorRT engine refit failed")
 
     def build(
         self,
@@ -265,10 +234,17 @@ class Engine:
         enable_all_tactics=True,
         timing_cache=None,
         workspace_size=0,
-        builder_optimization_level=5,  # 0-5, higher = more optimizations, slower build
-        profiling_verbosity=None,  # None (disabled), 'LAYER_NAMES_ONLY', 'DETAILED', 'NONE'
+        builder_optimization_level=5,  # 0-5, higher = more optimizations + slower build. Surfaced as a user toggle upstream.
+        profiling_verbosity=None,  # None/'NONE' (disabled, fastest runtime), 'LAYER_NAMES_ONLY', 'DETAILED'
+        hardware_compatibility=None,  # None/'none' (build-GPU only, fastest) | 'ampere_plus' | 'same_cc'.
+                                      # PORTABLE engines that run across GPU archs at ~5-15% inference cost.
     ):
-        print(f"Building TensorRT engine for {onnx_path}: {self.engine_path}")
+        # NOTE (librediffusion fork): ported Phase-3.x TRT build optimizations from the bundled
+        # librediffusion utilities.py — builder_optimization_level, tiling FULL, tf32, explicit
+        # tactic sources, profiling verbosity. Upstream daydream had none of these and even
+        # *disabled* tactics by default (tactic_sources=[]). The TensorRT-RTX branch is intentionally
+        # NOT ported (RTX was slower than plain TRT in practice).
+        logger.info(f"Building TensorRT engine for {onnx_path}: {self.engine_path}")
         p = Profile()
         if input_profile:
             for name, dims in input_profile.items():
@@ -280,65 +256,75 @@ class Engine:
         if workspace_size > 0:
             config_kwargs["memory_pool_limits"] = {trt.MemoryPoolType.WORKSPACE: workspace_size}
 
-        # ============ PROFILING & LOGGING OPTIMIZATION ============
-        # Disable profiling for maximum runtime performance (no overhead from profiling)
-        if profiling_verbosity is None or profiling_verbosity == 'NONE':
-            # Disable all profiling for best runtime performance
+        # ---- profiling verbosity: NONE for best runtime perf (no profiling overhead) ----
+        if profiling_verbosity is None or profiling_verbosity == "NONE":
             config_kwargs["profiling_verbosity"] = trt.ProfilingVerbosity.NONE
-        elif profiling_verbosity == 'LAYER_NAMES_ONLY':
+        elif profiling_verbosity == "LAYER_NAMES_ONLY":
             config_kwargs["profiling_verbosity"] = trt.ProfilingVerbosity.LAYER_NAMES_ONLY
-        elif profiling_verbosity == 'DETAILED':
+        elif profiling_verbosity == "DETAILED":
             config_kwargs["profiling_verbosity"] = trt.ProfilingVerbosity.DETAILED
 
-        # ============ BUILDER OPTIMIZATION LEVEL ============
-        # Level 5 = maximum optimizations, slower build time but faster inference
-        # Level 0 = minimal optimizations, faster build time
+        # ---- builder optimization level (TODO: surface as a user toggle) ----
+        # Level 5 = max optimizations / slower build / faster inference; Level 0 = fast build.
         config_kwargs["builder_optimization_level"] = builder_optimization_level
         config_kwargs["tiling_optimization_level"] = trt.TilingOptimizationLevel.FULL
 
-        # ============ TACTIC SOURCES ============
-        # Configure tactic sources for kernel selection
-        # CRITICAL: Always enable at least cuBLAS and cuBLAS-LT for optimal performance
-        # Setting tactic_sources=[] disables ALL optimized kernels!
+        # ---- hardware compatibility (portable engines across GPU archs) ----
+        # Default (None/'none') = build-GPU-locked (smallest/fastest). 'ampere_plus' makes the engine run
+        # on SM 8.0+ (Ampere/Ada/Hopper/Blackwell...) at ~5-15% inference cost + larger engine. polygraphy's
+        # CreateConfig sets config.hardware_compatibility_level from this kwarg directly.
+        _hc = (hardware_compatibility or "none").lower()
+        if _hc in ("ampere_plus", "ampere", "amperePlus".lower()):
+            config_kwargs["hardware_compatibility_level"] = trt.HardwareCompatibilityLevel.AMPERE_PLUS
+        elif _hc in ("same_cc", "same_compute_capability", "same"):
+            config_kwargs["hardware_compatibility_level"] = trt.HardwareCompatibilityLevel.SAME_COMPUTE_CAPABILITY
+        elif _hc not in ("none", ""):
+            print(f"[W] unknown hardware_compatibility '{hardware_compatibility}', using NONE (build-GPU only)")
+        if "hardware_compatibility_level" in config_kwargs:
+            print(f"[I] TensorRT hardware compatibility: {_hc} (PORTABLE engine; ~5-15% slower, larger)")
+
+        # ---- tactic sources ----
+        # CRITICAL: tactic_sources=[] (upstream daydream default) disables ALL optimized kernels.
+        # Always keep at least cuBLAS + cuBLAS-LT.
         if enable_all_tactics:
-            # Enable all available tactics for maximum optimization (slower build, potentially faster runtime)
             tactic_sources = [
-                1 << int(trt.TacticSource.CUBLAS),
-                1 << int(trt.TacticSource.CUBLAS_LT),
-                1 << int(trt.TacticSource.CUDNN),
             ]
-            # Add edge mask convolutions if available
-            try:
-                tactic_sources.append(1 << int(trt.TacticSource.EDGE_MASK_CONVOLUTIONS))
-            except AttributeError:
-                pass  # Not available in all TensorRT versions
-            config_kwargs["tactic_sources"] = tactic_sources
-        else:
-            # Use standard tactics (cuBLAS, cuBLAS-LT) for reasonable build time and good performance
-            config_kwargs["tactic_sources"] = [
-                1 << int(trt.TacticSource.CUBLAS),
-                1 << int(trt.TacticSource.CUBLAS_LT),
-            ]
+            # Version-aware: TRT 10 deprecated and TRT 11 REMOVED CUBLAS/CUBLAS_LT/CUDNN tactic
+            # sources (only EDGE_MASK_CONVOLUTIONS / JIT_CONVOLUTIONS remain in TRT 11). Build the
+            # list from whatever this TRT actually exposes; if none of the legacy GEMM sources exist,
+            # DON'T set tactic_sources at all (let TRT use its full default tactic set — the modern
+            # kernels are built in). Only restricting would otherwise DISABLE everything.
+            for src_name in ("CUBLAS", "CUBLAS_LT", "CUDNN", "EDGE_MASK_CONVOLUTIONS", "JIT_CONVOLUTIONS"):
+                src = getattr(trt.TacticSource, src_name, None)
+                if src is not None:
+                    tactic_sources.append(1 << int(src))
+            if tactic_sources:
+                config_kwargs["tactic_sources"] = tactic_sources
+            # else: leave unset → TRT default (all tactics)
+        # When enable_all_tactics is False we intentionally leave tactic_sources UNSET (TRT default),
+        # rather than the old [CUBLAS, CUBLAS_LT] which no longer exists in TRT 11.
 
-        network = network_from_onnx_path(onnx_path, flags=[trt.OnnxParserFlag.NATIVE_INSTANCENORM])
-
-        # TensorRT-RTX does NOT support the FP16 builder flag (models must be pre-converted to FP16)
-        # Disable FP16 flag when using TensorRT-RTX
-        import os
-        use_trt_rtx = os.environ.get("USE_TRT_RTX", "false").lower() in ("true", "1", "yes")
-        fp16_flag = False if use_trt_rtx else fp16
+        # TRT 11 removed the FP16/TF32 BUILDER FLAGS (networks are strongly-typed now: the ONNX is
+        # already fp16, so precision is per-tensor, not a global builder flag). polygraphy raises
+        # "fp16 in CreateConfig is not available on TensorRT 11" if we pass them. Gate on TRT major.
+        # (This generalizes our original code's "TRT-RTX doesn't support the FP16 builder flag" note.)
+        trt_major = int(trt.__version__.split(".")[0])
+        precision_kwargs = {}
+        if trt_major < 11:
+            precision_kwargs = {"tf32": True, "fp16": fp16}
 
         engine = engine_from_network(
-            network,
+            network_from_onnx_path(onnx_path, flags=[trt.OnnxParserFlag.NATIVE_INSTANCENORM]),
             config=CreateConfig(
-                tf32=True, fp16=fp16_flag, refittable=enable_refit, profiles=[p], load_timing_cache=timing_cache, **config_kwargs, 
+                refittable=enable_refit, profiles=[p],
+                load_timing_cache=timing_cache, **precision_kwargs, **config_kwargs,
             ),
             save_timing_cache=timing_cache,
         )
         save_engine(engine, path=self.engine_path)
 
     def load(self):
-        print(f"Loading TensorRT engine: {self.engine_path}")
+        logger.info(f"Loading TensorRT engine: {self.engine_path}")
         self.engine = engine_from_bytes(bytes_from_path(self.engine_path))
 
     def activate(self, reuse_device_memory=None):
@@ -349,47 +335,123 @@ class Engine:
             self.context = self.engine.create_execution_context()
 
     def allocate_buffers(self, shape_dict=None, device="cuda"):
-        for binding in range(self.engine.num_io_tensors):
-            name = self.engine.get_tensor_name(binding)
+        # Check if we can reuse existing buffers (OPTIMIZATION)
+        if self._can_reuse_buffers(shape_dict, device):
+            return
+        
+        # Clear existing buffers before reallocating
+        self.tensors.clear()
+        
+        # Reset CUDA graph when buffers are reallocated
+        # The captured graph becomes invalid with new memory addresses
+        if self.cuda_graph_instance is not None:
+            CUASSERT(cudart.cudaGraphExecDestroy(self.cuda_graph_instance))
+            self.cuda_graph_instance = None
+            if hasattr(self, 'graph') and self.graph is not None:
+                CUASSERT(cudart.cudaGraphDestroy(self.graph))
+                self.graph = None
+        
+        for idx in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(idx)
+
             if shape_dict and name in shape_dict:
                 shape = shape_dict[name]
             else:
                 shape = self.engine.get_tensor_shape(name)
-            dtype = trt_dtype_to_np(self.engine.get_tensor_dtype(name))
-            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
-                self.context.set_input_shape(name, shape)
-            tensor = torch.empty(tuple(shape), dtype=numpy_to_torch_dtype_dict[dtype]).to(device=device)
-            self.tensors[name] = tensor
 
-    def infer(self, feed_dict, stream, use_cuda_graph=False):
-        # Memory copy optimization: Only copy when necessary
-        # Skip redundant copies when input already shares memory with target buffer
-        for name, buf in feed_dict.items():
-            target_tensor = self.tensors[name]
-
-            # Skip copy if tensors share the same memory (zero-copy optimization)
-            if target_tensor.data_ptr() != buf.data_ptr():
-                # Only copy when buffers are different
-                target_tensor.copy_(buf)
-            # else: data_ptr is same, skip copy entirely
-
-        # For TensorRT-RTX compatibility: ensure input shapes are set before setting addresses
-        # TensorRT-RTX returns enums from tensorrt_bindings, not tensorrt_rtx,
-        # so we use string comparison as a reliable method to identify inputs
-        for name, tensor in self.tensors.items():
+            dtype_np = trt.nptype(self.engine.get_tensor_dtype(name))
             mode = self.engine.get_tensor_mode(name)
 
-            # Check if this is an input tensor
-            # Use string comparison for TensorRT-RTX compatibility since enum types differ
-            mode_str = str(mode)
-            is_input = "INPUT" in mode_str and "OUTPUT" not in mode_str
+            if mode == trt.TensorIOMode.INPUT:
+                self.context.set_input_shape(name, shape)
 
-            if is_input:
-                # Only set shape if it changed (avoid redundant API calls)
-                if name not in self.last_shapes or self.last_shapes[name] != tensor.shape:
-                    self.context.set_input_shape(name, tensor.shape)
-                    self.last_shapes[name] = tensor.shape
+            tensor = torch.empty(tuple(shape),
+                                 dtype=numpy_to_torch_dtype_dict[dtype_np]) \
+                          .to(device=device)
+            self.tensors[name] = tensor
+        
+        # Cache allocation parameters for reuse check
+        self._last_shape_dict = shape_dict.copy() if shape_dict else None
+        self._last_device = device
+    
+    def _can_reuse_buffers(self, shape_dict=None, device="cuda"):
+        """
+        Check if existing buffers can be reused (avoiding expensive reallocation)
+        
+        Returns:
+            bool: True if buffers can be reused, False if reallocation needed
+        """
+        # No existing tensors - need to allocate
+        if not self.tensors:
+            return False
+        
+        # Device changed - need to reallocate
+        if not hasattr(self, '_last_device') or self._last_device != device:
+            return False
+        
+        # No cached shape_dict - need to allocate
+        if not hasattr(self, '_last_shape_dict'):
+            return False
+            
+        # Compare current vs cached shape_dict
+        if shape_dict is None and self._last_shape_dict is None:
+            return True
+        elif shape_dict is None or self._last_shape_dict is None:
+            return False
+        
+        # Quick check: if tensor counts differ, can't reuse
+        if len(shape_dict) != len(self._last_shape_dict):
+            return False
+        
+        # Compare shapes for all tensors in the new shape_dict
+        for name, new_shape in shape_dict.items():
+            # Check if tensor exists in cached shapes
+            cached_shape = self._last_shape_dict.get(name)
+            if cached_shape is None:
+                return False
+            
+            # Compare shapes (handle different types consistently)
+            if tuple(cached_shape) != tuple(new_shape):
+                return False
+        
+        return True
 
+    def reset_cuda_graph(self):
+        if self.cuda_graph_instance is not None:
+            CUASSERT(cudart.cudaGraphExecDestroy(self.cuda_graph_instance))
+            self.cuda_graph_instance = None
+        if hasattr(self, 'graph') and self.graph is not None:
+            CUASSERT(cudart.cudaGraphDestroy(self.graph))
+            self.graph = None
+
+    def infer(self, feed_dict, stream, use_cuda_graph=False):
+        # Filter inputs to only those the engine actually exposes to avoid binding errors
+        try:
+            allowed_inputs = set()
+            for idx in range(self.engine.num_io_tensors):
+                name = self.engine.get_tensor_name(idx)
+                if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                    allowed_inputs.add(name)
+
+            # Drop any extra keys (e.g., text_embeds/time_ids) that the engine was not built to accept
+            if allowed_inputs:
+                filtered_feed_dict = {k: v for k, v in feed_dict.items() if k in allowed_inputs}
+                if len(filtered_feed_dict) != len(feed_dict):
+                    missing = [k for k in feed_dict.keys() if k not in allowed_inputs]
+                    if missing:
+                        logger.debug(
+                            "TensorRT Engine: filtering unsupported inputs %s (allowed=%s)",
+                            missing, sorted(list(allowed_inputs))
+                        )
+                feed_dict = filtered_feed_dict
+        except Exception:
+            # Be permissive if engine query fails; proceed with original dict
+            pass
+        
+        for name, buf in feed_dict.items():
+            self.tensors[name].copy_(buf)
+
+        for name, tensor in self.tensors.items():
             self.context.set_tensor_address(name, tensor.data_ptr())
 
         if use_cuda_graph:
@@ -501,45 +563,36 @@ def build_engine(
     build_dynamic_shape: bool = False,
     build_all_tactics: bool = False,
     build_enable_refit: bool = False,
+    builder_optimization_level: int = 5,  # 0-5; surfaced as a user toggle upstream. Higher = faster runtime, slower build.
+    hardware_compatibility=None,  # None/'none' | 'ampere_plus' | 'same_cc' — portable cross-GPU engines
 ):
+    # NOTE (librediffusion fork): ported Phase-3.x optimizations from bundled librediffusion —
+    # TF32 torch backends (CC>=8.0), VRAM-tiered workspace, per-engine timing cache.
     _, free_mem, _ = cudart.cudaMemGetInfo()
     GiB = 2**30
 
-    # Phase 3.1 Optimization: Enable TF32 for Ampere and newer GPUs (15-25% speedup)
-    # TF32 provides ~8x faster matrix multiplication than FP32 with minimal accuracy loss
-    # RTX 30/40 series, A100, H100 all support TF32
+    # TF32 for Ampere+ (CC>=8.0): ~faster fp32 matmul/conv with minimal accuracy loss (PyTorch 2.9+ API).
     if torch.cuda.is_available():
-        compute_capability = torch.cuda.get_device_capability()
-        if compute_capability[0] >= 8:  # Ampere (8.x), Ada (8.9), Hopper (9.0)
-            # Use new PyTorch 2.9+ API for TF32 settings
-            torch.backends.cuda.matmul.fp32_precision = 'tf32'
-            torch.backends.cudnn.conv.fp32_precision = 'tf32'
-            device_name = torch.cuda.get_device_name()
-            print(f"[I] TF32 enabled for {device_name} (Compute Capability {compute_capability[0]}.{compute_capability[1]})")
+        cc = torch.cuda.get_device_capability()
+        if cc[0] >= 8:
+            torch.backends.cuda.matmul.fp32_precision = "tf32"
+            torch.backends.cudnn.conv.fp32_precision = "tf32"
+            logger.info(f"TF32 enabled for {torch.cuda.get_device_name()} (CC {cc[0]}.{cc[1]})")
         else:
-            print(f"[I] TF32 not available on Compute Capability {compute_capability[0]}.{compute_capability[1]} (requires 8.0+)")
+            logger.info(f"TF32 not available on CC {cc[0]}.{cc[1]} (requires 8.0+)")
 
-    # Optimized workspace allocation - be more aggressive to allow more optimization tactics
-    # Old: reserved 4GB (too conservative), limiting optimization options
-    # New: use percentage-based allocation for better optimization
+    # Percentage-based workspace (more tactics available than the old fixed 4GiB carveout).
     if free_mem > 8 * GiB:
-        # High VRAM (>8GB): use 75% for workspace
         max_workspace_size = int(free_mem * 0.75)
-        print(f"High VRAM detected ({free_mem / GiB:.1f} GB), using {max_workspace_size / GiB:.2f} GB workspace")
     elif free_mem > 6 * GiB:
-        # Medium VRAM (6-8GB): use 70% for workspace
         max_workspace_size = int(free_mem * 0.70)
-        print(f"Medium VRAM detected ({free_mem / GiB:.1f} GB), using {max_workspace_size / GiB:.2f} GB workspace")
     elif free_mem > 4 * GiB:
-        # Low VRAM (4-6GB): use 60% for workspace
         max_workspace_size = int(free_mem * 0.60)
-        print(f"Low VRAM detected ({free_mem / GiB:.1f} GB), using {max_workspace_size / GiB:.2f} GB workspace")
     else:
-        # Very low VRAM (<4GB): use 50% for workspace
         max_workspace_size = int(free_mem * 0.50)
-        print(f"Very low VRAM detected ({free_mem / GiB:.1f} GB), using {max_workspace_size / GiB:.2f} GB workspace")
+    logger.info(f"VRAM {free_mem / GiB:.1f} GB free, using {max_workspace_size / GiB:.2f} GB workspace")
 
-    # Create timing cache path for faster subsequent builds
+    # Timing cache speeds up subsequent rebuilds of the same engine.
     timing_cache_path = engine_path.replace(".engine", ".timing.cache")
 
     engine = Engine(engine_path)
@@ -558,9 +611,14 @@ def build_engine(
         enable_all_tactics=build_all_tactics,
         workspace_size=max_workspace_size,
         timing_cache=timing_cache_path,
+        builder_optimization_level=builder_optimization_level,
+        hardware_compatibility=hardware_compatibility,
     )
 
     return engine
+
+
+
 
 
 def export_onnx(
@@ -572,10 +630,73 @@ def export_onnx(
     opt_batch_size: int,
     onnx_opset: int,
 ):
+    # TODO: Not 100% happy about this function - needs refactoring
+    
+    is_sdxl = False
+    is_sdxl_controlnet = False
+
+    # Detect if this is a ControlNet model (vs UNet model)
+    is_controlnet = (
+        hasattr(model, '__class__') and 'ControlNet' in model.__class__.__name__
+    ) or (
+        hasattr(model, 'config') and hasattr(model.config, '_class_name') and
+        'ControlNet' in model.config._class_name
+    )
+
+    # Detect if this is an SDXL model via detect_model
+    if hasattr(model, 'unet'):
+        detection_result = detect_model(model.unet)
+        if detection_result is not None:
+            is_sdxl = detection_result.get('is_sdxl', False)
+    elif hasattr(model, 'config'):
+        detection_result = detect_model(model)
+        if detection_result is not None:
+            is_sdxl = detection_result.get('is_sdxl', False)
+    
+    # Detect if this is an SDXL ControlNet
+    is_sdxl_controlnet = is_controlnet and (is_sdxl or (
+        hasattr(model, 'config') and
+        getattr(model.config, 'addition_embed_type', None) == 'text_time'
+    ))
+    
+    wrapped_model = model  # Default: use model as-is
+
+    # librediffusion: if the model already exposes the 5-input SDXL signature (our SDXLUNetWrapper,
+    # which feeds text_embeds/time_ids as real graph inputs for the C++ engine), DON'T auto-wrap with
+    # SDXLExportWrapper (that expects 3 inputs and zero-fills the conditioning).
+    if getattr(model, "_sdxl_export_ready", False):
+        is_sdxl = False  # skip the auto-wrap branch below; use the model as-is
+
+    # Apply SDXL wrapper for SDXL models (in practice, always UnifiedExportWrapper)
+    if is_sdxl and not is_controlnet:
+        embedding_dim = getattr(model_data, 'embedding_dim', 'unknown')
+        logger.info(f"Detected SDXL model (embedding_dim={embedding_dim}), using wrapper for ONNX export...")
+        from .export_wrappers.unet_sdxl_export import SDXLExportWrapper
+        wrapped_model = SDXLExportWrapper(model)
+    elif not is_controlnet:
+        embedding_dim = getattr(model_data, 'embedding_dim', 'unknown')
+        logger.info(f"Detected non-SDXL model (embedding_dim={embedding_dim}), using model as-is for ONNX export...")
+    
+    # SDXL ControlNet models need special wrapper for added_cond_kwargs
+    elif is_sdxl_controlnet:
+        logger.info("Detected SDXL ControlNet model, using specialized wrapper...")
+        from .export_wrappers.controlnet_export import SDXLControlNetExportWrapper
+        wrapped_model = SDXLControlNetExportWrapper(model)
+    
+    # Regular ControlNet models are exported directly
+    elif is_controlnet:
+        logger.info("Detected ControlNet model, exporting directly...")
+        wrapped_model = model
+    
     with torch.inference_mode(), torch.autocast("cuda"):
         inputs = model_data.get_sample_input(opt_batch_size, opt_image_height, opt_image_width)
+        
+        # Determine if we need external data format for large models (like SDXL)
+        is_large_model = is_sdxl or (hasattr(model, 'config') and getattr(model.config, 'sample_size', 32) >= 64)
+        
+        # Export ONNX normally first
         torch.onnx.export(
-            model,
+            wrapped_model,
             inputs,
             onnx_path,
             export_params=True,
@@ -584,9 +705,16 @@ def export_onnx(
             input_names=model_data.get_input_names(),
             output_names=model_data.get_output_names(),
             dynamic_axes=model_data.get_dynamic_axes(),
-            dynamo=False,  # Use legacy exporter for stability with dynamic_axes
+            dynamo=False,
         )
-    del model
+        
+        # librediffusion: do NOT manually re-save large models with a separate weights.pb. For >2GB
+        # SDXL, torch.onnx.export(export_params=True) already spills weights to a sibling external-data
+        # file that the downstream optimize/build path resolves. The old manual re-save wrote
+        # location="weights.pb" next to unet.onnx, but optimize_onnx/build read unet.opt.onnx (a
+        # different file) → broken external refs → "Inputs available in the TensorRT network: set()".
+        # (Our bundled exporter handles SDXL with no manual re-save; match that.)
+    del wrapped_model
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -596,8 +724,117 @@ def optimize_onnx(
     onnx_opt_path: str,
     model_data: BaseModel,
 ):
-    onnx_opt_graph = model_data.optimize(onnx.load(onnx_path))
-    onnx.save(onnx_opt_graph, onnx_opt_path)
+    import os
+
+    # librediffusion fork (2026-06-05): ALWAYS load with external data (a no-op if the model has no
+    # external refs) and decide the SAVE format by the optimized model's serialized size, not by a
+    # fragile filename heuristic.
+    #
+    # Old code keyed on `*.pb` files existing in onnx_dir. But torch.onnx.export(export_params=True)
+    # auto-spills a >2GB model to files named after the TENSORS (unet.add_embedding.linear_1.weight,
+    # onnx__Add_NNNN, ...) — NONE end in `.pb`. So for the from-scratch SDXL UNet the heuristic saw
+    # `uses_external_data=False`, took the else branch, and called onnx.save() WITHOUT external data on
+    # a 5.1GB graph → protobuf's hard 2GB limit truncated/corrupted unet.opt.onnx → TRT failed with
+    # "MODEL_DESERIALIZE_FAILED ... Failed to parse the ONNX model". Size-based save format fixes it for
+    # any spill convention (torch tensor-named, single weights.pb, or none).
+    opt_dir = os.path.dirname(onnx_opt_path)
+    os.makedirs(opt_dir, exist_ok=True)
+    # Clean stale OPT artifacts only (a prior failed run may have left a truncated unet.opt.onnx /
+    # weights.pb). IMPORTANT: opt_dir is often the SAME dir as the input onnx_path, so we must NOT
+    # delete the input model (unet.onnx) or its torch-spilled external-data files — only the
+    # opt-prefixed outputs. (An earlier version deleted all *.onnx here, including the input, which
+    # broke both onnxslim and the fallback with FileNotFoundError: unet.onnx.)
+    opt_base = os.path.basename(onnx_opt_path)            # e.g. unet.opt.onnx
+    in_base = os.path.basename(onnx_path)                 # e.g. unet.onnx
+    if os.path.exists(opt_dir):
+        for f in os.listdir(opt_dir):
+            full = os.path.join(opt_dir, f)
+            if full == os.path.abspath(onnx_path) or f == in_base:
+                continue  # never delete the input model
+            # opt artifacts: the opt onnx itself + its sibling weights.pb / *.data external file.
+            if f == opt_base or f == "weights.pb" or f.endswith('.opt.onnx') or f.endswith('.opt.onnx.data'):
+                try:
+                    os.remove(full)
+                except OSError:
+                    pass
+
+    # librediffusion fork (2026-06-05): for LARGE (>2GB) models (SDXL UNet), optimize with ONNXSLIM
+    # via its FILE->FILE API. Rationale: the in-memory model_data.optimize() path (onnxsim +
+    # onnxoptimizer) CANNOT handle >2GB protos — onnxsim bails on dynamic shapes and onnxoptimizer
+    # silently returns an empty graph (protobuf 2GB serialization limit). models.py already SKIPS those
+    # passes for >2GB, so SDXL would otherwise get only gs cleanup+fold. onnxslim 0.1.94 loads/saves by
+    # PATH with auto external-data, so it round-trips a 5GB model and gives real fusion. We DON'T pass
+    # input_shapes (keep the engine's dynamic batch/H/W axes — input_shapes would pin them). If onnxslim
+    # is unavailable or errors, fall back to the gs-only path (still correct, just less fused).
+    # Engine PERF is unaffected either way (TRT redoes node fusion itself; NVIDIA's demo/Diffusion omits
+    # these passes) — onnxslim mainly buys parser robustness + a smaller ONNX artifact.
+    # Detect a LARGE model by inspecting the input ONNX proto for EXTERNAL-DATA tensor refs (the
+    # definitive >2GB signal — torch.onnx.export spills weights externally only when the model exceeds
+    # protobuf's 2GB limit). This is robust regardless of how/where the weights were spilled (a previous
+    # directory-size heuristic was unreliable: same dir as opt_dir, files deleted/flushed at scan time).
+    use_onnxslim = False
+    try:
+        meta = onnx.load(onnx_path, load_external_data=False)
+        for init in meta.graph.initializer:
+            # data_location == EXTERNAL (1) means a weight lives in a sidecar -> the model is >2GB.
+            if init.data_location == onnx.TensorProto.EXTERNAL:
+                use_onnxslim = True
+                break
+        del meta
+    except Exception:
+        use_onnxslim = False
+    if use_onnxslim:
+        try:
+            import onnxslim
+            logger.info("ONNX optimize: large model (external-data weights) — using onnxslim "
+                        "file->file (auto external data)")
+            onnxslim.slim(
+                onnx_path,
+                onnx_opt_path,
+                model_check=False,
+                save_as_external_data=True,
+            )
+            # onnxslim wrote unet.opt.onnx (+ external data). Done — skip the in-memory path.
+            gc.collect()
+            torch.cuda.empty_cache()
+            logger.info("ONNX optimization complete with onnxslim (large model)")
+            return
+        except ImportError:
+            logger.info("onnxslim not installed — falling back to gs-only optimize for the large model")
+        except Exception as e:
+            logger.warning(f"onnxslim failed ({e}); falling back to gs-only optimize for the large model")
+            # Clean any partial onnxslim output before the fallback re-saves.
+            for f in os.listdir(opt_dir):
+                if f.endswith('.pb') or f.endswith('.onnx') or f.endswith('.data'):
+                    try:
+                        os.remove(os.path.join(opt_dir, f))
+                    except OSError:
+                        pass
+
+    onnx_model = onnx.load(onnx_path, load_external_data=True)
+    onnx_opt_graph = model_data.optimize(onnx_model)
+
+    # ByteSize() raises/overflows past 2GB on some protobuf builds; guard it.
+    try:
+        opt_too_large = onnx_opt_graph.ByteSize() > 2147483648
+    except (ValueError, Exception):
+        opt_too_large = True
+
+    if opt_too_large:
+        # Save optimized model with external data (single sibling weights.pb the TRT parser resolves).
+        onnx.save_model(
+            onnx_opt_graph,
+            onnx_opt_path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location="weights.pb",
+            convert_attribute=False,
+        )
+        logger.info("ONNX optimization complete with external data (model >2GB)")
+    else:
+        onnx.save(onnx_opt_graph, onnx_opt_path)
+        logger.info("ONNX optimization complete (single file)")
+
     del onnx_opt_graph
     gc.collect()
     torch.cuda.empty_cache()

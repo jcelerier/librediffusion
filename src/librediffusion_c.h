@@ -89,7 +89,8 @@ typedef enum librediffusion_model_type_t
 {
   MODEL_SD_15 = 0,
   MODEL_SD_TURBO = 1,
-  MODEL_SDXL_TURBO = 2
+  MODEL_SDXL_TURBO = 2,
+  MODEL_FLUX2_KLEIN_4B = 3
 } librediffusion_model_type_t;
 
 typedef enum librediffusion_pipeline_mode_t
@@ -468,6 +469,16 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_ipadapter(
     librediffusion_config_handle config, int num_image_tokens, float scale);
 
+/** Configure the OPTIONAL on-device IP-Adapter image encoder engines. When both are set the pipeline
+ * loads a CLIP ViT-H/14 image encoder + ImageProjModel so the host can feed a RAW style image via
+ * librediffusion_set_ipadapter_image (instead of precomputing tokens). Paths:
+ *  - image_encoder_engine: clip_image_encoder.engine (pixel_values[1,3,224,224]->image_embeds[1,1024])
+ *  - image_proj_engine:    ip_image_proj.engine      (image_embeds[1,1024]->ip_tokens[1,N,768]) */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_config_set_ipadapter_image_encoder(
+    librediffusion_config_handle config, const char* image_encoder_engine,
+    const char* image_proj_engine);
+
 /** Set the host-computed image tokens: pos (required) + neg (optional, for the cfg uncond row; base
  * IP-Adapter neg = projection of zeros). Each is a device fp16 tensor [num_tokens, dim]; dim must equal
  * the UNet hidden dim. Concatenated onto the text tokens to form encoder_hidden_states each step. */
@@ -475,6 +486,15 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_set_ipadapter_tokens(
     librediffusion_pipeline_handle pipeline, const librediffusion_half_t* pos_tokens,
     const librediffusion_half_t* neg_tokens, int num_tokens, int dim);
+
+/** Set the IP-Adapter style from a RAW host image (RGBA uint8 [h*w*4], row-major). Runs the on-device
+ * CLIP image encoder + projection to compute the pos tokens (+ neg tokens = projection of zeros) and
+ * installs them. Requires librediffusion_config_set_ipadapter_image_encoder to have been configured.
+ * Call once / on change (style is static); re-call only when the style image changes. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_ipadapter_image(
+    librediffusion_pipeline_handle pipeline, const uint8_t* cpu_rgba, int img_height,
+    int img_width);
 
 /** Uniform IP-Adapter scale across all layers. */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
@@ -1002,6 +1022,173 @@ librediffusion_cuda_memcpy_d2h(void* dst, const void* src, size_t size);
  */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_cuda_device_synchronize(void);
+
+/* ===================== FLUX.2-klein-4B ===================== */
+/* Opaque klein pipeline handle. */
+typedef struct librediffusion_flux2* librediffusion_flux2_handle;
+
+/* Create a klein pipeline from the 4 engine paths (vae_encoder may be NULL when no reference image is used). */
+LIBREDIFFUSION_API librediffusion_flux2_handle LIBREDIFFUSION_CALL
+librediffusion_flux2_create(
+    const char* transformer_engine, const char* qwen_engine, const char* vae_decoder_engine,
+    const char* vae_encoder_engine);
+
+LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
+librediffusion_flux2_destroy(librediffusion_flux2_handle h);
+
+/* Qwen3 encode seam: input_ids/attention_mask DEVICE int64 [1,Lt] -> ehs_out DEVICE bf16 [1,Lt,7680]. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_flux2_encode_text(
+    librediffusion_flux2_handle h, const void* input_ids, const void* attention_mask, void* ehs_out,
+    int Lt);
+
+/* Full txt2img-from-noise: produces an RGBA uint8 image [H*W*4] on the host (rgba_host).
+ * init_noise DEVICE bf16 packed [1,Lp,128]; ehs DEVICE bf16 [1,Lt,7680]; bn_mean/bn_std DEVICE fp32 [128].
+ * If out_final_latent_host != NULL it receives the post-Euler packed latent [Lp*128] fp32 (seam).
+ * img_ids/txt_ids are built internally on-device from Th/Tw/Lt. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_flux2_txt2img(
+    librediffusion_flux2_handle h, const void* init_noise, const void* ehs, const void* bn_mean,
+    const void* bn_std, int Th, int Tw, int Lt, int num_steps,
+    unsigned char* rgba_host, float* out_final_latent_host);
+
+/* Reference-image denoise+decode (numeric validation seam): like flux2_txt2img but with
+ * reference tokens concatenated to the noisy-latent sequence.
+ *   init_noise   DEVICE bf16 [1,Lp,128] (pure noise, packed)
+ *   ref_tokens   DEVICE bf16 [1,Lp,128] (packed reference tokens, from encode)
+ *   ehs          DEVICE bf16 [1,Lt,7680]
+ *   ref_ids      DEVICE fp32 [Lp,4] (reference RoPE ids, T offset). img_ids/txt_ids built internally.
+ *   bn_mean/bn_std DEVICE fp32 [128].
+ * out_final_latent_host (optional) receives the post-Euler packed latent [Lp*128] fp32. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_flux2_txt2img_ref(
+    librediffusion_flux2_handle h, const void* init_noise, const void* ref_tokens, const void* ehs,
+    const void* ref_ids, const void* bn_mean, const void* bn_std, int Th, int Tw, int Lt,
+    int num_steps, unsigned char* rgba_host, float* out_final_latent_host);
+
+/* ===================== FLUX.2-klein-4B streaming =====================
+ * Real-time video edit: each input frame is fed as a REFERENCE image (VAE-encoded -> reference
+ * tokens concatenated to a PURE-NOISE latent sequence; denoise always starts from the SAME fixed
+ * seed noise -> frame coherence). 2 steps, guidance 1.0, NO CFG, NO img2img strength.
+ *
+ * The Qwen text encoder is CACHED: it runs only when the prompt changes (set_prompt). Every frame
+ * reuses the cached encoder_hidden_states -> per-frame cost is VAE-encode + 2 transformer passes +
+ * VAE-decode (the 41ms Qwen pass is amortized to ~0 for a stable prompt).
+ *
+ * Output frames are RGBA uint8 [H*W*4] (H=Th*16, W=Tw*16), the exact format RIFE consumes:
+ *   librediffusion_rife_interpolate(rife, prev_out, cur_out, H, W, frames, &n);
+ *
+ * Usage:
+ *   s = librediffusion_flux2_stream_create(transformer, qwen, vae_decoder, vae_encoder,
+ *                                          tokenizer_json, Th, Tw, seed);
+ *   librediffusion_flux2_stream_set_prompt(s, "an oil painting of ...");  // triggers re-encode
+ *   for each webcam frame:
+ *     librediffusion_flux2_stream_frame(s, frame_rgba, out_rgba);         // 2-step, cached encoder
+ */
+typedef struct librediffusion_flux2_stream* librediffusion_flux2_stream_handle;
+
+/* Create a streaming klein pipeline. tokenizer_json = path to the klein tokenizer.json.
+ * Th/Tw = packed token grid (320x576 -> Th=36, Tw=20 -> H=576, W=320). seed = fixed noise seed
+ * (FluxRT uses 52; never reseeded per frame). num_steps defaults to 2. Returns NULL on failure. */
+LIBREDIFFUSION_API librediffusion_flux2_stream_handle LIBREDIFFUSION_CALL
+librediffusion_flux2_stream_create(
+    const char* transformer_engine, const char* qwen_engine, const char* vae_decoder_engine,
+    const char* vae_encoder_engine, const char* tokenizer_json, int Th, int Tw,
+    unsigned long long seed);
+
+LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
+librediffusion_flux2_stream_destroy(librediffusion_flux2_stream_handle s);
+
+/* Number of inference steps (default 2). */
+LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
+librediffusion_flux2_stream_set_steps(librediffusion_flux2_stream_handle s, int num_steps);
+
+/* Set the VAE batch-norm buffers (model constants) once after create. host fp32 [128] each.
+ * Required before stream_frame (the reference VAE encode + the decode both need them).
+ * Obtain from vae.bn.running_mean and sqrt(vae.bn.running_var + 1e-4). */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_flux2_stream_set_bn(
+    librediffusion_flux2_stream_handle s, const float* bn_mean_host, const float* bn_std_host);
+
+/* Set the prompt. Re-tokenizes + re-runs the Qwen encoder and caches the embeds. Cheap to call
+ * with the same prompt (no-op if unchanged). Returns the number of real text tokens, or -1. */
+LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+librediffusion_flux2_stream_set_prompt(librediffusion_flux2_stream_handle s, const char* prompt);
+
+/* Process one frame: input_rgba (HOST uint8 [H*W*4], H=Th*16, W=Tw*16) -> output_rgba (HOST uint8
+ * [H*W*4]). Uses the cached encoder embeds + fixed-seed pure noise + the reference-token path.
+ * Must call set_prompt at least once first. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_flux2_stream_frame(
+    librediffusion_flux2_stream_handle s, const unsigned char* input_rgba,
+    unsigned char* output_rgba);
+
+/* Cached-reference fast path. VAE-encode the reference frame ONCE (set_reference), then run
+ * frames via frame_cached (denoise+decode only, NO per-frame VAE-encode). The caller (node)
+ * hashes the input texture and calls set_reference only when it changes; for txt2img the black
+ * reference hashes constant -> encoded once. set_prompt + set_reference required before frame_cached. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_flux2_stream_set_reference(
+    librediffusion_flux2_stream_handle s, const unsigned char* input_rgba);
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_flux2_stream_frame_cached(
+    librediffusion_flux2_stream_handle s, unsigned char* output_rgba);
+
+/* Output dimensions for the configured Th/Tw (H = Th*16, W = Tw*16). */
+LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
+librediffusion_flux2_stream_dims(librediffusion_flux2_stream_handle s, int* H, int* W);
+
+/* ===================== RIFE frame interpolation (SHARED/model-agnostic) =====================
+ * RIFE operates on decoded RGB frames AFTER any pipeline's decode step, so it multiplies the
+ * DISPLAYED fps for ALL methods (FLUX/klein, SDXL, SD1.5, v2v) equally. It is fully OPTIONAL:
+ * if the caller never creates a handle / leaves it disabled, behavior is unchanged.
+ *
+ * Usage (any pipeline):
+ *   h = librediffusion_rife_create("/.../rife_ifnet_fp16.plan");
+ *   librediffusion_rife_set_enabled(h, 1);
+ *   librediffusion_rife_set_interpolation_exp(h, 2);   // -> 4x displayed frames
+ *   // each frame after decode:
+ *   int n = 0;
+ *   librediffusion_rife_interpolate(h, prev_rgba, cur_rgba, H, W, out_frames, &n);
+ *   // out_frames holds n = 2^exp frames [(2^exp)*H*W*4], display order, last = cur (real).
+ */
+typedef struct librediffusion_rife* librediffusion_rife_handle;
+
+/* Create a RIFE interpolator from the IFNet fp16 engine path. Returns NULL on failure. */
+LIBREDIFFUSION_API librediffusion_rife_handle LIBREDIFFUSION_CALL
+librediffusion_rife_create(const char* engine_path);
+
+LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
+librediffusion_rife_destroy(librediffusion_rife_handle h);
+
+/* Opt-in toggle. Disabled by default; when disabled, interpolate is a passthrough (returns cur). */
+LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
+librediffusion_rife_set_enabled(librediffusion_rife_handle h, int enabled);
+
+LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+librediffusion_rife_is_enabled(librediffusion_rife_handle h);
+
+/* interpolation_exp: 0 = off (1 frame out), 1 = 2x, 2 = 4x, 3 = 8x displayed frames. */
+LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
+librediffusion_rife_set_interpolation_exp(librediffusion_rife_handle h, int exp);
+
+LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+librediffusion_rife_get_interpolation_exp(librediffusion_rife_handle h);
+
+/* Interpolate between two consecutive real RGBA frames (HOST uint8 [H*W*4] each).
+ * Writes up to (2^exp) frames into out_frames (caller-sized (2^exp)*H*W*4); display order,
+ * last frame == cur. *out_count receives the number of frames written.
+ * When disabled (or exp==0), writes 1 frame (cur) and *out_count = 1. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_rife_interpolate(
+    librediffusion_rife_handle h, const unsigned char* prev_rgba, const unsigned char* cur_rgba,
+    int H, int W, unsigned char* out_frames, int* out_count);
+
+/* Device-pointer variant: prev/cur RGBA uint8 on DEVICE; out_frames RGBA uint8 on DEVICE. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_rife_interpolate_gpu(
+    librediffusion_rife_handle h, const unsigned char* prev_rgba_dev,
+    const unsigned char* cur_rgba_dev, int H, int W, unsigned char* out_frames_dev, int* out_count);
 
 #ifdef __cplusplus
 } /* extern "C" */

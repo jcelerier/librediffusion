@@ -4,37 +4,59 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 
-# hint: You're using CPython 3.14 (`cp314`), but `onnxruntime` (v1.23.2) only has wheels with the following Python ABI tags: `cp310`, `cp311`, `cp312`, `cp313`, `cp313t`
-requires-python = ">=3.13,<3.14"
+# Python pinned to 3.12: this is the version of the certified engine-build venv (CUDA 13 / TRT 11
+# toolchain). onnxruntime 1.23.x ships wheels for cp310..cp313 — 3.12 is well inside that range.
+requires-python = ">=3.12,<3.13"
 dependencies = [
-    "accelerate>=1.5",
+    "accelerate>=1.13",
     "colored>=2.3",
-    "cuda-python>=13",
+    "cuda-python>=13.3",
     "cudart>=1",
     "onnxsim_prebuilt>=0.4.36",
-    "diffusers>=0.32",
+    # diffusers: REQUIRES our kvo_cache fork (branch kvo-cache-0.38 = base diffusers 0.38.0 + kvo_cache),
+    # needed for the IP-Adapter kvo_cache export and the klein/Flux2 path. Generic diffusers will NOT work.
+    # Fork is pushed: github.com/jcelerier/diffusers @ kvo-cache-0.38 (HEAD 1b7b45ee2 — VAE-tuple fix).
+    "diffusers @ git+https://github.com/jcelerier/diffusers.git@kvo-cache-0.38",
+    # diffusers_ipadapter: fork (livepeer/Diffusers_IPAdapter @ 405f87da), imported by the export as
+    # `diffusers_ipadapter`; supplies the AttnProcessor2_0 patch for IP-Adapter kvo_cache support.
+    "diffusers_ipadapter @ git+https://github.com/livepeer/Diffusers_IPAdapter.git@405f87da",
     "ninja>=1.11",
-    "onnx-graphsurgeon>=0.5",
+    "onnx-graphsurgeon>=0.5.8",
     "onnxruntime==1.23.2",
     "onnxscript>=0.5.0",
-    "onnx<1.19", # 1.19 produces ir_version 12 not supported by onnxruntime 1.23
+    "onnx>=1.18,<1.19", # 1.19 produces ir_version 12 not supported by onnxruntime 1.23
+    "onnxslim>=0.1.94",
+    "onnxoptimizer>=0.4.2",
     "peft>=0.15.0",
-    "polygraphy>=0.49.20",
-    "tensorrt>=10.14.0.0,<10.15.0.0",
-    "torch>=2.9.0",
-    "torchvision>=0.21.0",
-    "transformers>=4.49.0"
+    "polygraphy>=0.50.3",
+    # protobuf MUST be pinned <5 (==4.25.3): the onnx export of the >2GB SDXL graph fails with protobuf 5.x.
+    # onnxslim/onnx-graphsurgeon call ByteSize()/SerializeToString() on the full SDXL proto; protobuf 5.x
+    # enforces the 2GB serialize limit and aborts.
+    "protobuf==4.25.3",
+    # TensorRT 11 (the latest, RTX-style strongly-typed builder). Pinned to the certified 11.0.0.114 via the
+    # CUDA-13 wheel package `tensorrt-cu13` (the meta `tensorrt` package pulls a CUDA-12 runtime). The whole
+    # engine-build/validation matrix is certified against exactly this build — do NOT let resolution slide to
+    # TRT 10 (different builder semantics: FP16 builder flag, CUBLAS/CUDNN tactic sources, etc.).
+    "tensorrt-cu13==11.0.0.114",
+    # nvidia-modelopt: FP8 calibration for the klein transformer (export_klein_fp8_calib.py). 0.44 pins
+    # torch>=2.8 (no upper bound), compatible with torch 2.12.
+    "nvidia-modelopt>=0.44",
+    # torch/torchvision must be the CUDA-13.2 build from the cu132 index (see [tool.uv.sources] below).
+    # Certified at torch 2.12.0+cu132 / torchvision 0.27.0+cu132 (bundles nccl 2.29.7).
+    "torch>=2.12.0",
+    "torchvision>=0.27.0",
+    "transformers>=5.10"
 ]
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
 explicit = true
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 torchvision = [
-  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
