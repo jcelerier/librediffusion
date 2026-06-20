@@ -76,7 +76,6 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
   int denoised_size = total_batch * 4 * config_.latent_height * config_.latent_width;
   CUDATensor<__half> denoised(denoised_size);
 
-  // Copy input
   x_t_latent.load_d2d(x_t_latent_in, latent_size, stream);
 
   // Batch denoising mode
@@ -96,6 +95,38 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
 
     int total_batch
         = config_.batch_size + (config_.denoising_steps - 1) * config_.frame_buffer_size;
+
+    // Rotate stock_noise at the START of the call, BEFORE the UNet — matches the reference
+    // pipeline.py predict_x0_batch (denoising_steps_num > 1):
+    //   self.stock_noise = torch.cat((self.init_noise[0:1], self.stock_noise[:-1]), dim=0)
+    // i.e. prepend init_noise[0], drop the last row. stock_noise feeds noise_pred_uncond for
+    // self/initialize RCFG; without this leading rotation the uncond term is misaligned every
+    // step and self-cfg diverges into garbage (validation harness: self-cfg predict_x0 rel ~124,
+    // psnr ~2.5). Use a temp because src/dst overlap. Only self(2)/initialize(3) consume stock_noise.
+    if(config_.guidance_scale > 1.0f && (config_.cfg_type == 2 || config_.cfg_type == 3))
+    {
+      const int stride_l = 4 * config_.latent_height * config_.latent_width;
+      // grow-only persistent scratch (avoid a per-frame cudaMalloc/Free on this CFG path)
+      if(!stock_noise_rotated_ || stock_noise_rotated_->size() < stock_noise_->size())
+        stock_noise_rotated_ = std::make_unique<CUDATensor<__half>>(stock_noise_->size());
+      CUDATensor<__half>& rotated = *stock_noise_rotated_;
+      // rotated[0] = init_noise[0]
+      cudaMemcpyAsync(
+          rotated.data(), init_noise_->data(), stride_l * sizeof(__half),
+          cudaMemcpyDeviceToDevice, stream);
+      // rotated[1:] = stock_noise[:-1]
+      if(config_.denoising_steps > 1)
+      {
+        cudaMemcpyAsync(
+            rotated.data() + stride_l, stock_noise_->data(),
+            (config_.denoising_steps - 1) * stride_l * sizeof(__half),
+            cudaMemcpyDeviceToDevice, stream);
+      }
+      cudaMemcpyAsync(
+          stock_noise_->data(), rotated.data(), stock_noise_->size() * sizeof(__half),
+          cudaMemcpyDeviceToDevice, stream);
+      cudaStreamSynchronize(stream);
+    }
 
     // Prepare UNet inputs based on cfg_type
     int unet_batch_size = total_batch;
@@ -161,7 +192,6 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
           total_batch * sizeof(float), cudaMemcpyDeviceToDevice, stream);
     }
 
-    // Call UNet
     // Convert FP16 latent input to FP32 for TensorRT engine
     int latent_elements
         = unet_batch_size * 4 * config_.latent_height * config_.latent_width;
@@ -233,10 +263,29 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
     // Run UNet inference
     if(config_.model_type == ModelType::SDXL_TURBO)
     {
+      // SDXL conditioning (pooled text_embeds + time_ids) must match unet_batch_size, exactly like
+      // encoder_hidden_states above. prepare_sdxl_conditioning sized text_embeds_/time_ids_ to
+      // config_.batch_size (the frame buffer, =1), but the BATCHED multi-step UNet runs
+      // unet_batch_size rows (total_batch, x2 for full/initialize). Passing the single-row buffers
+      // with batch=unet_batch_size made forward_sdxl's cudaMemcpyAsync read past the source end
+      // ("Copy is larger than memobj size") -> a sticky CUDA error that surfaced later as a CUB
+      // cudaErrorInvalidDevice in the scheduler step. Tile the single conditioning row to
+      // unet_batch_size here. (Single-step turbo never hit this: unet_batch_size==1==batch_size.)
+      const int pooled_dim = config_.pooled_embedding_dim;
+      const int time_ids_dim = config_.time_ids_dim;
+      CUDATensor<__half> tiled_text_embeds((size_t)unet_batch_size * pooled_dim);
+      CUDATensor<__half> tiled_time_ids((size_t)unet_batch_size * time_ids_dim);
+      for(int i = 0; i < unet_batch_size; i++)
+      {
+        cudaMemcpyAsync(tiled_text_embeds.data() + (size_t)i * pooled_dim, text_embeds_->data(),
+                        pooled_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(tiled_time_ids.data() + (size_t)i * time_ids_dim, time_ids_->data(),
+                        time_ids_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+      }
       unet_->forward_sdxl(
           unet_input_latent_fp32.data(), unet_input_timestep_ptr,
           unet_encoder_hidden_states_ptr,
-          text_embeds_->data(), time_ids_->data(),
+          tiled_text_embeds.data(), tiled_time_ids.data(),
           unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
           config_.text_seq_len, config_.text_hidden_dim,
           config_.pooled_embedding_dim, stream);
@@ -471,12 +520,24 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
       }
       else
       {
-        // No noise: buffer = alpha * denoised (beta term is 0)
-        // Just copy with alpha scaling - but since alpha is baked into scheduler step,
-        // we need to apply additional scaling. For now, just copy denoised[:-1]
-        cudaMemcpyAsync(
-            x_t_latent_buffer_->data(), denoised.data(), buffer_size * sizeof(__half),
-            cudaMemcpyDeviceToDevice, stream);
+        // No noise: buffer[i] = alpha[i+1] * denoised[i]  (beta*noise term is 0).
+        // Python (do_add_noise=False): x_t_latent_buffer = alpha_prod_t_sqrt[1:] * x_0_pred[:-1].
+        // The alpha scaling is NOT baked into the scheduler step output (denoised here IS
+        // x_0_pred, the clean prediction), so we must apply alpha[i+1] explicitly. Previously
+        // this raw-copied denoised[:-1] (omitting alpha<1), inflating the streaming buffer by
+        // ~1/alpha and drifting the converged x0 magnitude ~5% high (validation harness:
+        // cfg-none noise-0 predict_x0 rel 0.053, norm 146 vs golden 139).
+        for(int i = 0; i < config_.denoising_steps - 1; i++)
+        {
+          int denoised_offset = i * stride; // denoised[i] = x_0_pred[i]
+          int buffer_offset = i * stride;   // buffer[i]
+          float alpha_next = alpha_prod_t_sqrt_host_[i + 1]; // alpha[i+1]
+          cudaMemcpyAsync(
+              x_t_latent_buffer_->data() + buffer_offset, denoised.data() + denoised_offset,
+              stride * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+          launch_scalar_mul_inplace_fp16(
+              x_t_latent_buffer_->data() + buffer_offset, alpha_next, stride, stream);
+        }
       }
     }
   }
@@ -519,7 +580,6 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
       unet_input_timestep->load_d2d(sub_timesteps_->data(), config_.batch_size, stream);
     }
 
-    // Call UNet
     // Convert FP16 latent input to FP32 for TensorRT engine
     int latent_elements_2
         = unet_batch_size * 4 * config_.latent_height * config_.latent_width;
@@ -535,10 +595,22 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
     // Run UNet inference - use SDXL variant if configured
     if(config_.model_type == ModelType::SDXL_TURBO)
     {
+      // Tile SDXL conditioning to unet_batch_size (see the primary batched path for rationale).
+      const int pooled_dim = config_.pooled_embedding_dim;
+      const int time_ids_dim = config_.time_ids_dim;
+      CUDATensor<__half> tiled_text_embeds((size_t)unet_batch_size * pooled_dim);
+      CUDATensor<__half> tiled_time_ids((size_t)unet_batch_size * time_ids_dim);
+      for(int i = 0; i < unet_batch_size; i++)
+      {
+        cudaMemcpyAsync(tiled_text_embeds.data() + (size_t)i * pooled_dim, text_embeds_->data(),
+                        pooled_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(tiled_time_ids.data() + (size_t)i * time_ids_dim, time_ids_->data(),
+                        time_ids_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+      }
       unet_->forward_sdxl(
           unet_input_latent_fp32_2.data(), unet_input_timestep->data(),
           prompt_embeds_->data(),
-          text_embeds_->data(), time_ids_->data(),
+          tiled_text_embeds.data(), tiled_time_ids.data(),
           unet_output_ptr, unet_batch_size,
           config_.latent_height, config_.latent_width, config_.text_seq_len, config_.text_hidden_dim,
           config_.pooled_embedding_dim, stream);
@@ -602,7 +674,6 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
   int denoised_size = total_batch * 4 * config_.latent_height * config_.latent_width;
   CUDATensor<__half> denoised(denoised_size);
 
-  // Copy input
   x_t_latent.load_d2d(x_t_latent_in, latent_size, stream);
 
   // Sequential multi-step mode: Loop through each timestep separately
@@ -684,7 +755,6 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
           config_.batch_size * sizeof(float), cudaMemcpyDeviceToDevice, stream);
     }
 
-    // Call UNet for this timestep
     // Convert FP16 latent input to FP32 for TensorRT engine
     int latent_elements_seq
         = unet_batch_size * 4 * config_.latent_height * config_.latent_width;
@@ -752,10 +822,23 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
     // Run UNet inference - use SDXL variant if configured
     if(config_.model_type == ModelType::SDXL_TURBO)
     {
+      // Tile SDXL conditioning to unet_batch_size (see the batched path for the full rationale:
+      // text_embeds_/time_ids_ are sized config_.batch_size; the UNet runs unet_batch_size rows).
+      const int pooled_dim = config_.pooled_embedding_dim;
+      const int time_ids_dim = config_.time_ids_dim;
+      CUDATensor<__half> tiled_text_embeds((size_t)unet_batch_size * pooled_dim);
+      CUDATensor<__half> tiled_time_ids((size_t)unet_batch_size * time_ids_dim);
+      for(int i = 0; i < unet_batch_size; i++)
+      {
+        cudaMemcpyAsync(tiled_text_embeds.data() + (size_t)i * pooled_dim, text_embeds_->data(),
+                        pooled_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(tiled_time_ids.data() + (size_t)i * time_ids_dim, time_ids_->data(),
+                        time_ids_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+      }
       unet_->forward_sdxl(
           unet_input_latent_fp32_seq.data(), unet_input_timestep->data(),
           unet_encoder_hidden_states_seq->data(),
-          text_embeds_->data(), time_ids_->data(),
+          tiled_text_embeds.data(), tiled_time_ids.data(),
           unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
           config_.text_seq_len, config_.text_hidden_dim,
           config_.pooled_embedding_dim, stream);
@@ -939,7 +1022,6 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
     }
   }
 
-  // Copy final result to output
   current_latent.store_d2d(x_0_pred_out, latent_size, stream);
 }
 
@@ -952,7 +1034,6 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_single_step(
   const int total_batch
       = config_.batch_size + (config_.denoising_steps - 1) * config_.frame_buffer_size;
 
-  // Copy input
   predict_x0_batch_x_t_latent->load_d2d(x_t_latent_in, latent_size, stream);
 
   // Single-step mode for non-batch (use_denoising_batch=False, denoising_steps=1)
@@ -1084,11 +1165,25 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_single_step(
   // Run UNet inference - use SDXL variant if configured
   if(config_.model_type == ModelType::SDXL_TURBO)
   {
+    // Tile SDXL conditioning to unet_batch_size (config.batch_size, x2 for full/initialize) — see the
+    // batched path. Single-step turbo with batch_size==1 was the only previously-exercised SDXL case,
+    // so this only mattered once batch_size>1 / cfg doubling landed.
+    const int pooled_dim = config_.pooled_embedding_dim;
+    const int time_ids_dim = config_.time_ids_dim;
+    CUDATensor<__half> tiled_text_embeds((size_t)unet_batch_size * pooled_dim);
+    CUDATensor<__half> tiled_time_ids((size_t)unet_batch_size * time_ids_dim);
+    for(int i = 0; i < unet_batch_size; i++)
+    {
+      cudaMemcpyAsync(tiled_text_embeds.data() + (size_t)i * pooled_dim, text_embeds_->data(),
+                      pooled_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+      cudaMemcpyAsync(tiled_time_ids.data() + (size_t)i * time_ids_dim, time_ids_->data(),
+                      time_ids_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+    }
     unet_->forward_sdxl(
         predict_x0_batch_unet_input_latent_fp32_single->data(),
         predict_x0_batch_unet_input_timestep->data(),
         predict_x0_batch_unet_encoder_hidden_states_single->data(),
-        text_embeds_->data(), time_ids_->data(),
+        tiled_text_embeds.data(), tiled_time_ids.data(),
         predict_x0_batch_unet_output->data(), unet_batch_size, config_.latent_height,
         config_.latent_width, config_.text_seq_len, config_.text_hidden_dim,
         config_.pooled_embedding_dim, stream);

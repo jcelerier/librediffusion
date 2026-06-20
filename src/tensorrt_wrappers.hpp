@@ -118,6 +118,14 @@ private:
   };
   ShapeCache shape_cache_;
 
+  // Timestep input extent declared by the engine. Most engines (SD1.5/SD-Turbo, and our
+  // from-scratch SDXL trace) use a batch-sized timestep [batch]. The PREBUILT SDXL UNet from
+  // stabilityai/sdxl-turbo-tensorrt instead has a STATIC timestep shape [1]. We query this at
+  // load time so the forward path binds the engine's actual extent rather than assuming [batch]
+  // (which would fail allInputDimensionsSpecified for batch != 1 on the prebuilt engine).
+  // 0 = dynamic/batch-sized (use the call's batch); >0 = fixed extent the engine requires.
+  int timestep_fixed_extent_ = 0;
+
   // Persistent buffers (like Python's polygraphy implementation)
   // These maintain stable addresses across inference calls
   std::unique_ptr<CUDATensor<float>> sample_buffer_;
