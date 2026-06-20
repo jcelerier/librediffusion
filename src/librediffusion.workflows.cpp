@@ -41,7 +41,6 @@ void LibreDiffusionPipeline::img2img_impl(
       }
     }
 
-    // Increment frame counter
     temporal_state_.frame_id++;
   }
 

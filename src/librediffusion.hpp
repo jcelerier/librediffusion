@@ -320,6 +320,7 @@ public:
   std::unique_ptr<CUDATensor<__half>> x_t_latent_buffer_;
   std::unique_ptr<CUDATensor<__half>> init_noise_;
   std::unique_ptr<CUDATensor<__half>> stock_noise_;
+  std::unique_ptr<CUDATensor<__half>> stock_noise_rotated_;  // grow-only scratch for the per-step rotation
   std::unique_ptr<CUDATensor<__half>> prompt_embeds_;
   std::unique_ptr<CUDATensor<__half>> negative_embeds_;  // For CFG negative prompt
 

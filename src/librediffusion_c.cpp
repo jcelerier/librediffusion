@@ -12,6 +12,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -68,14 +69,19 @@ librediffusion_error_t try_catch_wrapper(Func&& func)
   }
   catch (const std::bad_alloc&)
   {
+    std::fprintf(stderr, "[librediffusion] OUT_OF_MEMORY\n");
     return LIBREDIFFUSION_ERROR_OUT_OF_MEMORY;
   }
-  catch (const std::exception&)
+  catch (const std::exception& e)
   {
+    // Surface the message so the C-API caller (harness/app) can see WHY an internal error
+    // occurred instead of an opaque -99. Without this every throw collapsed to the same code.
+    std::fprintf(stderr, "[librediffusion] INTERNAL ERROR: %s\n", e.what());
     return LIBREDIFFUSION_ERROR_INTERNAL;
   }
   catch (...)
   {
+    std::fprintf(stderr, "[librediffusion] INTERNAL ERROR: unknown (non-std::exception)\n");
     return LIBREDIFFUSION_ERROR_INTERNAL;
   }
 }

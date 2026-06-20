@@ -370,6 +370,64 @@ struct Float2HalfFunctor
   }
 };
 
+// ---------------------------------------------------------------------------
+// Deterministic counter-based PCG32 Gaussian noise.
+// librediffusion fork: torch.randn and cuRAND's curandGenerateNormal do NOT agree bit-for-bit
+// (different uniform->Gaussian transform + memory layout), so python<->C++ generated noise
+// diverged (txt2img). Replace cuRAND with ONE explicit counter-based spec shared with the
+// Python side (src/streamdiffusion/deterministic_noise.py) and pcg.hpp's PCG32 constants.
+// Per output element `i`: seed PCG32 with (s0=seed, s1=i), draw 2 u32 -> 2 uniforms in (0,1]
+// -> Box-Muller z0 -> __float2half. Value depends ONLY on (seed, i): index-deterministic,
+// independent of N/shape/threads. All math in fp32, cast to fp16 last. Also faster than the
+// old cuRAND path (no malloc / temp fp32 buffer / Thrust pass).
+__device__ __forceinline__ uint32_t pcg_rotr32(uint32_t x, uint32_t r)
+{
+  r &= 31u;
+  return (x >> r) | (x << ((32u - r) & 31u));
+}
+
+struct PcgState
+{
+  unsigned long long state;
+  unsigned long long inc;
+};
+
+// Mirrors pcg.hpp operator(): advance LCG, return previous-state output.
+__device__ __forceinline__ uint32_t pcg_step(PcgState& s)
+{
+  unsigned long long old = s.state;
+  s.state = old * 6364136223846793005ULL + s.inc;
+  uint32_t xorshifted = (uint32_t)(((old >> 18u) ^ old) >> 27u);
+  uint32_t rot = (uint32_t)(old >> 59u);
+  return pcg_rotr32(xorshifted, rot);
+}
+
+// Mirrors pcg.hpp seed(s0, s1): m_inc=(s1<<1)|1; m_state=0; step(); m_state+=s0; step().
+__device__ __forceinline__ void pcg_seed(PcgState& s, unsigned long long s0, unsigned long long s1)
+{
+  s.inc = (s1 << 1) | 1ULL;
+  s.state = 0ULL;
+  pcg_step(s);
+  s.state += s0;
+  pcg_step(s);
+}
+
+__global__ void pcg32_randn_kernel_fp16(__half* output, unsigned long long seed, int N)
+{
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i >= N)
+    return;
+  PcgState s;
+  pcg_seed(s, seed, (unsigned long long)i);
+  // uniform in (0,1]: (u32 + 1) * 2^-32 ; all math fp32 to match the numpy replica
+  const float two32 = 1.0f / 4294967296.0f; // 2^-32
+  float u1 = ((float)pcg_step(s) + 1.0f) * two32;
+  float u2 = ((float)pcg_step(s) + 1.0f) * two32;
+  float r = sqrtf(-2.0f * logf(u1));
+  float z0 = r * cosf(2.0f * 3.14159265358979323846f * u2);
+  output[i] = __float2half(z0);
+}
+
 void launch_randn_fp16(
     void* output,
     unsigned long long seed,
@@ -377,36 +435,11 @@ void launch_randn_fp16(
     void* stream_ptr
 ) {
     cudaStream_t stream = (cudaStream_t)stream_ptr;
-
-    thread_local curandGenerator_t gen = nullptr;
-    thread_local bool gen_initialized = false;
-
-    if (!gen_initialized) {
-        curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_PHILOX4_32_10);
-        gen_initialized = true;
-    }
-
-    // Set seed and stream
-    curandSetPseudoRandomGeneratorSeed(gen, seed);
-    curandSetStream(gen, stream);
-
-    // Allocate temporary FP32 buffer (cuRAND doesn't support FP16 directly)
-    float* temp_fp32;
-    cudaMallocAsync(&temp_fp32, N * sizeof(float), stream);
-
-    // Generate normal distribution directly to FP32
-    curandGenerateNormal(gen, temp_fp32, N, 0.0f, 1.0f);
-
-    // Convert FP32 -> FP16 using Thrust
-    thrust::device_ptr<float> fp32_ptr(temp_fp32);
-    thrust::device_ptr<__half> fp16_ptr((__half*)output);
-
-    thrust::transform(
-        thrust::cuda::par_nosync.on(stream), fp32_ptr, fp32_ptr + N, fp16_ptr,
-        Float2HalfFunctor());
-
-    // Cleanup
-    cudaFreeAsync(temp_fp32, stream);
+    // Deterministic counter-based PCG32 Gaussian — bit-identical to the Python replica
+    // (deterministic_noise.py). Writes __half directly; no temp buffer / malloc / Thrust.
+    const int threads = 256;
+    const int blocks = (N + threads - 1) / threads;
+    pcg32_randn_kernel_fp16<<<blocks, threads, 0, stream>>>((__half*)output, seed, N);
 }
 
 void launch_add_noise_fp16(

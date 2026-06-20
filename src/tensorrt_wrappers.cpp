@@ -90,6 +90,25 @@ void UNetWrapper::loadEngine(const std::string& engine_path)
   {
     throw std::runtime_error("Failed to create execution context");
   }
+
+  // Detect a statically-shaped `timestep` input. The prebuilt SDXL UNet ONNX from
+  // stabilityai/sdxl-turbo-tensorrt declares timestep as a fixed [1] (its optimization
+  // profile is min=opt=max=(1,)), whereas SD1.5/SD-Turbo and our from-scratch SDXL trace
+  // use a dynamic batch-sized timestep. When the engine fixes the extent we must bind that
+  // exact size; binding [batch] (batch != 1) against a [1] engine fails shape validation.
+  nvinfer1::ICudaEngine* eng = cached_engine_->getEngine();
+  if(eng)
+  {
+    const char* kTimestep = "timestep";
+    nvinfer1::Dims ts = eng->getTensorShape(kTimestep);
+    if(ts.nbDims == 1 && ts.d[0] > 0)
+    {
+      // A positive (non -1) declared dim means a fixed extent baked into the engine.
+      timestep_fixed_extent_ = static_cast<int>(ts.d[0]);
+      std::cout << "Note: engine declares a fixed timestep extent of "
+                << timestep_fixed_extent_ << " for " << engine_path << std::endl;
+    }
+  }
 }
 
 bool UNetWrapper::needsReallocation(
@@ -108,7 +127,8 @@ void UNetWrapper::forward(
 {
   // Calculate buffer sizes
   int sample_size = batch * 4 * height * width;
-  int timestep_size = batch;
+  int timestep_extent = (timestep_fixed_extent_ > 0) ? timestep_fixed_extent_ : batch;
+  int timestep_size = timestep_extent;
   int encoder_size = batch * seq_len * hidden_dim;
   int output_size = batch * 4 * height * width;
 
@@ -122,7 +142,6 @@ void UNetWrapper::forward(
     encoder_hidden_states_buffer_ = std::make_unique<CUDATensor<__half>>(encoder_size);
     output_buffer_ = std::make_unique<CUDATensor<__half>>(output_size);
 
-    // Update shape cache
     shape_cache_.batch = batch;
     shape_cache_.height = height;
     shape_cache_.width = width;
@@ -153,7 +172,7 @@ void UNetWrapper::forward(
   nvinfer1::Dims4 sample_dims{batch, 4, height, width};
   nvinfer1::Dims timestep_dims;
   timestep_dims.nbDims = 1;
-  timestep_dims.d[0] = batch;
+  timestep_dims.d[0] = timestep_extent;  // [batch] for SD; honors a fixed engine extent if present
   nvinfer1::Dims3 hidden_states_dims{batch, seq_len, hidden_dim};
 
   if(!context_->setInputShape("sample", sample_dims))
@@ -249,7 +268,9 @@ void UNetWrapper::forward_sdxl(
 {
   // Calculate buffer sizes
   int sample_size = batch * 4 * height * width;
-  int timestep_size = batch;
+  // The prebuilt SDXL UNet uses a static timestep [1]; honor the engine's declared extent.
+  int timestep_extent = (timestep_fixed_extent_ > 0) ? timestep_fixed_extent_ : batch;
+  int timestep_size = timestep_extent;
   int encoder_size = batch * seq_len * hidden_dim;
   int output_size = batch * 4 * height * width;
   int text_embeds_size = batch * pooled_dim;
@@ -267,7 +288,6 @@ void UNetWrapper::forward_sdxl(
     time_ids_buffer_ = std::make_unique<CUDATensor<__half>>(time_ids_size);
     output_buffer_ = std::make_unique<CUDATensor<__half>>(output_size);
 
-    // Update shape cache
     shape_cache_.batch = batch;
     shape_cache_.height = height;
     shape_cache_.width = width;
@@ -301,7 +321,7 @@ void UNetWrapper::forward_sdxl(
   nvinfer1::Dims4 sample_dims{batch, 4, height, width};
   nvinfer1::Dims timestep_dims;
   timestep_dims.nbDims = 1;
-  timestep_dims.d[0] = batch;
+  timestep_dims.d[0] = timestep_extent;  // [1] for the prebuilt SDXL UNet, else [batch]
   nvinfer1::Dims3 hidden_states_dims{batch, seq_len, hidden_dim};
   nvinfer1::Dims text_embeds_dims;
   text_embeds_dims.nbDims = 2;
@@ -429,7 +449,6 @@ void VAEEncoderWrapper::encode(
   {
     images_fp32_buffer_ = std::make_unique<CUDATensor<float>>(images_elements);
 
-    // Update shape cache
     shape_cache_.batch = batch;
     shape_cache_.height = height;
     shape_cache_.width = width;
@@ -485,7 +504,6 @@ void VAEEncoderWrapper::encode(
   {
     images_fp32_buffer_ = std::make_unique<CUDATensor<float>>(images_elements);
 
-    // Update shape cache
     shape_cache_.batch = batch;
     shape_cache_.height = height;
     shape_cache_.width = width;
@@ -499,9 +517,15 @@ void VAEEncoderWrapper::encode(
     throw std::runtime_error("Failed to set images shape");
   }
 
-  cudaMemcpy(
+  // `images` is DEVICE memory: this GPU encode path mirrors the __half overload (which
+  // converts device->device). Copy the fp32 device input into the persistent device
+  // buffer with a device-to-device copy on the stream. (Previously this used
+  // cudaMemcpyHostToDevice, which is wrong for a device source — it only "worked" via
+  // UVA inference and corrupted the input otherwise; the path is exercised by the
+  // validation harness, not the high-level CPU-RGBA img2img.)
+  cudaMemcpyAsync(
       images_fp32_buffer_->data(), (const void*)images, images_elements * sizeof(float),
-      cudaMemcpyHostToDevice);
+      cudaMemcpyDeviceToDevice, stream);
 
   cudaStreamSynchronize(stream);
 
@@ -585,7 +609,6 @@ void VAEDecoderWrapper::decode(
       throw std::runtime_error("Failed to set latent shape");
     }
 
-    // Update shape cache
     shape_cache_.batch = batch;
     shape_cache_.height = height;
     shape_cache_.width = width;
@@ -691,69 +714,80 @@ void CLIPWrapper::encode(
 
   int hidden_dim = output_dims.d[2];  // Extract hidden dimension from engine
 
-  // Allocate temporary FP32 buffer for engine output
-  // Engine outputs FP32 but we need FP16
+  // librediffusion fix: honor the engine's declared output dtype. Prebuilt SDXL / penultimate
+  // CLIP engines emit text_embeddings in FP16; the legacy code assumed FP32 and ran an extra
+  // FP32->FP16 conversion, reinterpreting the FP16 bytes as FP32 and producing inf/garbage.
+  // When the engine output is already HALF, bind the caller's FP16 buffer directly.
+  auto* eng = cached_engine_->getEngine();
+  const bool text_is_half
+      = (eng->getTensorDataType("text_embeddings") == nvinfer1::DataType::kHALF);
+
+  // Allocate temporary FP32 buffer for engine output only when the engine emits FP32.
   size_t output_size = batch * 77 * hidden_dim;
-  float* d_output_fp32;
-  cudaMalloc(&d_output_fp32, output_size * sizeof(float));
+  float* d_output_fp32 = nullptr;
+  if(!text_is_half)
+    cudaMalloc(&d_output_fp32, output_size * sizeof(float));
 
   // Check if engine has pooler_output (SDXL CLIP encoder 2)
   float* d_pooler_fp32 = nullptr;
   bool has_pooler = false;
+  bool pooler_is_half = false;
 
-  // Safely check if pooler_output exists by iterating I/O tensors
-  //int num_io_tensors = engine_->getNbIOTensors();
-  //for(int i = 0; i < num_io_tensors; ++i)
-  //{
-  //  const char* tensor_name = engine_->getIOTensorName(i);
-  //  if(std::string(tensor_name) == "pooler_output")
   if(pooler_output)
   {
     has_pooler = true;
-    nvinfer1::Dims pooler_dims = context_->getTensorShape("pooler_output");
-    size_t pooler_size = batch * pooler_dims.d[1];
-    cudaMalloc(&d_pooler_fp32, pooler_size * sizeof(float));
-    //    break;
+    pooler_is_half
+        = (eng->getTensorDataType("pooler_output") == nvinfer1::DataType::kHALF);
+    if(!pooler_is_half)
+    {
+      nvinfer1::Dims pooler_dims = context_->getTensorShape("pooler_output");
+      size_t pooler_size = batch * pooler_dims.d[1];
+      cudaMalloc(&d_pooler_fp32, pooler_size * sizeof(float));
+    }
   }
-  // }
+
+  auto cleanup = [&]() {
+    if(d_output_fp32) cudaFree(d_output_fp32);
+    if(d_pooler_fp32) cudaFree(d_pooler_fp32);
+  };
 
   // Set tensor addresses
   // Note: TensorRT API requires non-const void*, so we cast away const
   if(!context_->setTensorAddress("input_ids", const_cast<int32_t*>(input_ids)))
   {
-    cudaFree(d_output_fp32);
-    if(d_pooler_fp32) cudaFree(d_pooler_fp32);
+    cleanup();
     throw std::runtime_error("Failed to set CLIP input_ids tensor address");
   }
-  if(!context_->setTensorAddress("text_embeddings", d_output_fp32))
+  void* text_addr = text_is_half ? (void*)text_embeddings : (void*)d_output_fp32;
+  if(!context_->setTensorAddress("text_embeddings", text_addr))
   {
-    cudaFree(d_output_fp32);
-    if(d_pooler_fp32) cudaFree(d_pooler_fp32);
+    cleanup();
     throw std::runtime_error("Failed to set CLIP text_embeddings tensor address");
   }
 
   // Set pooler_output address if present
-  if(has_pooler && !context_->setTensorAddress("pooler_output", d_pooler_fp32))
+  if(has_pooler)
   {
-    cudaFree(d_output_fp32);
-    cudaFree(d_pooler_fp32);
-    throw std::runtime_error("Failed to set CLIP pooler_output tensor address");
+    void* pooler_addr = pooler_is_half ? (void*)pooler_output : (void*)d_pooler_fp32;
+    if(!context_->setTensorAddress("pooler_output", pooler_addr))
+    {
+      cleanup();
+      throw std::runtime_error("Failed to set CLIP pooler_output tensor address");
+    }
   }
 
   // Enqueue inference
   if(!context_->enqueueV3(stream))
   {
-    cudaFree(d_output_fp32);
-    if(d_pooler_fp32) cudaFree(d_pooler_fp32);
+    cleanup();
     throw std::runtime_error("Failed to enqueue CLIP inference");
   }
 
-  // Convert FP32 output to FP16
-  // Use the existing fp32_to_fp16 kernel
-  launch_fp32_to_fp16(d_output_fp32, text_embeddings, output_size, stream);
+  // Convert FP32 output to FP16 only when the engine emitted FP32.
+  if(!text_is_half)
+    launch_fp32_to_fp16(d_output_fp32, text_embeddings, output_size, stream);
 
-  // Convert pooler output to FP16 if requested
-  if(pooler_output && has_pooler && d_pooler_fp32)
+  if(pooler_output && has_pooler && !pooler_is_half && d_pooler_fp32)
   {
     nvinfer1::Dims pooler_dims = context_->getTensorShape("pooler_output");
     size_t pooler_size = batch * pooler_dims.d[1];
@@ -762,8 +796,7 @@ void CLIPWrapper::encode(
 
   // Wait for conversion to complete and cleanup
   cudaStreamSynchronize(stream);
-  cudaFree(d_output_fp32);
-  if(d_pooler_fp32) cudaFree(d_pooler_fp32);
+  cleanup();
 }
 
 __half* CLIPWrapper::computeEmbeddings(const std::string& prompt, cudaStream_t stream, int pad_token)
@@ -872,62 +905,66 @@ __half* CLIPWrapper::computeEmbeddingsWithPooled(
     int hidden_dim = hidden_states_dims.d[2];  // Should be 1280 for CLIP2
     int pooled_dim = text_embeddings_dims.d[1]; // Should be 1280 for CLIP2
 
+    // librediffusion fix: honor the engine's declared output dtype for hidden_states.
+    // Prebuilt SDXL CLIP2 emits hidden_states in FP16; the legacy code hard-assumed FP32
+    // and ran an extra FP32->FP16 conversion, reinterpreting the FP16 bytes and producing
+    // inf/garbage. (pooled text_embeddings was already bound as FP16, which is why it stayed
+    // correct.) When hidden_states is HALF, bind the FP16 buffer directly; else keep FP32 path.
+    auto* eng = cached_engine_->getEngine();
+    const bool hidden_is_half
+        = (eng->getTensorDataType("hidden_states") == nvinfer1::DataType::kHALF);
+
     // Allocate output buffers
     size_t sequence_size = 1 * 77 * hidden_dim;
     size_t pooled_size = 1 * pooled_dim;
 
-    // IMPORTANT: Engine outputs mixed precision!
-    // - hidden_states: FP32
-    // - text_embeddings: FP16
-    float* d_hidden_fp32;  // hidden_states output is FP32
-    cudaMalloc(&d_hidden_fp32, sequence_size * sizeof(float));
+    float* d_hidden_fp32 = nullptr;  // only used if engine emits FP32 hidden_states
+    if(!hidden_is_half)
+      cudaMalloc(&d_hidden_fp32, sequence_size * sizeof(float));
     cudaMalloc(&d_pooled_embeddings, pooled_size * sizeof(__half));  // text_embeddings is FP16
     cudaMalloc(&d_sequence_embeddings, sequence_size * sizeof(__half));  // final FP16 output
+
+    auto clip2_cleanup = [&]() {
+      cudaFree(d_token_ids);
+      if(d_hidden_fp32) cudaFree(d_hidden_fp32);
+      cudaFree(d_sequence_embeddings);
+      cudaFree(d_pooled_embeddings);
+    };
 
     // Set tensor addresses - mixed precision
     if(!context_->setTensorAddress("input_ids", d_token_ids))
     {
-      cudaFree(d_token_ids);
-      cudaFree(d_hidden_fp32);
-      cudaFree(d_sequence_embeddings);
-      cudaFree(d_pooled_embeddings);
+      clip2_cleanup();
       throw std::runtime_error("Failed to set CLIP2 input_ids tensor address");
     }
-    if(!context_->setTensorAddress("hidden_states", d_hidden_fp32))  // Engine writes FP32 here
+    void* hidden_addr = hidden_is_half ? (void*)d_sequence_embeddings : (void*)d_hidden_fp32;
+    if(!context_->setTensorAddress("hidden_states", hidden_addr))
     {
-      cudaFree(d_token_ids);
-      cudaFree(d_hidden_fp32);
-      cudaFree(d_sequence_embeddings);
-      cudaFree(d_pooled_embeddings);
+      clip2_cleanup();
       throw std::runtime_error("Failed to set CLIP2 hidden_states tensor address");
     }
     if(!context_->setTensorAddress("text_embeddings", d_pooled_embeddings))  // Engine writes FP16 here
     {
-      cudaFree(d_token_ids);
-      cudaFree(d_hidden_fp32);
-      cudaFree(d_sequence_embeddings);
-      cudaFree(d_pooled_embeddings);
+      clip2_cleanup();
       throw std::runtime_error("Failed to set CLIP2 text_embeddings tensor address");
     }
 
     // Run inference
     if(!context_->enqueueV3(stream))
     {
-      cudaFree(d_token_ids);
-      cudaFree(d_hidden_fp32);
-      cudaFree(d_sequence_embeddings);
-      cudaFree(d_pooled_embeddings);
+      clip2_cleanup();
       throw std::runtime_error("Failed to enqueue CLIP2 inference");
     }
 
-    // Convert FP32 hidden_states to FP16
-    launch_fp32_to_fp16(d_hidden_fp32, d_sequence_embeddings, sequence_size, stream);
+    // Convert FP32 hidden_states to FP16 only when the engine emitted FP32.
+    if(!hidden_is_half)
+      launch_fp32_to_fp16(d_hidden_fp32, d_sequence_embeddings, sequence_size, stream);
 
     cudaStreamSynchronize(stream);
 
     // Cleanup
     cudaFree(d_token_ids);
-    cudaFree(d_hidden_fp32);  // Free the FP32 intermediate buffer
+    if(d_hidden_fp32) cudaFree(d_hidden_fp32);  // Free the FP32 intermediate buffer (if any)
 
     // Return both outputs
     if(pooled_output)

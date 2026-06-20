@@ -45,11 +45,17 @@ void LibreDiffusionPipeline::encode_image(
     launch_scalar_mul_inplace_fp16(latent_out, vae_scaling_factor, latent_elements, stream);
   }
 
-  // Add noise to the clean latent (matching Python's pipeline.py:612)
-  // Python: x_t_latent = self.add_noise(img_latent, noise, 0)
-  // This creates the noisy latent that is passed to the denoising pipeline
-  // NOTE: Only add noise if scheduler parameters have been initialized via prepare()
-  if(config_.do_add_noise && init_noise_ && !alpha_prod_t_sqrt_host_.empty())
+  // Add noise to the clean latent (matching Python's pipeline.py encode_image).
+  // Python: x_t_latent = self.add_noise(img_latent, init_noise[0], 0)
+  // CRITICAL: encode_image adds noise@t0 UNCONDITIONALLY in every StreamDiffusion
+  // reference (upstream cumulo-autumn, the bundled fork, and daydream). The
+  // `do_add_noise` flag gates only the DENOISING-LOOP noise additions (see
+  // predict_x0_batch in librediffusion.unet.cpp), NOT this encode-time one. A previous
+  // `config_.do_add_noise &&` guard here made noise-0 img2img return the clean
+  // (alpha=1) latent instead of alpha0*latent + beta0*noise, diverging from the
+  // reference (validation harness: encode cos 0.73 -> 0.99999 once corrected).
+  // Still guard on scheduler init (prepare() must have run to populate alpha/beta).
+  if(init_noise_ && !alpha_prod_t_sqrt_host_.empty())
   {
     // Python uses init_noise[0]
     add_noise_direct(
@@ -75,7 +81,9 @@ void LibreDiffusionPipeline::encode_image(
 
   const int latent_elements
       = config_.batch_size * 4 * config_.latent_height * config_.latent_width;
-  if(config_.do_add_noise && init_noise_ && !alpha_prod_t_sqrt_host_.empty())
+  // Unconditional add_noise@t0 — matches every StreamDiffusion reference (see the __half
+  // overload above). do_add_noise gates only the denoising-loop noise, not this one.
+  if(init_noise_ && !alpha_prod_t_sqrt_host_.empty())
   {
     add_noise_direct(
         latent_out,          // clean latent (img_latent)
