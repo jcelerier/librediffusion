@@ -908,7 +908,8 @@ class SDXLUNet(BaseModel):
 
     def __init__(self, unet=None, fp16=False, device="cuda", max_batch_size=16, min_batch_size=1,
                  embedding_dim=2048, text_maxlen=77, unet_dim=4, pooled_embedding_dim=1280,
-                 use_control=False, **kwargs):
+                 use_control=False, use_ipadapter=False, num_image_tokens=4,
+                 num_ip_layers: int = None, **kwargs):
         super().__init__(fp16=fp16, device=device, max_batch_size=max_batch_size,
                          min_batch_size=min_batch_size, embedding_dim=embedding_dim,
                          text_maxlen=text_maxlen)
@@ -916,6 +917,16 @@ class SDXLUNet(BaseModel):
         self.unet_dim = unet_dim
         self.pooled_embedding_dim = pooled_embedding_dim
         self.use_control = use_control
+        # IP-Adapter (baked into the SDXL UNet engine): the encoder_hidden_states seq is extended to
+        # 77 + num_image_tokens and an extra fp32 ipadapter_scale[num_ip_layers] input is declared,
+        # alongside the existing text_embeds/time_ids. Mirrors how the SD1.5 `UNet` class does it.
+        self.use_ipadapter = use_ipadapter
+        self.num_image_tokens = num_image_tokens
+        self.num_ip_layers = num_ip_layers
+        if self.use_ipadapter:
+            if self.num_ip_layers is None:
+                raise ValueError("SDXLUNet requires num_ip_layers when use_ipadapter=True")
+            self.text_maxlen = text_maxlen + self.num_image_tokens
         self.name = "SDXL UNet"
 
     def _control_names(self):
@@ -925,6 +936,8 @@ class SDXLUNet(BaseModel):
 
     def get_input_names(self):
         names = ["sample", "timestep", "encoder_hidden_states", "text_embeds", "time_ids"]
+        if self.use_ipadapter:
+            names = names + ["ipadapter_scale"]
         if self.use_control:
             names = names + self._control_names()
         return names
@@ -941,6 +954,8 @@ class SDXLUNet(BaseModel):
             "time_ids": {0: "2B"},
             "latent": {0: "2B", 2: "H", 3: "W"},
         }
+        if self.use_ipadapter:
+            axes["ipadapter_scale"] = {0: "L_ip"}
         if self.use_control:
             # IMPORTANT: control residuals are at DOWNSAMPLED resolutions (H/2, H/4...), so their spatial
             # dims must NOT reuse the sample's "H"/"W" symbols — TRT would force one symbol to two values
@@ -967,6 +982,9 @@ class SDXLUNet(BaseModel):
                             (max_batch, self.pooled_embedding_dim)],
             "time_ids": [(min_batch, 6), (batch_size, 6), (max_batch, 6)],
         }
+        if self.use_ipadapter:
+            # per-layer scalar vector, length fixed to num_ip_layers (min extent 1 for profile validity).
+            prof["ipadapter_scale"] = [(1,), (self.num_ip_layers,), (self.num_ip_layers,)]
         if self.use_control:
             names = self._control_names()
             specs = self._CTRL_DOWN + [self._CTRL_MID]
@@ -986,6 +1004,8 @@ class SDXLUNet(BaseModel):
             "time_ids": (2 * batch_size, 6),
             "latent": (2 * batch_size, 4, latent_height, latent_width),
         }
+        if self.use_ipadapter:
+            d["ipadapter_scale"] = (self.num_ip_layers,)
         if self.use_control:
             names = self._control_names()
             specs = self._CTRL_DOWN + [self._CTRL_MID]
@@ -1004,6 +1024,8 @@ class SDXLUNet(BaseModel):
             torch.randn(2 * batch_size, self.pooled_embedding_dim, dtype=dtype, device=self.device),
             torch.randn(2 * batch_size, 6, dtype=dtype, device=self.device),  # time_ids
         ]
+        if self.use_ipadapter:
+            inputs.append(torch.ones(self.num_ip_layers, dtype=torch.float32, device=self.device))
         if self.use_control:
             specs = self._CTRL_DOWN + [self._CTRL_MID]
             for ch, fac in specs:
@@ -1059,6 +1081,43 @@ class SDXLUNetControlWrapper(torch.nn.Module):
                         down_block_additional_residuals=down,
                         mid_block_additional_residual=mid,
                         return_dict=False)
+        return out[0] if isinstance(out, (tuple, list)) else out
+
+
+class SDXLUNetIPAdapterWrapper(torch.nn.Module):
+    """IP-Adapter-aware SDXL UNet export wrapper.
+
+    The UNION of SDXLUNetWrapper (SDXL added_cond_kwargs) + the SD1.5 IP-Adapter path: takes the
+    extended encoder_hidden_states (77 + num_image_tokens) and an ipadapter_scale[num_ip_layers]
+    fp32 vector as a positional graph input (after the 5 SDXL inputs), routes the per-layer scales
+    into the baked TRT IP attention processors, and feeds text_embeds/time_ids as added_cond_kwargs.
+
+    Order: sample, timestep, encoder_hidden_states, text_embeds, time_ids, ipadapter_scale.
+
+    The IP attention processors must already be installed on `unet` (by the diffusers_ipadapter
+    IPAdapter load) — they are CONVERTED here to the runtime-scale TRT variants (TRTIPAttnProcessor*)
+    while preserving the loaded to_k_ip/to_v_ip weights. install_processors=False to never re-init.
+    """
+
+    _sdxl_export_ready = True
+
+    def __init__(self, unet, num_tokens: int = 4):
+        super().__init__()
+        from ..export_wrappers.unet_ipadapter_export import create_ipadapter_wrapper
+        # create_ipadapter_wrapper(install_processors=False) detects the pre-loaded IPAttn processors
+        # and swaps them for TRTIPAttn* variants (runtime per-layer scale tensor), keeping the weights.
+        self.ip_wrapper = create_ipadapter_wrapper(unet, num_tokens=num_tokens, install_processors=False)
+        # The IP wrapper converts the UNet to fp32 internally; keep the converted module.
+        self.unet = self.ip_wrapper.unet
+        self.config = self.unet.config
+        self.num_ip_layers = self.ip_wrapper.num_ip_layers
+
+    def forward(self, sample, timestep, encoder_hidden_states, text_embeds, time_ids, ipadapter_scale):
+        # Route the per-layer scale vector into the baked TRT IP processors.
+        self.ip_wrapper.set_ipadapter_scale(ipadapter_scale)
+        added_cond_kwargs = {"text_embeds": text_embeds, "time_ids": time_ids}
+        out = self.unet(sample, timestep, encoder_hidden_states=encoder_hidden_states,
+                        added_cond_kwargs=added_cond_kwargs, return_dict=False)
         return out[0] if isinstance(out, (tuple, list)) else out
 
 

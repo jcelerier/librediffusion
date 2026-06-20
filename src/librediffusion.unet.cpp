@@ -409,6 +409,45 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
             unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
             config_.text_seq_len, config_.text_hidden_dim, config_.pooled_embedding_dim, stream);
       }
+      else if(ipadapter_enabled_)
+      {
+        // SDXL + IP-Adapter: assemble the extended ehs [unet_batch, 77+N, 2048] (text ++ image tokens,
+        // same neg/pos arrangement as the SD1.5 IP branch) AND bind the SDXL conditioning (the tiled
+        // text_embeds/time_ids computed above). dim==2048 so the assembly is dimension-agnostic.
+        const int dim = config_.text_hidden_dim;
+        const int N = ipadapter_num_tokens_;
+        const int text_tok = config_.text_seq_len;             // 77
+        const int ext_tok = text_tok + N;
+        const int text_row = text_tok * dim, img_row = N * dim, ext_row = ext_tok * dim;
+        const __half* pos = ipadapter_tokens_pos_ ? ipadapter_tokens_pos_->data() : nullptr;
+        const __half* neg = ipadapter_tokens_neg_ ? ipadapter_tokens_neg_->data() : pos;
+        if(!pos)
+          throw std::runtime_error("IP-Adapter enabled but no image tokens set (set_ipadapter_tokens)");
+        const size_t ext_n = (size_t)unet_batch_size * ext_row;
+        if(!mp_ext_ehs_ || mp_ext_ehs_->size() < ext_n)
+          mp_ext_ehs_ = std::make_unique<CUDATensor<__half>>(ext_n);
+        CUDATensor<__half>& ext_ehs = *mp_ext_ehs_;
+        const bool full = (config_.guidance_scale > 1.0f && config_.cfg_type == 1);
+        const bool init = (config_.guidance_scale > 1.0f && config_.cfg_type == 3);
+        for(int r = 0; r < unet_batch_size; r++)
+        {
+          cudaMemcpyAsync(ext_ehs.data() + (size_t)r * ext_row,
+                          unet_encoder_hidden_states_ptr + (size_t)r * text_row,
+                          text_row * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+          bool is_neg = full ? (r < total_batch) : (init ? (r == 0) : false);
+          const __half* img = is_neg ? neg : pos;
+          cudaMemcpyAsync(ext_ehs.data() + (size_t)r * ext_row + text_row, img,
+                          img_row * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+        }
+        int nlay = unet_->numIpLayers();
+        if(nlay <= 0) nlay = (int)ipadapter_scale_vec_.size();
+        unet_->forward_ipadapter_sdxl(
+            unet_input_latent_fp32.data(), unet_input_timestep_ptr, ext_ehs.data(),
+            tiled_text_embeds.data(), tiled_time_ids.data(),
+            ipadapter_scale_vec_.data(), nlay,
+            unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
+            ext_tok, config_.text_hidden_dim, config_.pooled_embedding_dim, stream);
+      }
       else
       {
         unet_->forward_sdxl(
@@ -1363,12 +1402,28 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_single_step(
       graph_enabled_ = false;
       return;
     }
-    run_single_step_body(graph_in_staging_->data(), x_0_pred_out, stream);
-    cudaError_t end = cudaStreamEndCapture(stream, &graph_);
-    if(end != cudaSuccess || !graph_)
+    // The capture-run enqueue can FAIL by THROWING — e.g. SDXL UNets hit CUDA error 901
+    // (StreamCaptureUnsupported) at the time-embedding myelin node, so enqueueV3 returns false and the
+    // wrapper throws. We MUST still call cudaStreamEndCapture to take the stream OUT of capture mode
+    // (otherwise the next op on this stream fails), then fall back to per-call enqueue — the warm run
+    // above already produced THIS frame's output, so correctness holds.
+    bool body_ok = true;
+    try
     {
-      std::cerr << "Note: CUDA graph capture aborted (" << cudaGetErrorString(end)
+      run_single_step_body(graph_in_staging_->data(), x_0_pred_out, stream);
+    }
+    catch(const std::exception& e)
+    {
+      body_ok = false;
+      std::cerr << "Note: CUDA graph capture body failed (" << e.what()
                 << "); using per-call enqueue" << std::endl;
+    }
+    cudaError_t end = cudaStreamEndCapture(stream, &graph_);
+    if(!body_ok || end != cudaSuccess || !graph_)
+    {
+      if(body_ok)
+        std::cerr << "Note: CUDA graph capture aborted (" << cudaGetErrorString(end)
+                  << "); using per-call enqueue" << std::endl;
       if(graph_) { cudaGraphDestroy(graph_); graph_ = nullptr; }
       graph_enabled_ = false;
       cudaGetLastError();  // clear sticky capture error so this frame still returns success (warm run did it)
@@ -1578,6 +1633,49 @@ void LibreDiffusionPipeline::run_single_step_body(
           tiled_text_embeds.data(), tiled_time_ids.data(), down_ptrs, mid_ptr,
           predict_x0_batch_unet_output->data(), unet_batch_size, config_.latent_height,
           config_.latent_width, config_.text_seq_len, config_.text_hidden_dim,
+          config_.pooled_embedding_dim, stream);
+    }
+    else if(ipadapter_enabled_)
+    {
+      // SDXL + IP-Adapter (single-step path, used by img2img 1-step): extended ehs [unet_batch, 77+N,
+      // 2048] (text ++ image tokens, neg/pos as SD1.5) + the tiled SDXL conditioning -> forward_ipadapter_sdxl.
+      const int dim = config_.text_hidden_dim;
+      const int N = ipadapter_num_tokens_;
+      const int text_tok = config_.text_seq_len;
+      const int ext_tok = text_tok + N;
+      const int text_row = text_tok * dim, img_row = N * dim, ext_row = ext_tok * dim;
+      const __half* pos = ipadapter_tokens_pos_ ? ipadapter_tokens_pos_->data() : nullptr;
+      const __half* neg = ipadapter_tokens_neg_ ? ipadapter_tokens_neg_->data() : pos;
+      if(!pos)
+        throw std::runtime_error("IP-Adapter enabled but no image tokens set (set_ipadapter_tokens)");
+      const size_t ext_n = (size_t)unet_batch_size * ext_row;
+      if(!ip_ext_ehs_ || ip_ext_ehs_->size() < ext_n)
+      {
+        ip_ext_ehs_ = std::make_unique<CUDATensor<__half>>(ext_n);
+        graph_ready_ = false;  // buffer (re)allocated -> invalidate any captured graph (address moved)
+      }
+      __half* ext_ehs = ip_ext_ehs_->data();
+      const bool full = (config_.guidance_scale > 1.0f && config_.cfg_type == 1);
+      const bool init = (config_.guidance_scale > 1.0f && config_.cfg_type == 3);
+      for(int r = 0; r < unet_batch_size; r++)
+      {
+        cudaMemcpyAsync(ext_ehs + (size_t)r * ext_row,
+                        predict_x0_batch_unet_encoder_hidden_states_single->data() + (size_t)r * text_row,
+                        text_row * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+        bool is_neg = full ? (r < config_.batch_size) : (init ? (r == 0) : false);
+        const __half* img = is_neg ? neg : pos;
+        cudaMemcpyAsync(ext_ehs + (size_t)r * ext_row + text_row, img,
+                        img_row * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+      }
+      int nlay = unet_->numIpLayers();
+      if(nlay <= 0) nlay = (int)ipadapter_scale_vec_.size();
+      unet_->forward_ipadapter_sdxl(
+          predict_x0_batch_unet_input_latent_fp32_single->data(),
+          predict_x0_batch_unet_input_timestep->data(), ext_ehs,
+          tiled_text_embeds.data(), tiled_time_ids.data(),
+          ipadapter_scale_vec_.data(), nlay,
+          predict_x0_batch_unet_output->data(), unet_batch_size, config_.latent_height,
+          config_.latent_width, ext_tok, config_.text_hidden_dim,
           config_.pooled_embedding_dim, stream);
     }
     else

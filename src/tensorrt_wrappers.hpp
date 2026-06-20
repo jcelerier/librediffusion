@@ -146,6 +146,20 @@ public:
       cudaStream_t stream);
 
   /**
+   * Run UNet inference (SDXL) for an IP-Adapter engine. Combines forward_sdxl (binds text_embeds +
+   * time_ids for SDXL's added conditioning) with forward_ipadapter (extended encoder_hidden_states
+   * [batch, 77+num_image_tokens, 2048] ++ the per-layer ipadapter_scale[num_ip_layers] vector). The
+   * SDXL IP-variant unet.engine declares: sample, timestep, encoder_hidden_states, text_embeds,
+   * time_ids, ipadapter_scale -> latent.
+   */
+  void forward_ipadapter_sdxl(
+      const float* sample, const float* timestep, const __half* encoder_hidden_states,
+      const __half* text_embeds, const __half* time_ids,
+      const float* ipadapter_scale, int num_ip_layers,
+      __half* output, int batch, int height, int width, int seq_len, int hidden_dim,
+      int pooled_dim, cudaStream_t stream);
+
+  /**
    * StreamV2V: Access attention output buffers for feature injection
    * Returns the 16 attention layer outputs from the last forward pass
    */
