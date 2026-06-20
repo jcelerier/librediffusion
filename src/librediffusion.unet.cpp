@@ -5,6 +5,92 @@
 #include <cassert>
 namespace librediffusion
 {
+
+void LibreDiffusionPipeline::run_controlnets(
+    const __half* sample_fp16, const float* timestep, const __half* ehs,
+    const __half* text_embeds, const __half* time_ids,
+    int unet_batch_size, int seq_len, int hidden_dim, int pooled_dim,
+    const __half** out_down, const __half** out_mid, int& down_count, void* stream_void)
+{
+  cudaStream_t stream = (cudaStream_t)stream_void;
+  const int img_h = config_.latent_height * 8, img_w = config_.latent_width * 8;
+  const int cond_row = 3 * img_h * img_w;
+  const bool sdxl = (config_.model_type == ModelType::SDXL_TURBO);
+
+  const __half* net_down[ControlNetWrapper::MAX_DOWN];
+  const __half* net_mid = nullptr;
+  CUDATensor<__half> cond_tiled((size_t)unet_batch_size * cond_row);
+  int nd = 0;
+
+  for(size_t k = 0; k < controlnets_.size(); k++)
+  {
+    if(!controlnet_cond_[k])
+      throw std::runtime_error("ControlNet " + std::to_string(k) + " has no control image set "
+                               "(call set_controlnet_cond[_rgba])");
+    // Tile this net's single cond row to unet_batch_size.
+    for(int i = 0; i < unet_batch_size; i++)
+      cudaMemcpyAsync(cond_tiled.data() + (size_t)i * cond_row, controlnet_cond_[k]->data(),
+                      cond_row * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+    controlnets_[k]->forward(
+        sample_fp16, timestep, ehs, cond_tiled.data(), controlnet_scales_[k],
+        text_embeds, time_ids, unet_batch_size, config_.latent_height, config_.latent_width,
+        img_h, img_w, seq_len, hidden_dim, pooled_dim, net_down, &net_mid, stream);
+    nd = controlnets_[k]->numDown();
+
+    if(k == 0)
+    {
+      // Single net (or first): use its buffers directly — no copy/sum needed.
+      if(controlnets_.size() == 1)
+      {
+        for(int i = 0; i < nd; i++) out_down[i] = net_down[i];
+        *out_mid = net_mid;
+        down_count = nd;
+        return;
+      }
+      // Multi-net: initialize the sum accumulators with the first net's residuals (done below).
+      controlnet_sum_down_.clear();
+      controlnet_sum_down_.resize(nd);
+    }
+    // Determine each residual's element count from the engine geometry (same tables as the wrapper).
+    static const int kSD15Ch[12] = {320,320,320,320,640,640,640,1280,1280,1280,1280,1280};
+    static const int kSD15Fac[12] = {1,1,1,2,2,2,4,4,4,8,8,8};
+    static const int kSDXLCh[9] = {320,320,320,320,640,640,640,1280,1280};
+    static const int kSDXLFac[9] = {1,1,1,2,2,2,4,4,4};
+    const int* ch = sdxl ? kSDXLCh : kSD15Ch;
+    const int* fac = sdxl ? kSDXLFac : kSD15Fac;
+    const int midCh = 1280, midFac = sdxl ? 4 : 8;
+    auto down_elems = [&](int i) {
+      return (size_t)unet_batch_size * ch[i] * (config_.latent_height / fac[i])
+             * (config_.latent_width / fac[i]);
+    };
+    size_t mid_elems = (size_t)unet_batch_size * midCh * (config_.latent_height / midFac)
+                       * (config_.latent_width / midFac);
+    if(k == 0)
+    {
+      for(int i = 0; i < nd; i++)
+      {
+        controlnet_sum_down_[i] = std::make_unique<CUDATensor<__half>>(down_elems(i));
+        cudaMemcpyAsync(controlnet_sum_down_[i]->data(), net_down[i],
+                        down_elems(i) * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+      }
+      controlnet_sum_mid_ = std::make_unique<CUDATensor<__half>>(mid_elems);
+      cudaMemcpyAsync(controlnet_sum_mid_->data(), net_mid, mid_elems * sizeof(__half),
+                      cudaMemcpyDeviceToDevice, stream);
+    }
+    else
+    {
+      for(int i = 0; i < nd; i++)
+        launch_tensor_add_fp16(controlnet_sum_down_[i]->data(), net_down[i],
+                               (int)down_elems(i), stream);
+      launch_tensor_add_fp16(controlnet_sum_mid_->data(), net_mid, (int)mid_elems, stream);
+    }
+  }
+
+  for(int i = 0; i < nd; i++) out_down[i] = controlnet_sum_down_[i]->data();
+  *out_mid = controlnet_sum_mid_->data();
+  down_count = nd;
+}
+
 void LibreDiffusionPipeline::add_noise(
     const __half* original_samples, const __half* noise, __half* noisy_samples,
     int t_index, int N, cudaStream_t stream)
@@ -282,13 +368,49 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
         cudaMemcpyAsync(tiled_time_ids.data() + (size_t)i * time_ids_dim, time_ids_->data(),
                         time_ids_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
       }
-      unet_->forward_sdxl(
-          unet_input_latent_fp32.data(), unet_input_timestep_ptr,
-          unet_encoder_hidden_states_ptr,
-          tiled_text_embeds.data(), tiled_time_ids.data(),
+      if(controlnet_enabled_)
+      {
+        // SDXL + ControlNet (multi): run every net (same x_t/timestep/ehs + tiled SDXL conditioning +
+        // each net's control image), SUM their 9 down + mid residuals, inject once.
+        const __half* down_ptrs[ControlNetWrapper::MAX_DOWN];
+        const __half* mid_ptr = nullptr;
+        int down_count = 0;
+        run_controlnets(unet_input_latent_ptr, unet_input_timestep_ptr, unet_encoder_hidden_states_ptr,
+                        tiled_text_embeds.data(), tiled_time_ids.data(), unet_batch_size,
+                        config_.text_seq_len, config_.text_hidden_dim, pooled_dim,
+                        down_ptrs, &mid_ptr, down_count, stream);
+        unet_->forward_controlnet_sdxl(
+            unet_input_latent_fp32.data(), unet_input_timestep_ptr, unet_encoder_hidden_states_ptr,
+            tiled_text_embeds.data(), tiled_time_ids.data(), down_ptrs, mid_ptr,
+            unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
+            config_.text_seq_len, config_.text_hidden_dim, config_.pooled_embedding_dim, stream);
+      }
+      else
+      {
+        unet_->forward_sdxl(
+            unet_input_latent_fp32.data(), unet_input_timestep_ptr,
+            unet_encoder_hidden_states_ptr,
+            tiled_text_embeds.data(), tiled_time_ids.data(),
+            unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
+            config_.text_seq_len, config_.text_hidden_dim,
+            config_.pooled_embedding_dim, stream);
+      }
+    }
+    else if(controlnet_enabled_)
+    {
+      // ControlNet (SD1.5, multi): run every net on the SAME x_t/timestep/ehs the UNet sees (sample is
+      // the FP16 latent unet_input_latent_ptr, before fp32 conversion), SUM their residuals, inject once.
+      const __half* down_ptrs[ControlNetWrapper::MAX_DOWN];
+      const __half* mid_ptr = nullptr;
+      int down_count = 0;
+      run_controlnets(unet_input_latent_ptr, unet_input_timestep_ptr, unet_encoder_hidden_states_ptr,
+                      nullptr, nullptr, unet_batch_size, config_.text_seq_len,
+                      config_.text_hidden_dim, 0, down_ptrs, &mid_ptr, down_count, stream);
+      unet_->forward_controlnet(
+          unet_input_latent_fp32.data(), unet_input_timestep_ptr, unet_encoder_hidden_states_ptr,
+          down_ptrs, mid_ptr,
           unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
-          config_.text_seq_len, config_.text_hidden_dim,
-          config_.pooled_embedding_dim, stream);
+          config_.text_seq_len, config_.text_hidden_dim, stream);
     }
     else
     {

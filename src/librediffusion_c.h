@@ -209,6 +209,13 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_vae_decoder(
     librediffusion_config_handle config, const char* path);
 
+/* ControlNet (multi). Add one ControlNet engine + its conditioning scale; returns the net's index
+ * (>=0) or -1 on error. Requires a control-aware unet.engine. Preprocessing is EXTERNAL: feed each
+ * net's control image per-frame via librediffusion_set_controlnet_cond[_rgba](pipe, index, ...). */
+LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+librediffusion_config_add_controlnet(
+    librediffusion_config_handle config, const char* engine_path, float conditioning_scale);
+
 /* Timestep indices (array copy) */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_timestep_indices(
@@ -427,6 +434,30 @@ librediffusion_prepare_scheduler(
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_set_init_noise(
     librediffusion_pipeline_handle pipeline, const librediffusion_half_t* noise);
+
+/**
+ * Set ControlNet `index`'s control image (device ptr [1,3,H,W] fp16, [0,1]; already preprocessed).
+ * `index` is the value returned by librediffusion_config_add_controlnet. Tiled to the UNet batch.
+ */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_controlnet_cond(
+    librediffusion_pipeline_handle pipeline, int index, const librediffusion_half_t* cond,
+    int img_height, int img_width);
+
+/**
+ * Convenience: set ControlNet `index`'s control image from host RGBA uint8 [H,W,4]. Converted
+ * on-device to RGB fp16 NCHW in [0,1]. Use this when the host has a plain RGBA image (the preprocessed
+ * control map — canny/depth/pose/etc., produced externally).
+ */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_controlnet_cond_rgba(
+    librediffusion_pipeline_handle pipeline, int index, const uint8_t* cpu_rgba,
+    int img_height, int img_width);
+
+/** Live-adjust ControlNet `index`'s conditioning scale (applied next step). */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_controlnet_scale(
+    librediffusion_pipeline_handle pipeline, int index, float scale);
 
 /**
  * Reseed the random number generator.

@@ -44,6 +44,34 @@ void LibreDiffusionPipeline::init_engines()
   unet_ = std::make_unique<UNetWrapper>(config_.unet_engine_path, use_v2v);
   vae_encoder_ = std::make_unique<VAEEncoderWrapper>(config_.vae_encoder_path);
   vae_decoder_ = std::make_unique<VAEDecoderWrapper>(config_.vae_decoder_path);
+
+  // ControlNet (optional, multi): create a wrapper per configured net. Enabled only when at least one
+  // net is configured AND the UNet engine is control-aware (declares input_control_* inputs).
+  // NOTE: init_engines() can be called more than once (ctor + pipeline_init_all); clear first so the
+  // wrapper/cond/scale vectors don't ACCUMULATE duplicates across calls.
+  controlnets_.clear();
+  controlnet_cond_.clear();
+  controlnet_scales_.clear();
+  controlnet_enabled_ = false;
+  if(!config_.controlnets.empty())
+  {
+    if(!unet_->hasControlInputs())
+    {
+      std::cout << "Warning: " << config_.controlnets.size() << " controlnet(s) configured but the UNet "
+                   "engine has no input_control_* inputs; ControlNet DISABLED (use a control-aware "
+                   "unet.engine)" << std::endl;
+    }
+    else
+    {
+      for(const auto& spec : config_.controlnets)
+      {
+        controlnets_.push_back(std::make_unique<ControlNetWrapper>(spec.engine_path));
+        controlnet_cond_.push_back(nullptr);  // filled by set_controlnet_cond[_rgba]
+        controlnet_scales_.push_back(spec.conditioning_scale);
+      }
+      controlnet_enabled_ = true;
+    }
+  }
 }
 
 void LibreDiffusionPipeline::init_buffers()

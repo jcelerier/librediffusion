@@ -943,6 +943,51 @@ void launch_rgba_to_rgb_normalized_fp16(
         (const uint8_t*)rgba_in, (__half*)rgb_out, n, h, w);
 }
 
+// ControlNet control image: RGBA uint8 NHWC -> RGB fp16 NCHW [N,3,H,W] in [0,1].
+__global__ void rgba_to_rgb_chw_01_fp16_kernel(
+    const uint8_t* rgba_in, __half* rgb_out, int n, int h, int w)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_pixels = n * h * w;
+    if(idx < total_pixels)
+    {
+        int hw = h * w;
+        int img = idx / hw;        // batch index
+        int pix = idx % hw;        // pixel within image
+        int rgba_idx = idx * 4;    // NHWC source
+        // NCHW destination: channel plane offset = img*3*hw + c*hw + pix
+        int base = img * 3 * hw + pix;
+        rgb_out[base + 0 * hw] = __float2half(float(rgba_in[rgba_idx + 0]) / 255.0f);
+        rgb_out[base + 1 * hw] = __float2half(float(rgba_in[rgba_idx + 1]) / 255.0f);
+        rgb_out[base + 2 * hw] = __float2half(float(rgba_in[rgba_idx + 2]) / 255.0f);
+    }
+}
+
+void launch_rgba_to_rgb_chw_01_fp16(
+    const void* rgba_in, void* rgb_out, int n, int h, int w, void* stream_ptr)
+{
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    int total_pixels = n * h * w;
+    int block = 256, grid = (total_pixels + block - 1) / block;
+    rgba_to_rgb_chw_01_fp16_kernel<<<grid, block, 0, stream>>>(
+        (const uint8_t*)rgba_in, (__half*)rgb_out, n, h, w);
+}
+
+// Multi-ControlNet residual sum: acc[i] += src[i].
+__global__ void tensor_add_fp16_kernel(__half* acc, const __half* src, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < n)
+        acc[i] = __float2half(__half2float(acc[i]) + __half2float(src[i]));
+}
+
+void launch_tensor_add_fp16(void* acc, const void* src, int n, void* stream_ptr)
+{
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    int block = 256, grid = (n + block - 1) / block;
+    tensor_add_fp16_kernel<<<grid, block, 0, stream>>>((__half*)acc, (const __half*)src, n);
+}
+
 void launch_rgb_to_rgba_denormalized_fp32(
     const void* rgb_in,
     void* rgba_out,

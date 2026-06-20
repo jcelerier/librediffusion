@@ -93,6 +93,41 @@ public:
       int pooled_dim, cudaStream_t stream);
 
   /**
+   * Run UNet inference (SD1.5) WITH ControlNet residuals injected.
+   *
+   * The control-aware UNet engine declares extra inputs input_control_00..input_control_11 +
+   * input_control_middle (the 12 down + 1 mid ControlNet residuals); the engine adds them to its
+   * own down/mid blocks internally. The residuals are produced by ControlNetWrapper and are ALREADY
+   * conditioning_scale-scaled (our SD1.5 controlnet engine bakes scale via its onnx::Cast_4 input),
+   * so they are bound here as-is.
+   *
+   * @param down_residuals 12 device pointers, down_residuals[i] = input_control_{i:02d} [batch, C_i, H_i, W_i] FP16
+   * @param mid_residual   device pointer for input_control_middle [batch, 1280, H/8, W/8] FP16
+   * (other params as forward())
+   */
+  void forward_controlnet(
+      const float* sample, const float* timestep, const __half* encoder_hidden_states,
+      const __half* const* down_residuals, const __half* mid_residual,
+      __half* output, int batch, int height, int width, int seq_len, int hidden_dim,
+      cudaStream_t stream);
+
+  /**
+   * Run UNet inference (SDXL) WITH ControlNet residuals injected. Like forward_sdxl (binds
+   * text_embeds/time_ids) PLUS the 9 down + mid control residuals into input_control_00..08 +
+   * input_control_middle. Residuals are already scale-baked.
+   * @param down_residuals 9 device pointers; @param mid_residual the mid block residual.
+   */
+  void forward_controlnet_sdxl(
+      const float* sample, const float* timestep, const __half* encoder_hidden_states,
+      const __half* text_embeds, const __half* time_ids,
+      const __half* const* down_residuals, const __half* mid_residual,
+      __half* output, int batch, int height, int width, int seq_len, int hidden_dim,
+      int pooled_dim, cudaStream_t stream);
+
+  /// True if the loaded engine declares the input_control_* residual inputs (control-aware UNet).
+  bool hasControlInputs() const { return has_control_inputs_; }
+
+  /**
    * StreamV2V: Access attention output buffers for feature injection
    * Returns the 16 attention layer outputs from the last forward pass
    */
@@ -142,8 +177,91 @@ private:
   static constexpr int NUM_ATTENTION_OUTPUTS = 16;
   std::vector<std::unique_ptr<CUDATensor<__half>>> attention_output_buffers_;
 
+  // ControlNet residual inputs (SD1.5: 12 down + 1 mid). Persistent buffers, bound only when the
+  // engine declares input_control_* inputs (control-aware UNet). down_residuals copied per-call.
+  static constexpr int NUM_CONTROL_DOWN = 12;
+  bool has_control_inputs_ = false;
+  std::vector<std::unique_ptr<CUDATensor<__half>>> control_down_buffers_;  // 12
+  std::unique_ptr<CUDATensor<__half>> control_mid_buffer_;
+
   void loadEngine(const std::string& engine_path);
   bool needsReallocation(int batch, int height, int width, int seq_len, int hidden_dim, int pooled_dim = 0);
+};
+
+/**
+ * ControlNet wrapper for TensorRT (SD1.5).
+ *
+ * Inputs:
+ *   - sample:                [batch, 4, H, W]    FP16  (the x_t latent the UNet sees)
+ *   - timestep:              [batch]             FP32
+ *   - encoder_hidden_states: [batch, 77, 768]    FP16
+ *   - controlnet_cond:       [batch, 3, 8H, 8W]  FP16  (IMAGE-space control, range [0,1])
+ *   - onnx::Cast_4:          scalar              FP32  (conditioning_scale; BAKED into the residuals)
+ *
+ * Outputs (12 down + 1 mid, FP16), channels [320,320,320,320,640,640,640,1280,1280,1280,1280,1280] + mid 1280:
+ *   - down_block_00 .. down_block_11, mid_block
+ *
+ * The residuals come out already scaled by conditioning_scale, so the UNet binds them as-is.
+ */
+class ControlNetWrapper
+{
+public:
+  static constexpr int MAX_DOWN = 12;  // SD1.5 = 12, SDXL = 9 (numDown() reports the actual count)
+
+  explicit ControlNetWrapper(const std::string& engine_path);
+  ~ControlNetWrapper();
+
+  ControlNetWrapper(const ControlNetWrapper&) = delete;
+  ControlNetWrapper& operator=(const ControlNetWrapper&) = delete;
+
+  int numDown() const { return num_down_; }   // 12 (SD1.5) or 9 (SDXL)
+  bool isSdxl() const { return is_sdxl_; }     // engine has text_embeds/time_ids inputs
+
+  /**
+   * Run ControlNet inference. Outputs are written to internal persistent buffers; the returned
+   * pointers stay valid until the next forward() call. down_out is filled with numDown() pointers.
+   *
+   * @param sample            [batch,4,H,W] FP16 (the latent; same x_t fed to the UNet)
+   * @param timestep          [batch] FP32
+   * @param encoder_hidden_states [batch,77,hidden_dim] FP16
+   * @param controlnet_cond   [batch,3,img_h,img_w] FP16, range [0,1]
+   * @param conditioning_scale scalar baked into the output residuals
+   * @param text_embeds       [batch,1280] FP16 — SDXL only (nullptr for SD1.5)
+   * @param time_ids          [batch,6] FP16 — SDXL only (nullptr for SD1.5)
+   * @param down_out          OUT: numDown() device ptrs (down_block_00..)
+   * @param mid_out           OUT: device ptr (mid_block)
+   */
+  void forward(
+      const __half* sample, const float* timestep, const __half* encoder_hidden_states,
+      const __half* controlnet_cond, float conditioning_scale,
+      const __half* text_embeds, const __half* time_ids,
+      int batch, int height, int width, int img_height, int img_width, int seq_len, int hidden_dim,
+      int pooled_dim, const __half** down_out, const __half** mid_out, cudaStream_t stream);
+
+private:
+  std::shared_ptr<CachedTensorRTEngine> cached_engine_;
+  std::unique_ptr<nvinfer1::IExecutionContext> context_;
+
+  // The scale scalar input name varies by trace: SD1.5 traces it as "onnx::Cast_4"; SDXL declares a
+  // proper "conditioning_scale" input. Detected at load (lone scalar FP32 input).
+  std::string scale_input_name_;
+  int num_down_ = 12;       // actual down_block_* output count (detected at load)
+  bool is_sdxl_ = false;    // engine declares text_embeds/time_ids inputs
+
+  struct ShapeCache { int batch=0,height=0,width=0,img_h=0,img_w=0,seq_len=0,hidden_dim=0,pooled_dim=0; bool init=false; };
+  ShapeCache shape_cache_;
+
+  std::unique_ptr<CUDATensor<__half>> sample_buffer_;
+  std::unique_ptr<CUDATensor<float>> timestep_buffer_;
+  std::unique_ptr<CUDATensor<__half>> ehs_buffer_;
+  std::unique_ptr<CUDATensor<__half>> cond_buffer_;
+  std::unique_ptr<CUDATensor<float>> scale_buffer_;
+  std::unique_ptr<CUDATensor<__half>> text_embeds_buffer_;  // SDXL
+  std::unique_ptr<CUDATensor<__half>> time_ids_buffer_;     // SDXL
+  std::vector<std::unique_ptr<CUDATensor<__half>>> down_buffers_;
+  std::unique_ptr<CUDATensor<__half>> mid_buffer_;
+
+  void loadEngine(const std::string& engine_path);
 };
 
 /**
