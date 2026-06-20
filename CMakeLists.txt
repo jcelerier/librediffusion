@@ -18,8 +18,24 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 # 87: jetson orin
 # 89: 40xx
 # 120: 50xx
-set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 86-real 89-real 90-real 90a-real 100-real 103-real 110-real 120)
+# Overridable via -DCMAKE_CUDA_ARCHITECTURES=... (e.g. CI builds a single arch for speed); the cache
+# default ships every supported arch.
+set(CMAKE_CUDA_ARCHITECTURES "75-real;80-real;86-real;89-real;90-real;90a-real;100-real;103-real;110-real;120"
+    CACHE STRING "CUDA architectures to build")
 set(CMAKE_CUDA_FLAGS "-use_fast_math ")#-arch=sm_75 -arch=sm_80 -arch=sm_86 -arch=sm_89 -arch=sm_90 -arch=sm_90a -arch=sm_100 -arch=sm_103 -arch=sm_110 -arch=sm_120 ")
+if(MSVC)
+  # CUDA 13's CCCL headers reject MSVC's traditional preprocessor (fatal error C1189). Use the
+  # conforming preprocessor for both the host C++ and the nvcc host pass.
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>)
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/Zc:preprocessor")
+endif()
+
+# Boost is header-only here (model_cache.hpp uses boost::concurrent_flat_map, needs Boost >= 1.83).
+# Normally found as a system include; CI passes its location explicitly (portable across gcc/MSVC,
+# unlike CPLUS_INCLUDE_PATH which MSVC ignores).
+if(BOOST_INCLUDE_DIR)
+  include_directories(${BOOST_INCLUDE_DIR})
+endif()
 option(LRD_COVERAGE "Build host C++ with gcov coverage instrumentation" OFF)
 if(NOT MSVC)
   set(CMAKE_C_FLAGS -Wno-deprecated )
@@ -90,13 +106,11 @@ if(TENSORRT_RTX)
       ${TENSORRT_LIB_DIR}/libtensorrt_onnxparser_rtx.so
   )
 else()
-  if(WIN32)
-    set(TENSORRT_LIBRARIES
-        "${TENSORRT_LIB_DIR}/nvinfer_10.lib"
-    )
-  else()
-    find_library(TENSORRT_LIBRARIES NAMES nvinfer)
-  endif()
+  # Standard TensorRT (the project's runtime; TENSORRT_RTX is abandoned). Locate libnvinfer in
+  # TENSORRT_LIB_DIR: libnvinfer.so on Linux, nvinfer_<major>.lib on Windows. (Pass TENSORRT_LIBRARIES
+  # directly to override.)
+  find_library(TENSORRT_LIBRARIES NAMES nvinfer nvinfer_11 nvinfer_10
+               HINTS ${TENSORRT_LIB_DIR} ${TENSORRT_LIB_DIR}/lib)
 endif()
 
 # !! export POLYGRAPHY_USE_TENSORRT_RTX=1
@@ -171,3 +185,9 @@ target_link_libraries(librediffusion PUBLIC
     clip_tokenizer_c
     librediffusion_cuda
 )
+
+if(WIN32)
+  # System libs the Rust staticlib (clip_tokenizer_c) pulls in but doesn't propagate as import deps:
+  # BCryptGenRandom (bcrypt), plus the usual Rust-std-on-Windows set.
+  target_link_libraries(librediffusion PUBLIC bcrypt ntdll userenv ws2_32 advapi32)
+endif()

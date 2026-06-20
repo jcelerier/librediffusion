@@ -1,0 +1,135 @@
+name: CI
+
+# Builds the standalone librediffusion library (C++23 / CUDA + Rust clip-tokenizer) with the latest
+# CUDA toolkit and standard TensorRT (-DTENSORRT_RTX=OFF; TensorRT-RTX is abandoned). Compile/link
+# check only — no GPU needed (nvcc emits every arch offline), so it runs on CPU runners.
+#
+# All deps are public + login-free (the Linux job is validated end-to-end in an almalinux:9 container):
+#   * CUDA toolkit -> NVIDIA cuda-rhel9 dnf repo (rolling 'cuda-toolkit' = latest)
+#   * TensorRT     -> the official NVIDIA TensorRT 11.0.0.114 SDK archive (headers + libs, and on
+#                     Windows the import .lib) from developer.nvidia.com/downloads (direct, no login)
+#   * Boost 1.83+  -> downloaded headers (AlmaLinux 9 ships 1.75, too old for concurrent_flat_map)
+
+on:
+  push:
+    branches: [ master, main, sdxl-prebuilt-timestep ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TRT_LINUX_URL: https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/11.0.0/tars/TensorRT-Enterprise-11.0.0.114-Linux-x86_64-cuda-13.2-Release-external.tar.zst
+  TRT_WINDOWS_URL: https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/11.0.0/zip/TensorRT-Enterprise-11.0.0.114-Windows-amd64-cuda-13.2-Release-external.zip
+  BOOST_VERSION: 1.86.0
+
+jobs:
+  linux:
+    name: Linux (AlmaLinux 9, latest CUDA)
+    runs-on: ubuntu-latest
+    container: almalinux:9
+    steps:
+      # git + toolchain must exist before actions/checkout (the bare almalinux image has neither).
+      - name: Prepare container
+        run: |
+          set -eux
+          dnf -y install dnf-plugins-core epel-release
+          dnf config-manager --set-enabled crb
+          dnf -y install git ninja-build cmake make which tar gzip zstd findutils perl \
+                         gcc-toolset-13 gcc-toolset-13-gcc-c++ rust cargo
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install CUDA toolkit (latest)
+        run: |
+          set -eux
+          dnf config-manager --add-repo \
+            https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
+          dnf -y install cuda-toolkit            # rolling meta-package -> latest CUDA
+          /usr/local/cuda/bin/nvcc --version | tail -1
+
+      - name: Fetch TensorRT SDK + Boost
+        run: |
+          set -eux
+          curl -fsSL "$TRT_LINUX_URL" -o /tmp/trt.tar.zst
+          mkdir -p "$HOME/trt" && tar --use-compress-program=unzstd -xf /tmp/trt.tar.zst -C "$HOME/trt"
+          SDK="$(echo "$HOME"/trt/TensorRT-*)"
+          curl -fsSL "https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${BOOST_VERSION//./_}.tar.gz" \
+            | tar xz -C "$HOME"
+          {
+            echo "TRT_INC=$SDK/include"
+            echo "TRT_LIB=$SDK/lib"
+            echo "BOOST_DIR=$HOME/boost_${BOOST_VERSION//./_}"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          set -eux
+          source /opt/rh/gcc-toolset-13/enable
+          export PATH=/usr/local/cuda/bin:$PATH CUDACXX=/usr/local/cuda/bin/nvcc
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTENSORRT_RTX=OFF \
+            -DTENSORRT_INCLUDE_DIR="$TRT_INC" \
+            -DTENSORRT_LIB_DIR="$TRT_LIB" \
+            -DBOOST_INCLUDE_DIR="$BOOST_DIR"
+
+      - name: Build (all CUDA arches)
+        run: |
+          set -eux
+          source /opt/rh/gcc-toolset-13/enable
+          export PATH=/usr/local/cuda/bin:$PATH
+          cmake --build build --target librediffusion -j"$(nproc)"
+          ls -la build/liblibrediffusion.so
+
+  windows:
+    name: Windows (latest CUDA)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install CUDA toolkit (latest)
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: '13.2.0'
+          method: network
+          use-github-cache: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Fetch TensorRT SDK + Boost
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "$env:TRT_WINDOWS_URL" -OutFile "$env:RUNNER_TEMP\trt.zip"
+          Expand-Archive "$env:RUNNER_TEMP\trt.zip" -DestinationPath "$env:RUNNER_TEMP\trt" -Force
+          $sdk = (Get-ChildItem "$env:RUNNER_TEMP\trt" -Directory | Where-Object { $_.Name -like 'TensorRT-*' } | Select-Object -First 1).FullName
+          $b = "boost_" + $env:BOOST_VERSION.Replace('.', '_')
+          Invoke-WebRequest "https://archives.boost.io/release/$($env:BOOST_VERSION)/source/$b.tar.gz" -OutFile "$env:RUNNER_TEMP\boost.tar.gz"
+          tar xzf "$env:RUNNER_TEMP\boost.tar.gz" -C "$env:RUNNER_TEMP"
+          "TRT_INC=$sdk\include"        | Out-File $env:GITHUB_ENV -Append
+          "TRT_LIB=$sdk\lib"            | Out-File $env:GITHUB_ENV -Append
+          "BOOST_DIR=$env:RUNNER_TEMP\$b"          | Out-File $env:GITHUB_ENV -Append
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DTENSORRT_RTX=OFF `
+            -DTENSORRT_INCLUDE_DIR="$env:TRT_INC" `
+            -DTENSORRT_LIB_DIR="$env:TRT_LIB" `
+            -DBOOST_INCLUDE_DIR="$env:BOOST_DIR"
+
+      - name: Build (all CUDA arches)
+        shell: pwsh
+        run: cmake --build build --config Release --target librediffusion -j
