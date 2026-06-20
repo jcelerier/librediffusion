@@ -247,6 +247,52 @@ void launch_klein_euler_axpy(void* x, const void* v, float dt, long N, void* str
   k_euler_axpy<<<blocks, threads, 0, s>>>((bf16*)x, (const bf16*)v, dt, N);
 }
 
+// ---- lerp: out = (1-t)*a + t*b  (bf16, fp32 accumulate) — flow-match img2img start blend --------
+__global__ void k_lerp(bf16* out, const bf16* a, const bf16* b, float t, long N)
+{
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if(idx >= N) return;
+  float av = __bfloat162float(a[idx]);
+  float bv = __bfloat162float(b[idx]);
+  out[idx] = __float2bfloat16((1.f - t) * av + t * bv);
+}
+
+void launch_klein_lerp(void* out, const void* a, const void* b, float t, long N, void* stream_ptr)
+{
+  cudaStream_t s = (cudaStream_t)stream_ptr;
+  int threads = 256;
+  int blocks = (int)((N + threads - 1) / threads);
+  k_lerp<<<blocks, threads, 0, s>>>((bf16*)out, (const bf16*)a, (const bf16*)b, t, N);
+}
+
+// ---- inpaint blend (per-step): x = mask*x + (1-mask)*(sn*noise + (1-sn)*ref) ----------------------
+// mask is one value PER TOKEN [Lp] (1=regenerate, 0=keep), broadcast across `hidden` channels.
+// noised_ref = scale_noise(ref, sigma_next) keeps the unmasked region on the reference's noise schedule.
+__global__ void k_inpaint_blend(bf16* x, const bf16* ref, const bf16* noise, const float* mask,
+                                float sn, long Lp, int hidden)
+{
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long N = Lp * hidden;
+  if(idx >= N) return;
+  float m = mask[idx / hidden];
+  float xv = __bfloat162float(x[idx]);
+  float rv = __bfloat162float(ref[idx]);
+  float nv = __bfloat162float(noise[idx]);
+  float noised_ref = sn * nv + (1.f - sn) * rv;
+  x[idx] = __float2bfloat16(m * xv + (1.f - m) * noised_ref);
+}
+
+void launch_klein_inpaint_blend(void* x, const void* ref, const void* noise, const float* mask,
+                                float sigma_next, long Lp, int hidden, void* stream_ptr)
+{
+  cudaStream_t s = (cudaStream_t)stream_ptr;
+  int threads = 256;
+  long N = Lp * hidden;
+  int blocks = (int)((N + threads - 1) / threads);
+  k_inpaint_blend<<<blocks, threads, 0, s>>>((bf16*)x, (const bf16*)ref, (const bf16*)noise, mask,
+                                             sigma_next, Lp, hidden);
+}
+
 // ---- PCG32 randn (bf16), index-deterministic (matches pcg.hpp / deterministic_noise.py) -----
 __host__ __device__ static inline unsigned int pcg_rotr32(unsigned int v, unsigned int r)
 {

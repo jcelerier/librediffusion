@@ -60,11 +60,20 @@ public:
   // img_ids/ref_ids: [Lp,4] each (noisy-latent ids + reference ids). The transformer sees the
   // concatenated image sequence [noisy | ref] (2*Lp tokens); only the first Lp velocity rows are
   // used for the Euler step (pipeline.py:1018). Output Lp tokens decoded to rgba_out.
+  // Denoise schedule control:
+  //  - sigmas != nullptr: use this explicit FlowMatch sigma sequence verbatim (high->low, in [0,1];
+  //    terminal 0 appended internally). n_sigmas = number of steps. sigmas[0] is the start noise level
+  //    (=img2img strength: 1.0 = txt2img from pure noise, <1.0 starts from a noised reference). This is
+  //    the model's NATIVE scale and the path the node's Timesteps control drives for klein.
+  //  - sigmas == nullptr: fall back to klein_sigmas(num_steps) dynamic-shift schedule, with `strength`
+  //    (<1.0) truncating it to [strength,0] (the legacy single-knob path).
   void denoise_decode_ref(
       const __nv_bfloat16* init_noise, const __nv_bfloat16* ref_tokens, const __nv_bfloat16* ehs,
       const float* img_ids, const float* ref_ids, const float* txt_ids, const float* bn_mean,
       const float* bn_std, int Lp, int Lt, int Th, int Tw, int num_steps,
-      unsigned char* rgba_out, __nv_bfloat16* out_final_latent, cudaStream_t stream);
+      unsigned char* rgba_out, __nv_bfloat16* out_final_latent, cudaStream_t stream,
+      float strength = 1.0f, const float* sigmas = nullptr, int n_sigmas = 0,
+      const float* inpaint_mask = nullptr);  // device [Lp] (1=regenerate, 0=keep); null = no inpaint
 
   Flux2TransformerWrapper* transformer() { return transformer_.get(); }
   KleinVAEEncoderWrapper* vae_encoder() { return vae_enc_.get(); }
@@ -74,6 +83,15 @@ private:
   std::unique_ptr<Qwen3EncoderWrapper> qwen_;
   std::unique_ptr<KleinVAEEncoderWrapper> vae_enc_;
   std::unique_ptr<KleinVAEDecoderWrapper> vae_dec_;
+
+  // Persistent grow-only device scratch for the denoise/decode/encode working buffers. Allocated on
+  // first use and reused while the geometry is unchanged -> zero cudaMalloc per keyframe on the
+  // streaming hot path, and never leaked on a throw mid-call (freed in the destructor). Replaces the
+  // former per-call raw cudaMalloc/cudaFree pairs.
+  struct Scratch { void* p{}; size_t cap{}; };
+  Scratch sc_x_, sc_vel_, sc_full_in_, sc_full_ids_, sc_unpacked_, sc_patched_, sc_vae_lat_, sc_img_, sc_ts_;
+  void* grow_scratch(Scratch& s, size_t bytes);  // returns s.p, reallocating only when too small
+  void free_scratch();
 };
 
 } // namespace librediffusion
