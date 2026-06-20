@@ -189,4 +189,37 @@ void LibreDiffusionPipeline::set_controlnet_scale(int index, float scale)
   controlnet_scales_[index] = scale;
 }
 
+void LibreDiffusionPipeline::set_ipadapter_tokens(
+    const __half* pos, const __half* neg, int num_tokens, int dim)
+{
+  size_t n = (size_t)num_tokens * dim;
+  ipadapter_num_tokens_ = num_tokens;
+  ipadapter_tokens_pos_ = std::make_unique<CUDATensor<__half>>(n);
+  cudaMemcpyAsync(ipadapter_tokens_pos_->data(), pos, n * sizeof(__half),
+                  cudaMemcpyDeviceToDevice, stream_);
+  if(neg)
+  {
+    ipadapter_tokens_neg_ = std::make_unique<CUDATensor<__half>>(n);
+    cudaMemcpyAsync(ipadapter_tokens_neg_->data(), neg, n * sizeof(__half),
+                    cudaMemcpyDeviceToDevice, stream_);
+  }
+  else
+  {
+    ipadapter_tokens_neg_.reset();  // cfg-none/self use pos for all rows
+  }
+  cudaStreamSynchronize(stream_);
+}
+
+void LibreDiffusionPipeline::set_ipadapter_scale(float scale)
+{
+  int n = unet_ ? unet_->numIpLayers() : 0;
+  if(n <= 0) n = 16;  // SD1.5 base default if not yet known
+  ipadapter_scale_vec_.assign(n, scale);
+}
+
+void LibreDiffusionPipeline::set_ipadapter_scale_vector(const float* per_layer, int num_ip_layers)
+{
+  ipadapter_scale_vec_.assign(per_layer, per_layer + num_ip_layers);
+}
+
 }
