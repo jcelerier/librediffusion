@@ -409,6 +409,47 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
           unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
           config_.text_seq_len, config_.text_hidden_dim, stream);
     }
+    else if(ipadapter_enabled_)
+    {
+      // IP-Adapter (SD1.5): assemble the EXTENDED encoder_hidden_states [unet_batch, 77+N, dim] =
+      // per row, the 77 text tokens (already in unet_encoder_hidden_states_ptr) ++ N image tokens.
+      // Per-row image tokens follow the SAME neg/pos arrangement as the text ehs:
+      //   full       -> [neg x total_batch, pos x total_batch]
+      //   initialize -> [neg x 1, pos x total_batch]
+      //   none/self  -> [pos x unet_batch_size]
+      const int dim = config_.text_hidden_dim;
+      const int N = ipadapter_num_tokens_;
+      const int text_tok = config_.text_seq_len;             // 77
+      const int ext_tok = text_tok + N;                      // 81
+      const int text_row = text_tok * dim, img_row = N * dim, ext_row = ext_tok * dim;
+      const __half* pos = ipadapter_tokens_pos_ ? ipadapter_tokens_pos_->data() : nullptr;
+      const __half* neg = ipadapter_tokens_neg_ ? ipadapter_tokens_neg_->data() : pos;
+      if(!pos)
+        throw std::runtime_error("IP-Adapter enabled but no image tokens set (set_ipadapter_tokens)");
+
+      CUDATensor<__half> ext_ehs((size_t)unet_batch_size * ext_row);
+      const bool full = (config_.guidance_scale > 1.0f && config_.cfg_type == 1);
+      const bool init = (config_.guidance_scale > 1.0f && config_.cfg_type == 3);
+      for(int r = 0; r < unet_batch_size; r++)
+      {
+        // text part (77) for this row.
+        cudaMemcpyAsync(ext_ehs.data() + (size_t)r * ext_row,
+                        unet_encoder_hidden_states_ptr + (size_t)r * text_row,
+                        text_row * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+        // image part (N): pick neg vs pos to match the row's text conditioning.
+        bool is_neg = full ? (r < total_batch) : (init ? (r == 0) : false);
+        const __half* img = is_neg ? neg : pos;
+        cudaMemcpyAsync(ext_ehs.data() + (size_t)r * ext_row + text_row, img,
+                        img_row * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+      }
+      int nlay = unet_->numIpLayers();
+      if(nlay <= 0) nlay = (int)ipadapter_scale_vec_.size();
+      unet_->forward_ipadapter(
+          unet_input_latent_fp32.data(), unet_input_timestep_ptr, ext_ehs.data(),
+          ipadapter_scale_vec_.data(), nlay,
+          unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
+          ext_tok, config_.text_hidden_dim, stream);
+    }
     else
     {
       unet_->forward(

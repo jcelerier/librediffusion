@@ -116,12 +116,25 @@ void UNetWrapper::loadEngine(const std::string& engine_path)
     for(int i = 0; i < eng->getNbIOTensors(); i++)
     {
       const char* tn = eng->getIOTensorName(i);
-      if(tn && std::string(tn) == "input_control_00")
+      if(!tn) continue;
+      std::string nm = tn;
+      if(nm == "input_control_00")
       {
         has_control_inputs_ = true;
         std::cout << "Note: engine is control-aware (input_control_* inputs) for " << engine_path
                   << std::endl;
-        break;
+      }
+      else if(nm == "ipadapter_scale" && eng->getTensorIOMode(tn) == nvinfer1::TensorIOMode::kINPUT)
+      {
+        has_ipadapter_ = true;
+        // The scale vector length = num IP layers. Its profile max gives the length (dynamic -1 dim).
+        nvinfer1::Dims d = eng->getTensorShape(tn);
+        if(d.nbDims == 1 && d.d[0] > 0)
+          num_ip_layers_ = (int)d.d[0];
+        // else dynamic: resolved from the caller's num_ip_layers at forward time.
+        std::cout << "Note: engine is IP-Adapter (ipadapter_scale input, "
+                  << (num_ip_layers_ ? std::to_string(num_ip_layers_) : std::string("dynamic"))
+                  << " layers) for " << engine_path << std::endl;
       }
     }
   }
@@ -389,6 +402,79 @@ void UNetWrapper::forward_controlnet(
 
   if(!context_->enqueueV3(stream))
     throw std::runtime_error("Failed to enqueue inference (controlnet UNet)");
+
+  cudaMemcpyAsync(output, output_buffer_->data(), output_size * sizeof(__half),
+                  cudaMemcpyDeviceToDevice, stream);
+}
+
+void UNetWrapper::forward_ipadapter(
+    const float* sample, const float* timestep, const __half* encoder_hidden_states,
+    const float* ipadapter_scale, int num_ip_layers,
+    __half* output, int batch, int height, int width, int seq_len, int hidden_dim,
+    cudaStream_t stream)
+{
+  int sample_size = batch * 4 * height * width;
+  int timestep_extent = (timestep_fixed_extent_ > 0) ? timestep_fixed_extent_ : batch;
+  int encoder_size = batch * seq_len * hidden_dim;  // seq_len = 77 + num_image_tokens (e.g. 81)
+  int output_size = batch * 4 * height * width;
+
+  bool needs_realloc = needsReallocation(batch, height, width, seq_len, hidden_dim);
+  if(needs_realloc)
+  {
+    sample_buffer_ = std::make_unique<CUDATensor<float>>(sample_size);
+    timestep_buffer_ = std::make_unique<CUDATensor<float>>(timestep_extent);
+    encoder_hidden_states_buffer_ = std::make_unique<CUDATensor<__half>>(encoder_size);
+    output_buffer_ = std::make_unique<CUDATensor<__half>>(output_size);
+    shape_cache_.batch = batch;
+    shape_cache_.height = height;
+    shape_cache_.width = width;
+    shape_cache_.seq_len = seq_len;
+    shape_cache_.hidden_dim = hidden_dim;
+    shape_cache_.initialized = true;
+  }
+  if(!ipadapter_scale_buffer_ || (int)ipadapter_scale_buffer_->size() < num_ip_layers)
+    ipadapter_scale_buffer_ = std::make_unique<CUDATensor<float>>(num_ip_layers);
+
+  cudaMemcpyAsync(sample_buffer_->data(), sample, sample_size * sizeof(float),
+                  cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(timestep_buffer_->data(), timestep, timestep_extent * sizeof(float),
+                  cudaMemcpyDeviceToDevice, stream);
+  cudaMemcpyAsync(encoder_hidden_states_buffer_->data(), encoder_hidden_states,
+                  encoder_size * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+  // ipadapter_scale is host-supplied (a small per-layer vector) -> H2D.
+  cudaMemcpyAsync(ipadapter_scale_buffer_->data(), ipadapter_scale, num_ip_layers * sizeof(float),
+                  cudaMemcpyHostToDevice, stream);
+  cudaStreamSynchronize(stream);
+
+  nvinfer1::Dims4 sample_dims{batch, 4, height, width};
+  nvinfer1::Dims timestep_dims; timestep_dims.nbDims = 1; timestep_dims.d[0] = timestep_extent;
+  nvinfer1::Dims3 hidden_states_dims{batch, seq_len, hidden_dim};
+  nvinfer1::Dims scale_dims; scale_dims.nbDims = 1; scale_dims.d[0] = num_ip_layers;
+  if(!context_->setInputShape("sample", sample_dims))
+    throw std::runtime_error("Failed to set sample shape");
+  if(!context_->setInputShape("timestep", timestep_dims))
+    throw std::runtime_error("Failed to set timestep shape");
+  if(!context_->setInputShape("encoder_hidden_states", hidden_states_dims))
+    throw std::runtime_error("Failed to set encoder_hidden_states shape");
+  if(!context_->setInputShape("ipadapter_scale", scale_dims))
+    throw std::runtime_error("Failed to set ipadapter_scale shape");
+
+  if(!context_->allInputDimensionsSpecified())
+    throw std::runtime_error("Not all input dimensions specified (IP-Adapter UNet)");
+
+  if(!context_->setTensorAddress("sample", sample_buffer_->data()))
+    throw std::runtime_error("Failed to set sample tensor address");
+  if(!context_->setTensorAddress("timestep", timestep_buffer_->data()))
+    throw std::runtime_error("Failed to set timestep tensor address");
+  if(!context_->setTensorAddress("encoder_hidden_states", encoder_hidden_states_buffer_->data()))
+    throw std::runtime_error("Failed to set encoder_hidden_states tensor address");
+  if(!context_->setTensorAddress("ipadapter_scale", ipadapter_scale_buffer_->data()))
+    throw std::runtime_error("Failed to set ipadapter_scale tensor address");
+  if(!context_->setTensorAddress("latent", output_buffer_->data()))
+    throw std::runtime_error("Failed to set latent tensor address");
+
+  if(!context_->enqueueV3(stream))
+    throw std::runtime_error("Failed to enqueue inference (IP-Adapter UNet)");
 
   cudaMemcpyAsync(output, output_buffer_->data(), output_size * sizeof(__half),
                   cudaMemcpyDeviceToDevice, stream);

@@ -459,6 +459,32 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_set_controlnet_scale(
     librediffusion_pipeline_handle pipeline, int index, float scale);
 
+/* IP-Adapter. The IP attention is BAKED into the UNet engine (an IP-variant unet.engine with a longer
+ * encoder_hidden_states seq + an ipadapter_scale input), auto-detected at init — no separate engine.
+ * Image tokens are computed HOST-SIDE (CLIP image encode + projection) and fed in (external). */
+
+/** Configure IP-Adapter defaults: num image tokens (4 base / 16 plus) + uniform per-layer scale. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_config_set_ipadapter(
+    librediffusion_config_handle config, int num_image_tokens, float scale);
+
+/** Set the host-computed image tokens: pos (required) + neg (optional, for the cfg uncond row; base
+ * IP-Adapter neg = projection of zeros). Each is a device fp16 tensor [num_tokens, dim]; dim must equal
+ * the UNet hidden dim. Concatenated onto the text tokens to form encoder_hidden_states each step. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_ipadapter_tokens(
+    librediffusion_pipeline_handle pipeline, const librediffusion_half_t* pos_tokens,
+    const librediffusion_half_t* neg_tokens, int num_tokens, int dim);
+
+/** Uniform IP-Adapter scale across all layers. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_ipadapter_scale(librediffusion_pipeline_handle pipeline, float scale);
+
+/** Per-layer IP-Adapter scale vector (length = num_ip_layers; for style/composition presets). */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_ipadapter_scale_vector(
+    librediffusion_pipeline_handle pipeline, const float* per_layer, int num_ip_layers);
+
 /**
  * Reseed the random number generator.
  *

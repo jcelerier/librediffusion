@@ -127,6 +127,24 @@ public:
   /// True if the loaded engine declares the input_control_* residual inputs (control-aware UNet).
   bool hasControlInputs() const { return has_control_inputs_; }
 
+  /// True if the loaded engine is an IP-Adapter variant (declares the `ipadapter_scale` input).
+  bool hasIpAdapter() const { return has_ipadapter_; }
+  /// Length of the ipadapter_scale vector (= num cross-attn IP layers), detected at load (0 if none).
+  int numIpLayers() const { return num_ip_layers_; }
+
+  /**
+   * Run UNet inference (SD1.5) for an IP-Adapter engine. Identical to forward() except:
+   *  - encoder_hidden_states is the EXTENDED sequence [batch, 77+num_image_tokens, hidden_dim] (text
+   *    tokens ++ image tokens, assembled by the caller); pass the full seq_len (e.g. 81).
+   *  - binds the `ipadapter_scale` fp32 vector [num_ip_layers] (per-layer decoupled-attn scale).
+   * The IP to_k_ip/to_v_ip + projection are baked into the engine; output is the usual single latent.
+   */
+  void forward_ipadapter(
+      const float* sample, const float* timestep, const __half* encoder_hidden_states,
+      const float* ipadapter_scale, int num_ip_layers,
+      __half* output, int batch, int height, int width, int seq_len, int hidden_dim,
+      cudaStream_t stream);
+
   /**
    * StreamV2V: Access attention output buffers for feature injection
    * Returns the 16 attention layer outputs from the last forward pass
@@ -183,6 +201,12 @@ private:
   bool has_control_inputs_ = false;
   std::vector<std::unique_ptr<CUDATensor<__half>>> control_down_buffers_;  // 12
   std::unique_ptr<CUDATensor<__half>> control_mid_buffer_;
+
+  // IP-Adapter: engine declares an `ipadapter_scale` fp32 vector input (+ a longer ehs seq). The IP
+  // attention is baked into the engine; we only bind the per-layer scale vector here.
+  bool has_ipadapter_ = false;
+  int num_ip_layers_ = 0;
+  std::unique_ptr<CUDATensor<float>> ipadapter_scale_buffer_;
 
   void loadEngine(const std::string& engine_path);
   bool needsReallocation(int batch, int height, int width, int seq_len, int hidden_dim, int pooled_dim = 0);

@@ -72,6 +72,20 @@ void LibreDiffusionPipeline::init_engines()
       controlnet_enabled_ = true;
     }
   }
+
+  // IP-Adapter: auto-enable when the UNet engine is an IP variant (declares ipadapter_scale). The image
+  // tokens are fed host-side via set_ipadapter_tokens; default the per-layer scale vector to a uniform
+  // config_.ipadapter_scale (length = the engine's num_ip_layers).
+  ipadapter_enabled_ = unet_->hasIpAdapter();
+  if(ipadapter_enabled_)
+  {
+    int n = unet_->numIpLayers();
+    if(n <= 0) n = 16;
+    ipadapter_scale_vec_.assign(n, config_.ipadapter_scale);
+    ipadapter_num_tokens_ = config_.ipadapter_num_tokens;
+    std::cout << "Note: IP-Adapter enabled (" << n << " layers, " << ipadapter_num_tokens_
+              << " image tokens)" << std::endl;
+  }
 }
 
 void LibreDiffusionPipeline::init_buffers()
