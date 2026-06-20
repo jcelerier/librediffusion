@@ -750,6 +750,55 @@ librediffusion_set_controlnet_scale(
   });
 }
 
+/* ---- IP-Adapter ---- */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_config_set_ipadapter(
+    librediffusion_config_handle config, int num_image_tokens, float scale)
+{
+  if (!config)
+    return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  return try_catch_wrapper([&]() {
+    config->cpp_config.ipadapter_num_tokens = num_image_tokens;
+    config->cpp_config.ipadapter_scale = scale;
+  });
+}
+
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_ipadapter_tokens(
+    librediffusion_pipeline_handle pipeline, const librediffusion_half_t* pos_tokens,
+    const librediffusion_half_t* neg_tokens, int num_tokens, int dim)
+{
+  if (!pipeline || !pipeline->cpp_pipeline)
+    return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  if (!pos_tokens)
+    return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  return try_catch_wrapper([&]() {
+    pipeline->cpp_pipeline->set_ipadapter_tokens(
+        to_half_ptr(pos_tokens), to_half_ptr(neg_tokens), num_tokens, dim);
+  });
+}
+
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_ipadapter_scale(librediffusion_pipeline_handle pipeline, float scale)
+{
+  if (!pipeline || !pipeline->cpp_pipeline)
+    return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  return try_catch_wrapper([&]() { pipeline->cpp_pipeline->set_ipadapter_scale(scale); });
+}
+
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_ipadapter_scale_vector(
+    librediffusion_pipeline_handle pipeline, const float* per_layer, int num_ip_layers)
+{
+  if (!pipeline || !pipeline->cpp_pipeline)
+    return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  if (!per_layer)
+    return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  return try_catch_wrapper([&]() {
+    pipeline->cpp_pipeline->set_ipadapter_scale_vector(per_layer, num_ip_layers);
+  });
+}
+
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_reseed(librediffusion_pipeline_handle pipeline, int64_t seed)
 {

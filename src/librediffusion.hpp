@@ -89,6 +89,12 @@ struct LibreDiffusionConfig
   };
   std::vector<ControlNetSpec> controlnets;
 
+  // IP-Adapter (baked into the UNet engine — an IP-variant unet.engine with a longer encoder_hidden_
+  // states seq + an ipadapter_scale input). Auto-detected from the engine; no separate path needed.
+  // Image tokens are computed HOST-SIDE and fed in via the C-API (external, like controlnet preproc).
+  int ipadapter_num_tokens = 4;       // image tokens appended to the 77 text tokens (4 base / 16 plus)
+  float ipadapter_scale = 1.0f;       // uniform per-layer scale (overridable per-layer via the C-API)
+
   std::vector<int> timestep_indices;
 
   // StreamV2V temporal coherence parameters
@@ -217,6 +223,14 @@ public:
   void set_controlnet_cond_rgba(int index, const uint8_t* cpu_rgba, int img_h, int img_w);
   // Live-adjust a net's conditioning scale (re-baked each step via the engine's scale input).
   void set_controlnet_scale(int index, float scale);
+
+  // IP-Adapter: set the host-computed image tokens (pos + optional neg), shape [num_tokens, dim] each
+  // (device fp16). dim must equal the UNet hidden dim. neg may be null (used for the cfg uncond row;
+  // base IP-Adapter neg = projection of zeros, supplied by the host).
+  void set_ipadapter_tokens(const __half* pos, const __half* neg, int num_tokens, int dim);
+  // Uniform scale across all IP layers; or a per-layer vector of length num_ip_layers.
+  void set_ipadapter_scale(float scale);
+  void set_ipadapter_scale_vector(const float* per_layer, int num_ip_layers);
 
   void reseed(int64_t seed);
 
@@ -419,6 +433,14 @@ public:
   std::vector<std::unique_ptr<CUDATensor<__half>>> controlnet_sum_down_;
   std::unique_ptr<CUDATensor<__half>> controlnet_sum_mid_;
   bool controlnet_enabled_ = false;
+
+  // IP-Adapter (baked UNet variant). Host-fed image tokens [num_tokens, dim] (pos + neg) + the per-layer
+  // scale vector. Enabled when the UNet engine declares ipadapter_scale (unet_->hasIpAdapter()).
+  bool ipadapter_enabled_ = false;
+  std::unique_ptr<CUDATensor<__half>> ipadapter_tokens_pos_;  // [num_tokens, dim]
+  std::unique_ptr<CUDATensor<__half>> ipadapter_tokens_neg_;  // [num_tokens, dim] (zeros-proj for base)
+  std::vector<float> ipadapter_scale_vec_;                    // host, length num_ip_layers
+  int ipadapter_num_tokens_ = 0;
 
   // StreamV2V temporal state
   TemporalState temporal_state_;
