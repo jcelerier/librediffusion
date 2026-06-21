@@ -13,6 +13,7 @@ name: CI
 on:
   push:
     branches: [ master, main, sdxl-prebuilt-timestep ]
+    tags: [ 'v*' ]
   pull_request:
   workflow_dispatch:
 
@@ -84,7 +85,15 @@ jobs:
           source /opt/rh/gcc-toolset-13/enable
           export PATH=/usr/local/cuda/bin:$PATH
           cmake --build build --target librediffusion -j"$(nproc)"
+          strip --strip-unneeded build/liblibrediffusion.so || true
           ls -la build/liblibrediffusion.so
+
+      - name: Upload library
+        uses: actions/upload-artifact@v4
+        with:
+          name: liblibrediffusion-linux-x86_64
+          path: build/liblibrediffusion.so
+          if-no-files-found: error
 
   windows:
     name: Windows (latest CUDA)
@@ -132,4 +141,45 @@ jobs:
 
       - name: Build (all CUDA arches)
         shell: pwsh
-        run: cmake --build build --config Release --target librediffusion -j
+        run: |
+          cmake --build build --config Release --target librediffusion -j
+          Get-ChildItem build\librediffusion.dll
+
+      - name: Upload library
+        uses: actions/upload-artifact@v4
+        with:
+          name: librediffusion-windows-x86_64
+          path: build/librediffusion.dll
+          if-no-files-found: error
+
+  release:
+    name: Release (attach binaries on tag)
+    needs: [ linux, windows ]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download built libraries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Zip per-platform bundles
+        run: |
+          set -eux
+          mkdir -p dist
+          # The library sits at the zip root: score extracts a "support" package into
+          # {RootPath}/support/librediffusion/, so the lib lands directly there.
+          (cd artifacts/liblibrediffusion-linux-x86_64 \
+             && zip -9 "$GITHUB_WORKSPACE/dist/x86_64-unknown-linux-gnu.zip" liblibrediffusion.so)
+          (cd artifacts/librediffusion-windows-x86_64 \
+             && zip -9 "$GITHUB_WORKSPACE/dist/x86_64-pc-windows-msvc.zip" librediffusion.dll)
+          ls -la dist
+
+      - name: Attach to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: dist/*.zip
+          tag: ${{ github.ref }}
+          overwrite: true
+          file_glob: true
