@@ -1243,6 +1243,42 @@ librediffusion_rife_interpolate_gpu(
     librediffusion_rife_handle h, const unsigned char* prev_rgba_dev,
     const unsigned char* cur_rgba_dev, int H, int W, unsigned char* out_frames_dev, int* out_count);
 
+/* ===================== img2img-turbo (pix2pix-turbo skip-VAE) =====================
+ * NOTE: "img2img-turbo" = the project github.com/GaParmar/img2img-turbo, NOT a generic SD-turbo
+ * img2img workflow (that is the ordinary librediffusion_img2img path). Distinct architecture below.
+ * SD-turbo one-step img2img with 4 VAE encoder->decoder skip connections (baked in the engines).
+ * forward() pointers are DEVICE fp32. Feed the CLIP text embedding as ehs[1,77,1024] (1024 = SD2.1
+ * cross-attn width); for the CycleGAN models this is a baked per-direction constant. */
+typedef struct librediffusion_img2img_turbo* librediffusion_img2img_turbo_handle;
+
+LIBREDIFFUSION_API librediffusion_img2img_turbo_handle LIBREDIFFUSION_CALL
+librediffusion_img2img_turbo_create(
+    const char* unet_engine, const char* vae_encoder_engine, const char* vae_decoder_engine);
+
+LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
+librediffusion_img2img_turbo_destroy(librediffusion_img2img_turbo_handle h);
+
+/* image_dev[1,3,512,512], ehs_dev[1,77,1024] -> out_dev[1,3,512,512] in [-1,1]. All DEVICE fp32. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_img2img_turbo_forward(
+    librediffusion_img2img_turbo_handle h, const void* image_dev, const void* ehs_dev, void* out_dev,
+    librediffusion_stream_t stream);
+
+/* HOST-bytes convenience (mirrors flux2_stream_frame): RGBA8 [H,W,4] in + host ehs[1,77,1024]
+ * -> RGBA8 [H,W,4] out. Does all host<->device copies + RGBA<->CHW conversion internally, so callers
+ * with no CUDA (e.g. the score node) only pass plain byte/float buffers. Model is static 512x512. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_img2img_turbo_frame(
+    librediffusion_img2img_turbo_handle h, const unsigned char* in_rgba, const float* ehs,
+    unsigned char* out_rgba);
+
+/* Like _frame but ehs is a DEVICE fp16 [1,77,1024] (e.g. straight from clip_compute_embeddings);
+ * converted to fp32 internally. Image is still HOST RGBA8 [H,W,4] in/out. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_img2img_turbo_frame_dev(
+    librediffusion_img2img_turbo_handle h, const unsigned char* in_rgba,
+    const librediffusion_half_t* ehs_dev, unsigned char* out_rgba);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

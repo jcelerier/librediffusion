@@ -1206,6 +1206,48 @@ void launch_rgb_to_rgba_denormalized_fp32(
         (const float*)rgb_in, (uint8_t*)rgba_out, n, h, w);
 }
 
+// ===== img2img-turbo host<->device image conversions (fp32, channels-first) =====
+// RGBA8 NHWC [H,W,4] -> RGB fp32 CHW [3,H,W] in [0,1] (ToTensor: /255, alpha dropped).
+__global__ void k_rgba_to_chw01_f32(const uint8_t* rgba, float* chw, int H, int W)
+{
+    long total = (long)H * W;
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= total) return;
+    for(int c = 0; c < 3; ++c)
+        chw[(long)c * total + idx] = float(rgba[idx * 4 + c]) * (1.0f / 255.0f);
+}
+void launch_rgba_to_chw01_f32(const void* rgba, void* chw, int H, int W, void* stream_ptr)
+{
+    cudaStream_t s = (cudaStream_t)stream_ptr;
+    long total = (long)H * W;
+    int t = 256;
+    int b = (int)((total + t - 1) / t);
+    k_rgba_to_chw01_f32<<<b, t, 0, s>>>((const uint8_t*)rgba, (float*)chw, H, W);
+}
+
+// RGB fp32 CHW [3,H,W] in [-1,1] -> RGBA8 NHWC [H,W,4] (clamped, alpha=255).
+__global__ void k_chw_m1p1_to_rgba_f32(const float* chw, uint8_t* rgba, int H, int W)
+{
+    long total = (long)H * W;
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= total) return;
+    for(int c = 0; c < 3; ++c)
+    {
+        float v = (chw[(long)c * total + idx] * 0.5f + 0.5f) * 255.0f;
+        v = v < 0.f ? 0.f : (v > 255.f ? 255.f : v);
+        rgba[idx * 4 + c] = (uint8_t)(v + 0.5f);
+    }
+    rgba[idx * 4 + 3] = 255;
+}
+void launch_chw_m1p1_to_rgba_f32(const void* chw, void* rgba, int H, int W, void* stream_ptr)
+{
+    cudaStream_t s = (cudaStream_t)stream_ptr;
+    long total = (long)H * W;
+    int t = 256;
+    int b = (int)((total + t - 1) / t);
+    k_chw_m1p1_to_rgba_f32<<<b, t, 0, s>>>((const float*)chw, (uint8_t*)rgba, H, W);
+}
+
 void launch_rgb_to_rgba_denormalized_fp16(
     const void* rgb_in,
     void* rgba_out,
@@ -1219,4 +1261,25 @@ void launch_rgb_to_rgba_denormalized_fp16(
 
     rgb_to_rgba_denormalized_fp16_kernel<<<grid_size, block_size, 0, stream>>>(
         (const __half*)rgb_in, (uint8_t*)rgba_out, n, h, w);
+}
+
+// ===== img2img-turbo: closed-form 1-step DDPM x0 reconstruction =====
+// x0 = (latent - sqrt(1-acp)*model_pred) / sqrt(acp)   (DDPMScheduler.step at t=999, single step).
+__global__ void k_ddpm_1step_x0(
+    const float* latent, const float* model_pred, float sqrt_acp, float sqrt_1macp, long N, float* out)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < N)
+        out[i] = (latent[i] - sqrt_1macp * model_pred[i]) / sqrt_acp;
+}
+
+void launch_ddpm_1step_x0(
+    const float* latent, const float* model_pred, float acp, long N, float* out, void* stream_ptr)
+{
+    if(N <= 0) return;
+    cudaStream_t s = (cudaStream_t)stream_ptr;
+    int threads = 256;
+    int blocks = (int)((N + threads - 1) / threads);
+    k_ddpm_1step_x0<<<blocks, threads, 0, s>>>(
+        latent, model_pred, sqrtf(acp), sqrtf(1.0f - acp), N, out);
 }
