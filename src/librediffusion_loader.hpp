@@ -203,6 +203,16 @@ public:
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, rife_interpolate_gpu);
 
   /*=========================================================================*/
+  /* img2img-turbo (pix2pix-turbo skip-VAE, github.com/GaParmar/img2img-turbo)*/
+  /*=========================================================================*/
+
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, img2img_turbo_create);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, img2img_turbo_destroy);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, img2img_turbo_forward);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, img2img_turbo_frame);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, img2img_turbo_frame_dev);
+
+  /*=========================================================================*/
   /* Utility Functions                                                       */
   /*=========================================================================*/
 
@@ -473,6 +483,16 @@ private:
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_get_interpolation_exp);
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_interpolate);
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_interpolate_gpu);
+
+    /*=====================================================================*/
+    /* img2img-turbo (pix2pix-turbo skip-VAE)                              */
+    /*=====================================================================*/
+
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_create);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_destroy);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_forward);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_frame);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_frame_dev);
 
     /*=====================================================================*/
     /* Utility Functions                                                   */

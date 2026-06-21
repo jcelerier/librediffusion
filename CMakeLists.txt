@@ -156,7 +156,10 @@ add_library(librediffusion SHARED
     src/librediffusion.rife.hpp
     src/librediffusion_c.rife.cpp
     src/librediffusion_c.flux2.cpp
-    src/cuda_tensor.hpp 
+    src/librediffusion.img2img_turbo.cpp
+    src/librediffusion.img2img_turbo.hpp
+    src/librediffusion_c.img2img_turbo.cpp
+    src/cuda_tensor.hpp
     src/cuda_tensor.cpp
     src/pcg.hpp
 

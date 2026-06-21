@@ -48,6 +48,7 @@ dependencies = [
     "transformers>=5.10",
     "opencv-python-headless>=4.13.0.92",
     "controlnet-aux>=0.0.10",
+    "fire>=0.7.1",
 ]
 
 [[tool.uv.index]]

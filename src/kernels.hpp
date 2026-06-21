@@ -134,6 +134,11 @@ void launch_rgb_to_rgba_denormalized_fp16(
     int n, int h, int w,
     void* stream_ptr);
 
+// img2img-turbo host<->device image conversions (fp32, channels-first):
+// RGBA8 NHWC [H,W,4] -> RGB fp32 CHW [3,H,W] in [0,1]; and CHW [-1,1] -> RGBA8 (alpha=255).
+void launch_rgba_to_chw01_f32(const void* rgba, void* chw, int H, int W, void* stream_ptr);
+void launch_chw_m1p1_to_rgba_f32(const void* chw, void* rgba, int H, int W, void* stream_ptr);
+
 // ===== FLUX.2-klein-4B kernels (bf16) =====
 void launch_klein_stack3_7680(
     const void* l0, const void* l1, const void* l2, void* out, int B, int Lt, int D, void* stream_ptr);
@@ -187,3 +192,7 @@ inline void launch_concat(
     offset += input_byte_sizes[i];
   }
 }
+
+// img2img-turbo: closed-form 1-step DDPM x0 = (latent - sqrt(1-acp)*model_pred)/sqrt(acp). All DEVICE fp32.
+void launch_ddpm_1step_x0(
+    const float* latent, const float* model_pred, float acp, long N, float* out, void* stream_ptr);
