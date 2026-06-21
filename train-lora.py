@@ -125,8 +125,10 @@ class LoraSpec:
 
 def parse_args():
     p = argparse.ArgumentParser(description="Export TensorRT engines (daydream API) for the C++ engine")
-    p.add_argument("-t", "--type", choices=["sd15", "sdxl", "klein"], default="sd15",
-                   help="sd15/sdxl: this script's native diffusers export. klein: FLUX.2-klein-4B "
+    p.add_argument("-t", "--type", choices=["sd15", "sdxl", "klein", "img2img-turbo"], default="sd15",
+                   help="sd15/sdxl: this script's native diffusers export. img2img-turbo: GaParmar "
+                        "pix2pix-turbo skip-VAE (1-step, sd-turbo base; --model = a pretrained name "
+                        "like edge_to_image, or a path to a *.pkl). klein: FLUX.2-klein-4B "
                         "(dispatches to the vendored klein export scripts in ./klein/; needs the "
                         "unified venv with diffusers Flux2 + nvidia-modelopt).")
     p.add_argument("--klein-scripts-dir",
@@ -319,10 +321,95 @@ def write_manifest(out_dir, meta, list_engines_dir=None):
     print(f"  wrote {path}")
 
 
+def export_img2img_turbo(args):
+    """GaParmar img2img-turbo (pix2pix-turbo) export -> a COMPLETE bundle:
+        <out>/unet.engine          latent[1,4,h,w], ehs[1,77,1024] -> model_pred (t=999 baked)
+        <out>/vae_encoder.engine   image -> latent + enc0..enc3 skips      (skip-VAE encoder)
+        <out>/vae_decoder.engine   latent_scaled + s0..s3 (skips) -> image (skip-VAE decoder)
+        <out>/clip.engine          sd-turbo CLIPTextModel (1024-dim, last_hidden_state)
+
+    The skip-VAE engines come from the vendored img2img_turbo package (raw TRT, static). CLIP reuses
+    the shared compile_clip so the C++ node's prompt path (clip_compute_embeddings) is satisfied —
+    sd-turbo's text encoder is a plain CLIPTextModel (penultimate=False: pix2pix uses last_hidden_state).
+    """
+    from img2img_turbo.export import load_model, export_onnx, build_engines
+
+    out = os.path.abspath(args.output)
+    os.makedirs(out, exist_ok=True)
+    res = args.opt_width
+    if args.opt_width != args.opt_height:
+        raise SystemExit(f"img2img-turbo engines are square; got {args.opt_width}x{args.opt_height}")
+
+    # --model selects the pretrained variant: a known name (edge_to_image / sketch_to_image_stochastic)
+    # or a path to a trained *.pkl. The default --model (an HF repo id) is meaningless here -> edge_to_image.
+    KNOWN = ("edge_to_image", "sketch_to_image_stochastic")
+    if args.model in KNOWN:
+        pretrained_name, pretrained_path = args.model, None
+    elif os.path.exists(args.model):
+        pretrained_name, pretrained_path = None, args.model
+    else:
+        print(f"[img2img-turbo] --model '{args.model}' not a known name or a path; using edge_to_image")
+        pretrained_name, pretrained_path = "edge_to_image", None
+
+    print(f"[img2img-turbo] model={pretrained_name or pretrained_path} res={res} hw_compat={args.hw_compat} -> {out}")
+    # ckpt + onnx dirs live OUTSIDE --output: daydream's compile_clip post-build cleanup os.remove()s
+    # every non-.engine entry in the engine dir and chokes on a subdirectory.
+    model = load_model(pretrained_name, pretrained_path,
+                       ckpt_folder=out.rstrip("/") + "_checkpoints-img2img-turbo")
+
+    onnx_dir = out.rstrip("/") + "_onnx-img2img-turbo"
+    export_onnx(model, onnx_dir, res)
+    build_engines(onnx_dir, out, res, hw_compat=args.hw_compat,
+                  builder_optimization_level=args.builder_optimization_level)
+
+    # CLIP engine (the gap that made standalone img2img-turbo bundles incomplete). sd-turbo text encoder
+    # = CLIPTextModel, last_hidden_state -> penultimate=False. Build static (batch 1), matching the engines.
+    clip_dim = model.text_encoder.config.hidden_size  # 1024 (sd-turbo / SD2.1 text encoder)
+    onnx_clip_dir = out.rstrip("/") + "_onnx-img2img-turbo-clip"
+    os.makedirs(onnx_clip_dir, exist_ok=True)
+    clip_build_opts = {
+        "opt_image_height": res, "opt_image_width": res,
+        "min_image_resolution": res, "max_image_resolution": res,
+        "min_image_height": res, "max_image_height": res,
+        "min_image_width": res, "max_image_width": res,
+        "build_static_batch": True, "build_dynamic_shape": False,
+        "builder_optimization_level": args.builder_optimization_level,
+        "hardware_compatibility": args.hw_compat,
+    }
+    clip_model = CLIP(device=torch.device("cuda"), max_batch_size=1, min_batch_size=1,
+                      embedding_dim=clip_dim)
+    o = create_onnx_path("clip", onnx_clip_dir, opt=False)
+    oo = create_onnx_path("clip", onnx_clip_dir, opt=True)
+    compile_clip(model.text_encoder, clip_model, o, oo, f"{out}/clip.engine",
+                 opt_batch_size=1, engine_build_options=clip_build_opts,
+                 output_hidden_states=False, penultimate=False)
+
+    write_manifest(out, {
+        "model_type": "img2img-turbo",
+        "model_family": "sd",
+        "base_model": "stabilityai/sd-turbo",
+        "variant": pretrained_name or os.path.basename(args.model),
+        "embedding_dim": clip_dim,
+        "resolution": {"width": res, "height": res},
+        "denoising_steps": 1,
+        "precision": "fp16",
+        "features": {"controlnet": False, "ipadapter": False, "v2v": False, "rife": False,
+                     "skip_vae": True},
+    })
+    print(f"\n[img2img-turbo] DONE. Bundle at {out}:")
+    for f in sorted(os.listdir(out)):
+        if f.endswith(".engine"):
+            sz = os.path.getsize(os.path.join(out, f)) / (1024 * 1024)
+            print(f"  {f}  ({sz:.0f} MB)")
+
+
 def main():
     args = parse_args()
     if args.type == "klein":
         export_klein(args)
+        return
+    if args.type == "img2img-turbo":
+        export_img2img_turbo(args)
         return
     device = torch.device("cuda")
     dtype = torch.float16
