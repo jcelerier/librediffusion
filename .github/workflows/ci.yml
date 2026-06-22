@@ -177,7 +177,7 @@ jobs:
           stage_toolchain() {
             local dest="$1"
             for p in train-lora.py pyproject.toml uv.lock README.md LICENSE \
-                     src klein img2img_turbo tools; do
+                     src tools; do
               [ -e "$p" ] && cp -r "$p" "$dest"/
             done
           }

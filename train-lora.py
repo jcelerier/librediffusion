@@ -129,10 +129,11 @@ def parse_args():
                    help="sd15/sdxl: this script's native diffusers export. img2img-turbo: GaParmar "
                         "pix2pix-turbo skip-VAE (1-step, sd-turbo base; --model = a pretrained name "
                         "like edge_to_image, or a path to a *.pkl). klein: FLUX.2-klein-4B "
-                        "(dispatches to the vendored klein export scripts in ./klein/; needs the "
-                        "unified venv with diffusers Flux2 + nvidia-modelopt).")
+                        "(dispatches to the vendored klein export scripts in ./src/streamdiffusion/klein/; "
+                        "needs the unified venv with diffusers Flux2 + nvidia-modelopt).")
     p.add_argument("--klein-scripts-dir",
-                   default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "klein"),
+                   default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "src", "streamdiffusion", "klein"),
                    help="dir holding export_klein.py / build_klein_engines.py / export_klein_fp8_calib.py")
     p.add_argument("--klein-quality", choices=["speed", "quality", "both"], default="both",
                    help="klein only: speed=fp8_calib transformer, quality=bf16, both")
@@ -332,7 +333,7 @@ def export_img2img_turbo(args):
     the shared compile_clip so the C++ node's prompt path (clip_compute_embeddings) is satisfied —
     sd-turbo's text encoder is a plain CLIPTextModel (penultimate=False: pix2pix uses last_hidden_state).
     """
-    from img2img_turbo.export import load_model, export_onnx, build_engines
+    from streamdiffusion.img2img_turbo.export import load_model, export_onnx, build_engines
 
     out = os.path.abspath(args.output)
     os.makedirs(out, exist_ok=True)
