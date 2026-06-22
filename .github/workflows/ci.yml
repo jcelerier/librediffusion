@@ -158,21 +158,36 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
+      - name: Checkout source (Python export toolchain)
+        uses: actions/checkout@v4
+
       - name: Download built libraries
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Zip per-platform bundles
+      - name: Assemble per-platform bundles
         run: |
           set -eux
-          mkdir -p dist
-          # The library sits at the zip root: score extracts a "support" package into
-          # {RootPath}/support/librediffusion/, so the lib lands directly there.
-          (cd artifacts/liblibrediffusion-linux-x86_64 \
-             && zip -9 "$GITHUB_WORKSPACE/dist/x86_64-unknown-linux-gnu.zip" liblibrediffusion.so)
-          (cd artifacts/librediffusion-windows-x86_64 \
-             && zip -9 "$GITHUB_WORKSPACE/dist/x86_64-pc-windows-msvc.zip" librediffusion.dll)
+          # Everything is laid out FLAT (no version-named top directory) so the "support"
+          # package always extracts to the same {RootPath}/support/librediffusion folder,
+          # regardless of release. Each bundle = the platform library + the (platform-
+          # independent) Python export toolchain needed to build engines with train-lora.py.
+          mkdir -p stage/linux stage/windows dist
+          stage_toolchain() {
+            local dest="$1"
+            for p in train-lora.py pyproject.toml uv.lock README.md LICENSE \
+                     src klein img2img_turbo tools; do
+              [ -e "$p" ] && cp -r "$p" "$dest"/
+            done
+          }
+          stage_toolchain stage/linux
+          stage_toolchain stage/windows
+          cp artifacts/liblibrediffusion-linux-x86_64/liblibrediffusion.so stage/linux/
+          cp artifacts/librediffusion-windows-x86_64/librediffusion.dll    stage/windows/
+          # Zip the directory CONTENTS so the library + toolchain sit at the zip root.
+          (cd stage/linux   && zip -9 -r "$GITHUB_WORKSPACE/dist/x86_64-unknown-linux-gnu.zip" .)
+          (cd stage/windows && zip -9 -r "$GITHUB_WORKSPACE/dist/x86_64-pc-windows-msvc.zip" .)
           ls -la dist
 
       - name: Attach to release
