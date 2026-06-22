@@ -13,6 +13,7 @@ name: CI
 on:
   push:
     branches: [ master, main, sdxl-prebuilt-timestep ]
+    tags: [ 'v*' ]
   pull_request:
   workflow_dispatch:
 
@@ -84,7 +85,15 @@ jobs:
           source /opt/rh/gcc-toolset-13/enable
           export PATH=/usr/local/cuda/bin:$PATH
           cmake --build build --target librediffusion -j"$(nproc)"
+          strip --strip-unneeded build/liblibrediffusion.so || true
           ls -la build/liblibrediffusion.so
+
+      - name: Upload library
+        uses: actions/upload-artifact@v4
+        with:
+          name: liblibrediffusion-linux-x86_64
+          path: build/liblibrediffusion.so
+          if-no-files-found: error
 
   windows:
     name: Windows (latest CUDA)
@@ -132,4 +141,60 @@ jobs:
 
       - name: Build (all CUDA arches)
         shell: pwsh
-        run: cmake --build build --config Release --target librediffusion -j
+        run: |
+          cmake --build build --config Release --target librediffusion -j
+          Get-ChildItem build\librediffusion.dll
+
+      - name: Upload library
+        uses: actions/upload-artifact@v4
+        with:
+          name: librediffusion-windows-x86_64
+          path: build/librediffusion.dll
+          if-no-files-found: error
+
+  release:
+    name: Release (attach binaries on tag)
+    needs: [ linux, windows ]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout source (Python export toolchain)
+        uses: actions/checkout@v4
+
+      - name: Download built libraries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble per-platform bundles
+        run: |
+          set -eux
+          # Everything is laid out FLAT (no version-named top directory) so the "support"
+          # package always extracts to the same {RootPath}/support/librediffusion folder,
+          # regardless of release. Each bundle = the platform library + the (platform-
+          # independent) Python export toolchain needed to build engines with train-lora.py.
+          mkdir -p stage/linux stage/windows dist
+          stage_toolchain() {
+            local dest="$1"
+            for p in train-lora.py pyproject.toml uv.lock README.md LICENSE \
+                     src klein img2img_turbo tools; do
+              [ -e "$p" ] && cp -r "$p" "$dest"/
+            done
+          }
+          stage_toolchain stage/linux
+          stage_toolchain stage/windows
+          cp artifacts/liblibrediffusion-linux-x86_64/liblibrediffusion.so stage/linux/
+          cp artifacts/librediffusion-windows-x86_64/librediffusion.dll    stage/windows/
+          # Zip the directory CONTENTS so the library + toolchain sit at the zip root.
+          (cd stage/linux   && zip -9 -r "$GITHUB_WORKSPACE/dist/x86_64-unknown-linux-gnu.zip" .)
+          (cd stage/windows && zip -9 -r "$GITHUB_WORKSPACE/dist/x86_64-pc-windows-msvc.zip" .)
+          ls -la dist
+
+      - name: Attach to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: dist/*.zip
+          tag: ${{ github.ref }}
+          overwrite: true
+          file_glob: true
