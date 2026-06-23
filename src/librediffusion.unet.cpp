@@ -1371,6 +1371,20 @@ uint64_t LibreDiffusionPipeline::capture_signature() const
   if(predict_x0_batch_unet_output) h = mix(h, ptr(predict_x0_batch_unet_output->data()));
   if(predict_x0_batch_model_pred) h = mix(h, ptr(predict_x0_batch_model_pred->data()));
   if(predict_x0_batch_denoised) h = mix(h, ptr(predict_x0_batch_denoised->data()));
+  // Conditioning + scheduler buffers the captured body memcpy's from BY ADDRESS (prompt/negative embeds,
+  // SDXL pooled text_embeds/time_ids, sub_timesteps + scheduler coeffs). The prepare_* now reuse these
+  // in place for a fixed shape (stable address -> no recapture on a live prompt/timestep edit), but a
+  // genuine shape change moves them -> a changed signature -> recapture, which is the correct response.
+  // Hashing them here is belt-and-suspenders against any path that reallocates without invalidating.
+  if(prompt_embeds_) h = mix(h, ptr(prompt_embeds_->data()));
+  if(negative_embeds_) h = mix(h, ptr(negative_embeds_->data()));
+  if(text_embeds_) h = mix(h, ptr(text_embeds_->data()));
+  if(time_ids_) h = mix(h, ptr(time_ids_->data()));
+  if(sub_timesteps_) h = mix(h, ptr(sub_timesteps_->data()));
+  if(alpha_prod_t_sqrt_) h = mix(h, ptr(alpha_prod_t_sqrt_->data()));
+  if(beta_prod_t_sqrt_) h = mix(h, ptr(beta_prod_t_sqrt_->data()));
+  if(c_skip_) h = mix(h, ptr(c_skip_->data()));
+  if(c_out_) h = mix(h, ptr(c_out_->data()));
   if(ip_ext_ehs_) h = mix(h, ptr(ip_ext_ehs_->data()));
   // IP token source buffers: the captured body memcpy's from these into ip_ext_ehs_, so a moved
   // address (set_ipadapter_tokens/_image reallocating) must force a recapture. Grow-only allocation

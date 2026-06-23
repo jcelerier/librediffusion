@@ -101,12 +101,22 @@ void LibreDiffusionPipeline::prepare_scheduler(
   c_skip_host_.assign(c_skip.begin(), c_skip.end());
   c_out_host_.assign(c_out.begin(), c_out.end());
 
-  // Allocate and copy scheduler parameters
-  alpha_prod_t_sqrt_ = std::make_unique<CUDATensor<float>>(config_.denoising_steps);
-  beta_prod_t_sqrt_ = std::make_unique<CUDATensor<float>>(config_.denoising_steps);
-  c_skip_ = std::make_unique<CUDATensor<float>>(config_.denoising_steps);
-  c_out_ = std::make_unique<CUDATensor<float>>(config_.denoising_steps);
-  sub_timesteps_ = std::make_unique<CUDATensor<float>>(config_.denoising_steps);
+  // Allocate and copy scheduler parameters. Grow-only / in-place: the captured 1-step CUDA graph reads
+  // sub_timesteps_ (and the scheduler step reads the coeff buffers) BY ADDRESS, and capture_signature()
+  // does NOT hash them. A live timesteps edit calls this every change; reallocating would move the
+  // device address and the replayed graph would read a stale/freed buffer -> "any change randomly breaks"
+  // (random because cudaFree+cudaMalloc may reuse the address). Reuse when the step count is unchanged
+  // (no recapture) and only (re)allocate + invalidate the graph on a size change. See reuse_or_realloc
+  // in librediffusion.embeddings.cpp and the set_controlnet_cond fix.
+  const size_t nsteps = (size_t)config_.denoising_steps;
+  auto reuse = [&](std::unique_ptr<CUDATensor<float>>& b) {
+    if(!b || b->size() != nsteps) { b = std::make_unique<CUDATensor<float>>(nsteps); graph_ready_ = false; }
+  };
+  reuse(alpha_prod_t_sqrt_);
+  reuse(beta_prod_t_sqrt_);
+  reuse(c_skip_);
+  reuse(c_out_);
+  reuse(sub_timesteps_);
 
   // Copy scheduler parameters to device
 
