@@ -147,6 +147,10 @@ def parse_args():
     p.add_argument("-o", "--output", default="./engines")
     p.add_argument("-l", "--lora", action="append", dest="loras", default=[], metavar="PATH[:WEIGHT]")
     p.add_argument("--lora-scale", type=float, default=1.0)
+    p.add_argument("--no-fuse-lora", action="store_true",
+                   help="EXPERIMENT: keep the LoRA active as graph ops (unfused) instead of fusing it "
+                        "into the weights. The trace then emits lora_A/lora_B matmuls (scale baked at "
+                        "1.0) — the basis for a runtime lora_scale engine input.")
     # ControlNet: when set, ALSO export a controlnet.engine (the ControlNet model) AND a
     # controlnet-variant unet.engine that has the input_control_NN / input_control_middle residual
     # inputs (ControlNetUNetExportWrapper). The C++ pipeline runs the controlnet engine, then feeds its
@@ -430,9 +434,12 @@ def main():
         else:
             stream.load_lora(spec.path)
         print(f"Loaded LoRA: {spec.path} (weight_name={spec.weight_name}, scale {args.lora_scale})")
-    if args.lora_specs:
+    if args.lora_specs and not args.no_fuse_lora:
         stream.fuse_lora(fuse_unet=True, fuse_text_encoder=True, lora_scale=args.lora_scale,
                          safe_fusing=False)
+    elif args.lora_specs and args.no_fuse_lora:
+        # Leave the adapter active (default scale 1.0) so the ONNX trace captures lora_A/lora_B as ops.
+        print("[no-fuse-lora] LoRA kept UNFUSED (graph ops, scale=1.0) — runtime-scale experiment")
 
     # TinyVAE (matches the original + what the C++ engine expects).
     taesd = "madebyollin/taesdxl" if is_sdxl else "madebyollin/taesd"
