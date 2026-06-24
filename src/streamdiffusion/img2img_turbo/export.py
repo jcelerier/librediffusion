@@ -98,8 +98,12 @@ class DecoderExport(torch.nn.Module):
 
 
 def _onnx_export(mod, args_tuple, names_in, names_out, path, dynamic=None):
+    # Force the legacy TorchScript exporter (dynamo=False): torch>=2.9 defaults torch.onnx.export to the
+    # dynamo/torch.export path, which is stricter and fails to trace some pix2pix-turbo UNets (e.g.
+    # sketch_to_image_stochastic -> "unsupported operand -: int and NoneType"). The TorchScript path
+    # handles them and is what the edge_to_image bundle was built with.
     torch.onnx.export(mod, args_tuple, path, input_names=names_in, output_names=names_out,
-                      dynamic_axes=dynamic, opset_version=17, do_constant_folding=True)
+                      dynamic_axes=dynamic, opset_version=17, do_constant_folding=True, dynamo=False)
     print(f"  wrote {path}")
 
 
@@ -182,5 +186,12 @@ def load_model(pretrained_name, pretrained_path, ckpt_folder):
                       ckpt_folder=ckpt_folder)
     m.set_eval()
     fuse_loras(m.unet, m.vae)
+    # Stochastic variants (e.g. sketch_to_image_stochastic) replace unet.conv_in with a TwinConv that
+    # blends a pretrained and a trained conv by a runtime ratio `r` (default None -> crashes export).
+    # Bake r=1.0: at r=1 the model collapses to the deterministic skip-VAE flow our pipeline implements
+    # (unet_input = encoded_control*r + noise_map*(1-r) = encoded_control; TwinConv -> the trained conv;
+    # LoRA already fused at 1.0; VAE skip gamma baked at 1.0). Harmless no-op for non-TwinConv models.
+    if hasattr(m.unet, "conv_in") and hasattr(m.unet.conv_in, "r"):
+        m.unet.conv_in.r = 1.0
     m.unet.eval(); m.vae.eval()
     return m
