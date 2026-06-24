@@ -1385,6 +1385,9 @@ uint64_t LibreDiffusionPipeline::capture_signature() const
   if(beta_prod_t_sqrt_) h = mix(h, ptr(beta_prod_t_sqrt_->data()));
   if(c_skip_) h = mix(h, ptr(c_skip_->data()));
   if(c_out_) h = mix(h, ptr(c_out_->data()));
+  // Runtime-LoRA lora_scale buffer (the captured UNet enqueue reads it). Grow-only -> stable address;
+  // set_lora_scale forces a recapture on a VALUE change (the staged H2D contents are baked into the graph).
+  if(unet_ && unet_->loraScaleBufferAddr()) h = mix(h, ptr(unet_->loraScaleBufferAddr()));
   if(ip_ext_ehs_) h = mix(h, ptr(ip_ext_ehs_->data()));
   // IP token source buffers: the captured body memcpy's from these into ip_ext_ehs_, so a moved
   // address (set_ipadapter_tokens/_image reallocating) must force a recapture. Grow-only allocation

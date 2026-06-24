@@ -879,6 +879,33 @@ librediffusion_set_ipadapter_scale_vector(
   });
 }
 
+LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+librediffusion_num_runtime_loras(librediffusion_pipeline_handle pipeline)
+{
+  if (!pipeline || !pipeline->cpp_pipeline)
+    return 0;
+  return pipeline->cpp_pipeline->num_runtime_loras();
+}
+
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_lora_scale(librediffusion_pipeline_handle pipeline, int idx, float scale)
+{
+  if (!pipeline || !pipeline->cpp_pipeline)
+    return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  return try_catch_wrapper([&]() { pipeline->cpp_pipeline->set_lora_scale(idx, scale); });
+}
+
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_lora_scale_vector(
+    librediffusion_pipeline_handle pipeline, const float* scales, int n)
+{
+  if (!pipeline || !pipeline->cpp_pipeline)
+    return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  if (!scales)
+    return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  return try_catch_wrapper([&]() { pipeline->cpp_pipeline->set_lora_scale_vector(scales, n); });
+}
+
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_reseed(librediffusion_pipeline_handle pipeline, int64_t seed)
 {

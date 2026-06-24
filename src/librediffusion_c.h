@@ -535,6 +535,19 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_set_ipadapter_scale_vector(
     librediffusion_pipeline_handle pipeline, const float* per_layer, int num_ip_layers);
 
+/** Runtime LoRA: number of lora_scale slots the loaded UNet engine declares (0 if none). Slot order =
+ *  the order of the PATH:runtime LoRAs at export time (also in bundle.json lora_runtime_slots). */
+LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+librediffusion_num_runtime_loras(librediffusion_pipeline_handle pipeline);
+
+/** Set the runtime scale of LoRA slot `idx` (0..N-1). 1.0 = fully on (== a baked engine), 0.0 = off. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_lora_scale(librediffusion_pipeline_handle pipeline, int idx, float scale);
+
+/** Set all runtime LoRA scales at once (length n = num_runtime_loras). */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_set_lora_scale_vector(librediffusion_pipeline_handle pipeline, const float* scales, int n);
+
 /**
  * Reseed the random number generator.
  *
