@@ -255,4 +255,27 @@ void LibreDiffusionPipeline::set_ipadapter_scale_vector(const float* per_layer, 
   ipadapter_scale_vec_.assign(per_layer, per_layer + num_ip_layers);
 }
 
+int LibreDiffusionPipeline::num_runtime_loras() const
+{
+  return unet_ ? unet_->numRuntimeLoras() : 0;
+}
+
+void LibreDiffusionPipeline::set_lora_scale(int idx, float scale)
+{
+  if(unet_)
+    unet_->setLoraScale(idx, scale);
+  // The captured 1-step CUDA graph bakes the lora_scale H2D (contents staged before enqueue). A value
+  // change must re-stage -> force a recapture (the buffer address is stable + hashed in capture_signature,
+  // so a no-op set leaves the graph intact). Same discipline as a prompt/scheduler change.
+  graph_ready_ = false;
+}
+
+void LibreDiffusionPipeline::set_lora_scale_vector(const float* scales, int n)
+{
+  if(unet_)
+    for(int i = 0; i < n; i++)
+      unet_->setLoraScale(i, scales[i]);
+  graph_ready_ = false;
+}
+
 }

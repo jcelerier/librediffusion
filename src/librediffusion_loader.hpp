@@ -113,6 +113,9 @@ public:
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, set_ipadapter_tokens);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, set_ipadapter_scale);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, set_ipadapter_scale_vector);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, num_runtime_loras);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, set_lora_scale);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, set_lora_scale_vector);
 
   /*=========================================================================*/
   /* High-Level Inference (CPU buffers)                                      */
@@ -394,6 +397,9 @@ private:
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, set_ipadapter_tokens);
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, set_ipadapter_scale);
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, set_ipadapter_scale_vector);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, num_runtime_loras);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, set_lora_scale);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, set_lora_scale_vector);
 
     /*=====================================================================*/
     /* High-Level Inference (CPU buffers)                                  */

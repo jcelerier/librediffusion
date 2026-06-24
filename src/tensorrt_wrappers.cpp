@@ -81,6 +81,8 @@ UNetWrapper::~UNetWrapper()
   // Unique_ptrs will handle cleanup automatically
   if(ipadapter_scale_pinned_)
     cudaFreeHost(ipadapter_scale_pinned_);
+  if(lora_scale_pinned_)
+    cudaFreeHost(lora_scale_pinned_);
 }
 
 void UNetWrapper::loadEngine(const std::string& engine_path)
@@ -188,6 +190,25 @@ void UNetWrapper::loadEngine(const std::string& engine_path)
                   << (num_ip_layers_ ? std::to_string(num_ip_layers_) : std::string("dynamic"))
                   << " layers) for " << engine_path << std::endl;
       }
+      else if(nm == "lora_scale" && eng->getTensorIOMode(tn) == nvinfer1::TensorIOMode::kINPUT)
+      {
+        // Runtime LoRA: lora_scale[N] HALF vector (N = #runtime LoRAs). Static engine declares N>0;
+        // a dynamic build reads N from the profile MAX (mirrors ipadapter_scale).
+        has_lora_scale_ = true;
+        nvinfer1::Dims d = eng->getTensorShape(tn);
+        if(d.nbDims == 1 && d.d[0] > 0)
+          num_runtime_loras_ = (int)d.d[0];
+        else if(d.nbDims == 1)
+        {
+          nvinfer1::Dims dmax = eng->getProfileShape(tn, 0, nvinfer1::OptProfileSelector::kMAX);
+          if(dmax.nbDims == 1 && dmax.d[0] > 0)
+            num_runtime_loras_ = (int)dmax.d[0];
+        }
+        if(num_runtime_loras_ > 0)
+          lora_scale_host_.assign(num_runtime_loras_, 1.0f);  // default: every runtime LoRA fully on
+        std::cout << "Note: engine has runtime LoRA (lora_scale input, "
+                  << num_runtime_loras_ << " slot(s)) for " << engine_path << std::endl;
+      }
     }
 
     // Derive the per-residual ControlNet geometry from the engine's input_control_NN bindings, so the
@@ -286,6 +307,62 @@ bool UNetWrapper::needsReallocation(
          || shape_cache_.height != height || shape_cache_.width != width
          || shape_cache_.seq_len != seq_len || shape_cache_.hidden_dim != hidden_dim
          || shape_cache_.pooled_dim != pooled_dim;
+}
+
+void UNetWrapper::setLoraScale(int idx, float v)
+{
+  if(idx < 0 || idx >= num_runtime_loras_)
+    return;
+  if((int)lora_scale_host_.size() < num_runtime_loras_)
+    lora_scale_host_.assign(num_runtime_loras_, 1.0f);
+  if(lora_scale_host_[idx] != v)
+  {
+    lora_scale_host_[idx] = v;
+    lora_scale_dirty_ = true;
+  }
+}
+
+const void* UNetWrapper::loraScaleBufferAddr() const
+{
+  return lora_scale_buffer_ ? (const void*)lora_scale_buffer_->data() : nullptr;
+}
+
+// Bind the runtime lora_scale[N] input (called from forward()/forward_sdxl() before enqueueV3 when the
+// engine declares it). Grow-only device buffer (stable address for CUDA-graph) + PINNED host staging,
+// change-gated H2D (a steady-state graph replay does no copy). The engine's lora_scale is HALF.
+void UNetWrapper::bindLoraScale(cudaStream_t stream)
+{
+  if(!has_lora_scale_ || num_runtime_loras_ <= 0)
+    return;
+  const int N = num_runtime_loras_;
+  if((int)lora_scale_host_.size() < N)
+    lora_scale_host_.resize(N, 1.0f);
+  if(!lora_scale_buffer_ || (int)lora_scale_buffer_->size() < N)
+  {
+    lora_scale_buffer_ = std::make_unique<CUDATensor<__half>>(N);
+    lora_scale_dirty_ = true;
+  }
+  if(lora_scale_pinned_cap_ < N)
+  {
+    if(lora_scale_pinned_)
+      cudaFreeHost(lora_scale_pinned_);
+    cudaMallocHost((void**)&lora_scale_pinned_, N * sizeof(__half));
+    lora_scale_pinned_cap_ = N;
+    lora_scale_dirty_ = true;
+  }
+  if(lora_scale_dirty_)
+  {
+    for(int i = 0; i < N; i++)
+      lora_scale_pinned_[i] = __float2half(lora_scale_host_[i]);
+    cudaMemcpyAsync(lora_scale_buffer_->data(), lora_scale_pinned_, N * sizeof(__half),
+                    cudaMemcpyHostToDevice, stream);
+    lora_scale_dirty_ = false;
+  }
+  nvinfer1::Dims d;
+  d.nbDims = 1;
+  d.d[0] = N;
+  context_->setInputShape("lora_scale", d);
+  context_->setTensorAddress("lora_scale", lora_scale_buffer_->data());
 }
 
 void UNetWrapper::forward(
@@ -413,6 +490,8 @@ void UNetWrapper::forward(
       }
     }
   }
+
+  bindLoraScale(stream);  // runtime-LoRA engines: bind lora_scale[N] (no-op otherwise)
 
   // Enqueue inference
   if(!context_->enqueueV3(stream))
@@ -1198,6 +1277,8 @@ void UNetWrapper::forward_sdxl(
   {
     throw std::runtime_error("Failed to set latent tensor address");
   }
+
+  bindLoraScale(stream);  // runtime-LoRA SDXL engines: bind lora_scale[N] (no-op otherwise)
 
   // Enqueue inference
   if(!context_->enqueueV3(stream))

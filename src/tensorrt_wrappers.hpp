@@ -132,6 +132,15 @@ public:
   /// Length of the ipadapter_scale vector (= num cross-attn IP layers), detected at load (0 if none).
   int numIpLayers() const { return num_ip_layers_; }
 
+  /// Runtime LoRA: the engine declares a `lora_scale[N]` HALF input (N = #runtime LoRAs, slot order =
+  /// export CLI order). forward()/forward_sdxl() bind it automatically from the host scales below.
+  bool hasLoraScale() const { return has_lora_scale_; }
+  int numRuntimeLoras() const { return num_runtime_loras_; }
+  /// Set the runtime scale for LoRA slot `idx` (0..N-1). Change-gated (no-op if unchanged).
+  void setLoraScale(int idx, float v);
+  /// Device address of the lora_scale buffer (for the pipeline's CUDA-graph capture_signature).
+  const void* loraScaleBufferAddr() const;
+
   /**
    * Run UNet inference (SD1.5) for an IP-Adapter engine. Identical to forward() except:
    *  - encoder_hidden_states is the EXTENDED sequence [batch, 77+num_image_tokens, hidden_dim] (text
@@ -292,6 +301,18 @@ private:
   float* ipadapter_scale_pinned_ = nullptr;   // cudaMallocHost, length = ipadapter_scale_pinned_cap_
   int ipadapter_scale_pinned_cap_ = 0;
   std::vector<float> ipadapter_scale_last_;    // last host values uploaded (to skip redundant H2D)
+
+  // Runtime LoRA: engine declares a `lora_scale[N]` HALF input. We hold the host scales (default 1.0),
+  // stage them through PINNED host memory, and bind a grow-only device buffer (stable address for
+  // CUDA-graph). bindLoraScale() does the change-gated H2D + binds the input in forward()/forward_sdxl().
+  bool has_lora_scale_ = false;
+  int num_runtime_loras_ = 0;
+  std::vector<float> lora_scale_host_;            // current per-slot scales (size N, init 1.0)
+  std::unique_ptr<CUDATensor<__half>> lora_scale_buffer_;
+  __half* lora_scale_pinned_ = nullptr;
+  int lora_scale_pinned_cap_ = 0;
+  bool lora_scale_dirty_ = true;                  // re-upload H2D only when a scale changed
+  void bindLoraScale(cudaStream_t stream);
 
   void loadEngine(const std::string& engine_path);
   bool needsReallocation(int batch, int height, int width, int seq_len, int hidden_dim, int pooled_dim = 0);

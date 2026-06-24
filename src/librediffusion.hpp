@@ -244,6 +244,12 @@ public:
   // Uniform scale across all IP layers; or a per-layer vector of length num_ip_layers.
   void set_ipadapter_scale(float scale);
   void set_ipadapter_scale_vector(const float* per_layer, int num_ip_layers);
+
+  // Runtime LoRA: number of lora_scale slots the loaded UNet engine declares (0 if none); set slot idx
+  // (0..N-1) or the whole vector. 1.0 = the LoRA fully on (== a baked engine); 0.0 = off.
+  int num_runtime_loras() const;
+  void set_lora_scale(int idx, float scale);
+  void set_lora_scale_vector(const float* scales, int n);
   // On-device path: take a raw host RGBA style image [img_h,img_w,4], run the CLIP image encoder +
   // projection engines, and set the pos tokens (+ neg tokens = projection of zeros). Requires the
   // image encoder engines to be configured (ipadapter_image_encoder_path / _proj_path). Call once /
