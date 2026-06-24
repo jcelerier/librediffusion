@@ -166,29 +166,37 @@ def _splice_lora_scale(onnx_path, out_path, ranks, adapter_names):
                 return i
         return 0
 
-    spliced = []  # (scaling_mul_node, new_mul_node)
+    # lora_B = a MatMul whose weight is 2D with a dim == rank (the rank can be either axis), and whose
+    # output reaches an Add (the residual base+delta) DIRECTLY (fp8: scaling folded into the weight) or
+    # via a single Mul (non-fp8: the PEFT scaling Mul). lora_A also has a rank-dim weight but its output
+    # feeds a Cast/MatMul (the up-projection), not an Add -> it never matches. We splice a
+    # Mul(lora_B_out, lora_scale[slot]) and rewire whatever consumed lora_B_out (the Add, or the scaling Mul).
+    spliced = []  # (anchor_node_to_insert_after, new_mul_node)
     for nd in g.node:
         if nd.op_type != "MatMul":
             continue
-        if not any(shapes.get(inp) and len(shapes[inp]) == 2 and shapes[inp][0] in ranks for inp in nd.input):
+        if not any(shapes.get(inp) and len(shapes[inp]) == 2 and any(d in ranks for d in shapes[inp])
+                   for inp in nd.input):
             continue
-        for mul in [c for c in consumers.get(nd.output[0], []) if c.op_type == "Mul"]:
-            old = mul.output[0]
-            adds = [c for c in consumers.get(old, []) if c.op_type == "Add"]
-            if not adds:
-                continue
-            new_out = old + "_a"
-            for a in adds:
-                for k, inp in enumerate(a.input):
-                    if inp == old:
-                        a.input[k] = new_out
-            spliced.append((mul, helper.make_node("Mul", [old, slot_out[slot_of(nd)]], [new_out],
-                                                   name=old + "/lora_scale_mul")))
-    # rebuild node list: slot gathers first, then originals with each new Mul right after its scaling Mul
+        out = nd.output[0]
+        cons = consumers.get(out, [])
+        reaches_add = any(c.op_type == "Add" for c in cons) or any(
+            c.op_type == "Mul" and any(c2.op_type == "Add" for c2 in consumers.get(c.output[0], []))
+            for c in cons)
+        if not reaches_add:
+            continue  # lora_A (feeds Cast/MatMul) — skip
+        new_out = out + "_a"
+        for c in cons:
+            for k, inp in enumerate(c.input):
+                if inp == out:
+                    c.input[k] = new_out
+        spliced.append((nd, helper.make_node("Mul", [out, slot_out[slot_of(nd)]], [new_out],
+                                              name=out + "/lora_scale_mul")))
+    # rebuild node list: slot gathers first, then originals with each new Mul right after its lora_B MatMul
     nodes = list(g.node)
     pos = {id(n): i for i, n in enumerate(nodes)}
-    for src_mul, nn in sorted(spliced, key=lambda p: pos[id(p[0])], reverse=True):
-        nodes.insert(pos[id(src_mul)] + 1, nn)
+    for anchor, nn in sorted(spliced, key=lambda p: pos[id(p[0])], reverse=True):
+        nodes.insert(pos[id(anchor)] + 1, nn)
     del g.node[:]
     g.node.extend(slot_nodes + nodes)
     onnx.save(m, out_path)
@@ -535,9 +543,16 @@ def main():
         if spec.runtime:
             runtime_adapter_names.append(name)
     has_runtime = bool(runtime_adapter_names)
-    if has_runtime and (args.controlnet or args.ipadapter or args.v2v or args.fp8):
-        raise SystemExit("--lora PATH:runtime is not combinable with --controlnet/--ipadapter/--v2v/--fp8 "
-                         "(plain SD1.5/SDXL only for now).")
+    # Runtime LoRA composes with the feature variants: the trace emits LoRA ops on whichever UNet wrapper
+    # is built below (plain / ControlNet / IP-Adapter / V2V); build_runtime_lora_unet() splices lora_scale
+    # onto that engine's profile, and the C++ forward_* paths all bind lora_scale.
+    # FP8 is NOT supported with runtime LoRA: the modelopt fp8 trace MERGES the LoRA into the weight
+    # (down@up -> Add(base_weight) -> quantize), i.e. weight-space, so a runtime scale would have to
+    # multiply the full [d,d] delta weight every frame for every layer — which defeats the cheap
+    # activation-space scaling that makes runtime LoRA worthwhile. Bake the LoRA (drop :runtime) for fp8.
+    if has_runtime and args.fp8:
+        raise SystemExit("--lora PATH:runtime is not supported with --fp8 (fp8 merges LoRA weight-space). "
+                         "Use a baked LoRA (PATH or PATH:weight) with --fp8, or drop --fp8 for runtime LoRA.")
     if args.lora_specs and not (args.no_fuse_lora or has_runtime):
         # Legacy path: no runtime LoRAs -> fuse everything at the shared --lora-scale (unchanged behavior).
         stream.fuse_lora(fuse_unet=True, fuse_text_encoder=True, lora_scale=args.lora_scale,

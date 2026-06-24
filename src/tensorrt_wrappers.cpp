@@ -646,6 +646,8 @@ void UNetWrapper::forward_v2v(
   if(!context_->setTensorAddress("latent", output_buffer_->data()))
     throw std::runtime_error("forward_v2v: failed to set latent address");
 
+  bindLoraScale(stream);  // runtime-LoRA + V2V
+
   if(!context_->enqueueV3(stream))
     throw std::runtime_error("forward_v2v: failed to enqueue inference");
 
@@ -822,6 +824,8 @@ void UNetWrapper::forward_controlnet(
   if(!context_->setTensorAddress("latent", output_buffer_->data()))
     throw std::runtime_error("Failed to set latent tensor address");
 
+  bindLoraScale(stream);  // runtime-LoRA + ControlNet (SD1.5)
+
   if(!context_->enqueueV3(stream))
     throw std::runtime_error("Failed to enqueue inference (controlnet UNet)");
 
@@ -911,6 +915,8 @@ void UNetWrapper::forward_ipadapter(
     throw std::runtime_error("Failed to set ipadapter_scale tensor address");
   if(!context_->setTensorAddress("latent", output_buffer_->data()))
     throw std::runtime_error("Failed to set latent tensor address");
+
+  bindLoraScale(stream);  // runtime-LoRA + IP-Adapter (SD1.5)
 
   if(!context_->enqueueV3(stream))
     throw std::runtime_error("Failed to enqueue inference (IP-Adapter UNet)");
@@ -1022,6 +1028,8 @@ void UNetWrapper::forward_ipadapter_sdxl(
     throw std::runtime_error("Failed to set ipadapter_scale tensor address");
   if(!context_->setTensorAddress("latent", output_buffer_->data()))
     throw std::runtime_error("Failed to set latent tensor address");
+
+  bindLoraScale(stream);  // runtime-LoRA + IP-Adapter (SDXL)
 
   if(!context_->enqueueV3(stream))
     throw std::runtime_error("Failed to enqueue inference (SDXL IP-Adapter UNet)");
@@ -1145,6 +1153,8 @@ void UNetWrapper::forward_controlnet_sdxl(
     throw std::runtime_error("Failed to set time_ids tensor address");
   if(!context_->setTensorAddress("latent", output_buffer_->data()))
     throw std::runtime_error("Failed to set latent tensor address");
+
+  bindLoraScale(stream);  // runtime-LoRA + ControlNet (SDXL)
 
   if(!context_->enqueueV3(stream))
     throw std::runtime_error("Failed to enqueue inference (controlnet SDXL UNet)");
