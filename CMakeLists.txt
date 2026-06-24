@@ -1,4 +1,20 @@
 cmake_minimum_required(VERSION 3.18)
+
+# Build for ALL architectures by default so the shipped library just runs on any GPU. MUST be set BEFORE
+# project(... CUDA ...): CMP0104 makes project() seed CMAKE_CUDA_ARCHITECTURES with a single native default
+# (e.g. '75') as a NORMAL variable that would shadow any later set(), so a too-narrow build silently
+# JIT-fails the custom CUDA kernels -> black output, rc=0 (the stale-sm_75-on-sm_89-RTX-4090 trap).
+# `all` (CMake >= 3.23) covers every arch the installed CUDA toolkit supports + PTX for forward-compat; on
+# older CMake fall back to the explicit comprehensive list (Turing -> Blackwell). A fast single-arch dev
+# build still wins via -DCMAKE_CUDA_ARCHITECTURES=89 (the cache value is set, so the guard below is skipped).
+if(NOT CMAKE_CUDA_ARCHITECTURES)
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.23)
+    set(CMAKE_CUDA_ARCHITECTURES all)
+  else()
+    set(CMAKE_CUDA_ARCHITECTURES "75-real;80-real;86-real;89-real;90-real;90a-real;100-real;103-real;110-real;120")
+  endif()
+endif()
+
 project(librediffusion LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 23)
@@ -13,16 +29,9 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_CUDA_VISIBILITY_PRESET hidden)
 
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
-# 75: 20xx
-# 86: 30xx
-# 87: jetson orin
-# 89: 40xx
-# 120: 50xx
-# Overridable via -DCMAKE_CUDA_ARCHITECTURES=... (e.g. CI builds a single arch for speed); the cache
-# default ships every supported arch.
-set(CMAKE_CUDA_ARCHITECTURES "75-real;80-real;86-real;89-real;90-real;90a-real;100-real;103-real;110-real;120"
-    CACHE STRING "CUDA architectures to build")
-set(CMAKE_CUDA_FLAGS "-use_fast_math ")#-arch=sm_75 -arch=sm_80 -arch=sm_86 -arch=sm_89 -arch=sm_90 -arch=sm_90a -arch=sm_100 -arch=sm_103 -arch=sm_110 -arch=sm_120 ")
+# CMAKE_CUDA_ARCHITECTURES is set above project() (arch families: 75=20xx, 86=30xx, 87=Jetson Orin,
+# 89=40xx, 120=50xx) — it must precede project() or CMP0104's native default shadows it.
+set(CMAKE_CUDA_FLAGS "-use_fast_math ")
 if(MSVC)
   # CUDA 13's CCCL headers reject MSVC's traditional preprocessor (fatal error C1189). Use the
   # conforming preprocessor for both the host C++ and the nvcc host pass.
