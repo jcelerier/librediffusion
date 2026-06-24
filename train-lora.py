@@ -105,22 +105,119 @@ class LoraSpec:
     path: str
     weight: float = 1.0
     weight_name: str = None  # HF-repo subfile (e.g. a kohya .safetensors inside a multi-file repo)
+    runtime: bool = False    # ":runtime" -> kept UNFUSED with a per-adapter runtime lora_scale input
 
     @classmethod
     def parse(cls, spec: str) -> "LoraSpec":
         # librediffusion: "repo|weight_name" picks a specific file inside an HF LoRA repo
         # (e.g. ByteDance/Hyper-SD|Hyper-SD15-4steps-lora.safetensors). load_lora forwards
         # weight_name= to diffusers. Distinct '|' separator avoids the path:floatweight ':' clash.
+        wn = None
         if "|" in spec:
-            repo, wn = spec.split("|", 1)
-            return cls(path=repo, weight=1.0, weight_name=wn)
+            spec, wn = spec.split("|", 1)
+        # "PATH:runtime" -> runtime-scalable (engine gets a lora_scale slot); "PATH:0.8" -> baked weight.
         if ":" in spec:
             last = spec.rfind(":")
+            suffix = spec[last + 1:]
+            if suffix == "runtime":
+                return cls(path=spec[:last], weight=1.0, weight_name=wn, runtime=True)
             try:
-                return cls(path=spec[:last], weight=float(spec[last + 1:]))
+                return cls(path=spec[:last], weight=float(suffix), weight_name=wn)
             except ValueError:
                 pass
-        return cls(path=spec, weight=1.0)
+        return cls(path=spec, weight=1.0, weight_name=wn)
+
+
+def _splice_lora_scale(onnx_path, out_path, ranks, adapter_names):
+    """Add a runtime `lora_scale[N]` input to an UNFUSED-LoRA UNet ONNX (N = #runtime adapters).
+
+    Each LoRA branch in the traced graph is  ...-> MatMul(B[r,d]) -> Mul(scaling const) -> Add(base).
+    We multiply each scaled delta by lora_scale[adapter_slot] before the Add. At lora_scale=1 the result
+    is identical to the baked/fused engine; 0 removes that LoRA; in between scales it inside every layer.
+    Branches are detected structurally (lora_B = a MatMul whose weight initializer is 2D with first dim
+    in `ranks`, feeding a Mul that feeds an Add) — the traced graph strips lora names, so we must NOT key
+    on names except to assign the per-adapter slot. Returns (N, n_branches)."""
+    import onnx
+    from onnx import helper, TensorProto
+    from collections import defaultdict
+    m = onnx.load(onnx_path, load_external_data=False)
+    g = m.graph
+    shapes = {i.name: list(i.dims) for i in g.initializer}
+    consumers = defaultdict(list)
+    for nd in g.node:
+        for i in nd.input:
+            consumers[i].append(nd)
+    N = max(1, len(adapter_names))
+    LS = "lora_scale"
+    g.input.append(helper.make_tensor_value_info(LS, TensorProto.FLOAT16, [N]))
+    # one Gather per slot up front: lora_scale[i] -> scalar-ish [1] reused by every branch of adapter i
+    slot_nodes, slot_out = [], []
+    for i in range(N):
+        idx = f"{LS}_idx{i}"; out = f"{LS}_s{i}"
+        g.initializer.append(helper.make_tensor(idx, TensorProto.INT64, [1], [i]))
+        slot_nodes.append(helper.make_node("Gather", [LS, idx], [out], axis=0, name=f"{LS}/gather{i}"))
+        slot_out.append(out)
+
+    def slot_of(node):
+        if N == 1:
+            return 0
+        for i, a in enumerate(adapter_names):
+            if a in node.name:
+                return i
+        return 0
+
+    spliced = []  # (scaling_mul_node, new_mul_node)
+    for nd in g.node:
+        if nd.op_type != "MatMul":
+            continue
+        if not any(shapes.get(inp) and len(shapes[inp]) == 2 and shapes[inp][0] in ranks for inp in nd.input):
+            continue
+        for mul in [c for c in consumers.get(nd.output[0], []) if c.op_type == "Mul"]:
+            old = mul.output[0]
+            adds = [c for c in consumers.get(old, []) if c.op_type == "Add"]
+            if not adds:
+                continue
+            new_out = old + "_a"
+            for a in adds:
+                for k, inp in enumerate(a.input):
+                    if inp == old:
+                        a.input[k] = new_out
+            spliced.append((mul, helper.make_node("Mul", [old, slot_out[slot_of(nd)]], [new_out],
+                                                   name=old + "/lora_scale_mul")))
+    # rebuild node list: slot gathers first, then originals with each new Mul right after its scaling Mul
+    nodes = list(g.node)
+    pos = {id(n): i for i, n in enumerate(nodes)}
+    for src_mul, nn in sorted(spliced, key=lambda p: pos[id(p[0])], reverse=True):
+        nodes.insert(pos[id(src_mul)] + 1, nn)
+    del g.node[:]
+    g.node.extend(slot_nodes + nodes)
+    onnx.save(m, out_path)
+    onnx.checker.check_model(out_path)
+    return N, len(spliced)
+
+
+def build_runtime_lora_unet(wrapped_unet, unet_model, onnx_path, engine_path,
+                            opt_h, opt_w, opt_batch, static_batch, static_shape, ranks, adapter_names):
+    """Export the UNFUSED UNet (LoRA as ops), splice the runtime lora_scale input, build the engine.
+    Bypasses the daydream onnxslim step (which OOMs on >2GB SDXL ONNX) and adds lora_scale to the TRT
+    input profile. Writes a `lora_runtime.json` sidecar so the C++/node know the slot order."""
+    from cuda.bindings import runtime as cudart  # cuda-python 13: cudart under cuda.bindings.runtime
+    from streamdiffusion.acceleration.tensorrt.utilities import export_onnx, Engine
+    export_onnx(wrapped_unet, onnx_path, unet_model, opt_h, opt_w, opt_batch, onnx_opset=19)
+    alpha = onnx_path[:-5] + "_lora.onnx"
+    N, nb = _splice_lora_scale(onnx_path, alpha, ranks, adapter_names)
+    print(f"[runtime-lora] lora_scale[{N}] spliced over {nb} branches; slots={adapter_names}")
+    prof = unet_model.get_input_profile(opt_batch, opt_h, opt_w,
+                                        static_batch=static_batch, static_shape=static_shape)
+    prof["lora_scale"] = ((N,), (N,), (N,))
+    _, free_mem, _ = cudart.cudaMemGetInfo()
+    Engine(engine_path).build(alpha, fp16=True, input_profile=prof,
+                              workspace_size=int(free_mem * 0.75),
+                              timing_cache=engine_path.replace(".engine", ".timing.cache"),
+                              builder_optimization_level=5)
+    # (num_runtime_loras is recorded in bundle.json by write_manifest at the end of main() — the per-engine
+    #  builder cleanup wipes any non-.engine file we'd write into the bundle dir here.)
+    return N
 
 
 def parse_args():
@@ -425,21 +522,44 @@ def main():
 
     stream = StreamDiffusion(pipe, t_index_list=[30, 45], torch_dtype=dtype, cfg_type="none")
 
-    # LoRAs: load + fuse (same as the original / the matrix path).
-    for spec in args.lora_specs:
-        # weight_name selects a specific file inside a multi-file HF repo (kohya LoRAs like
-        # ByteDance/Hyper-SD); load_lora forwards it to diffusers' load_lora_weights.
-        if spec.weight_name:
-            stream.load_lora(spec.path, weight_name=spec.weight_name)
-        else:
-            stream.load_lora(spec.path)
-        print(f"Loaded LoRA: {spec.path} (weight_name={spec.weight_name}, scale {args.lora_scale})")
-    if args.lora_specs and not args.no_fuse_lora:
+    # LoRAs: load each as a named adapter. BAKED ones (PATH or PATH:weight) are fused into the weights;
+    # RUNTIME ones (PATH:runtime) stay active/unfused so the trace emits lora_A/lora_B as ops and a
+    # `lora_scale[N]` engine input drives them per-adapter at inference (see build_runtime_lora_unet).
+    runtime_adapter_names, runtime_ranks = [], set()
+    for i, spec in enumerate(args.lora_specs):
+        name = f"lora{i}"
+        kw = {"weight_name": spec.weight_name} if spec.weight_name else {}
+        stream.load_lora(spec.path, adapter_name=name, **kw)
+        kind = "runtime" if spec.runtime else f"baked@{spec.weight}"
+        print(f"Loaded LoRA[{name}]: {spec.path} (weight_name={spec.weight_name}, {kind})")
+        if spec.runtime:
+            runtime_adapter_names.append(name)
+    has_runtime = bool(runtime_adapter_names)
+    if has_runtime and (args.controlnet or args.ipadapter or args.v2v or args.fp8):
+        raise SystemExit("--lora PATH:runtime is not combinable with --controlnet/--ipadapter/--v2v/--fp8 "
+                         "(plain SD1.5/SDXL only for now).")
+    if args.lora_specs and not (args.no_fuse_lora or has_runtime):
+        # Legacy path: no runtime LoRAs -> fuse everything at the shared --lora-scale (unchanged behavior).
         stream.fuse_lora(fuse_unet=True, fuse_text_encoder=True, lora_scale=args.lora_scale,
                          safe_fusing=False)
-    elif args.lora_specs and args.no_fuse_lora:
-        # Leave the adapter active (default scale 1.0) so the ONNX trace captures lora_A/lora_B as ops.
-        print("[no-fuse-lora] LoRA kept UNFUSED (graph ops, scale=1.0) — runtime-scale experiment")
+    elif args.lora_specs and (args.no_fuse_lora or has_runtime):
+        # Fuse only the BAKED adapters (each at its own weight); keep the runtime adapters active at 1.0.
+        baked = [(f"lora{i}", s) for i, s in enumerate(args.lora_specs) if not s.runtime]
+        for name, s in baked:
+            stream.pipe.fuse_lora(adapter_names=[name], lora_scale=s.weight, safe_fusing=False)
+        if baked:
+            print(f"[runtime-lora] fused baked adapters {[n for n, _ in baked]}")
+        if runtime_adapter_names:
+            stream.pipe.set_adapters(runtime_adapter_names, [1.0] * len(runtime_adapter_names))
+            for n in runtime_adapter_names:
+                r = getattr(stream.unet.peft_config.get(n, None), "r", None)
+                if isinstance(r, dict):
+                    runtime_ranks.update(r.values())
+                elif r:
+                    runtime_ranks.add(r)
+            print(f"[runtime-lora] kept UNFUSED: {runtime_adapter_names}  ranks={sorted(runtime_ranks)}")
+        else:
+            print("[no-fuse-lora] LoRA kept UNFUSED (graph ops, scale=1.0)")
 
     # TinyVAE (matches the original + what the C++ engine expects).
     taesd = "madebyollin/taesdxl" if is_sdxl else "madebyollin/taesd"
@@ -657,8 +777,18 @@ def main():
         os.environ["LRD_FP8_EXPORT"] = "1"   # gate export_onnx/optimize_onnx to preserve Q/DQ
 
     o, oo = onnx_pair("unet")
-    compile_unet(wrapped_unet, unet_model, o, oo, f"{args.output}/unet.engine",
-                 opt_batch_size=args.opt_batch, engine_build_options=build_opts)
+    if has_runtime:
+        # Runtime-LoRA: export UNFUSED, splice the lora_scale[N] input, build (skips onnxslim — which OOMs
+        # on >2GB SDXL ONNX — and adds the lora_scale profile). Plain SD1.5/SDXL only (gated above).
+        wrapped_unet = wrapped_unet.to(device, dtype=dtype)
+        build_runtime_lora_unet(
+            wrapped_unet, unet_model, o, f"{args.output}/unet.engine",
+            args.opt_height, args.opt_width, args.opt_batch,
+            static_batch=static, static_shape=static,
+            ranks=runtime_ranks or {16, 32, 64}, adapter_names=runtime_adapter_names)
+    else:
+        compile_unet(wrapped_unet, unet_model, o, oo, f"{args.output}/unet.engine",
+                     opt_batch_size=args.opt_batch, engine_build_options=build_opts)
     os.environ.pop("LRD_FP8_EXPORT", None)   # scope the flag to the UNet build only
 
     # ---- VAE decoder ----
@@ -741,9 +871,14 @@ def main():
             "ipadapter": bool(args.ipadapter),
             "v2v": bool(args.v2v),                     # kvo extended-self-attention UNet (--v2v)
             "rife": False,
+            "runtime_lora": bool(runtime_adapter_names),
         },
         "controlnet_repo": args.controlnet,
         "ipadapter_ckpt": args.ipadapter,
+        # runtime LoRA: the UNet engine declares a lora_scale[N] input; slot i = the i-th PATH:runtime
+        # LoRA in CLI order. The node exposes one scale knob per slot. 0 = none.
+        "num_runtime_loras": len(runtime_adapter_names),
+        "lora_runtime_slots": [s.path for s in args.lora_specs if s.runtime],
     })
 
     print(f"\nDONE. Engines in {args.output}:")
