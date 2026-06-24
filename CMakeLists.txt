@@ -20,9 +20,11 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 # 120: 50xx
 # Overridable via -DCMAKE_CUDA_ARCHITECTURES=... (e.g. CI builds a single arch for speed); the cache
 # default ships every supported arch.
-set(CMAKE_CUDA_ARCHITECTURES "75-real;80-real;86-real;89-real;90-real;90a-real;100-real;103-real;110-real;120"
-    CACHE STRING "CUDA architectures to build")
-set(CMAKE_CUDA_FLAGS "-use_fast_math -arch=sm_75 -arch=sm_80 -arch=sm_86 -arch=sm_89 -arch=sm_90 -arch=sm_90a -arch=sm_100 -arch=sm_103 -arch=sm_110 -arch=sm_120 ")
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES all)
+endif()
+
+set(CMAKE_CUDA_FLAGS "-use_fast_math ")
 if(MSVC)
   # CUDA 13's CCCL headers reject MSVC's traditional preprocessor (fatal error C1189). Use the
   # conforming preprocessor for both the host C++ and the nvcc host pass.
