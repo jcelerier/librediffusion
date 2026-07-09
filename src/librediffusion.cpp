@@ -106,6 +106,16 @@ void LibreDiffusionPipeline::prepare_scheduler(
   // syncing the pipeline's denoising_steps), and using the stale config count would memcpy past the end
   // of the *_host_ vectors (an OOB read). timesteps.size() is authoritative and self-consistent.
   const size_t n = timesteps.size();
+  // Contract: all five coefficient arrays describe the same timesteps, so they must be the same length
+  // (the C-API builds every span from one num_timesteps; updateScheduler fills them in one loop). Guard
+  // it so a future caller mismatch is a clear error, not a silent OOB read in the memcpys below.
+  // NOTE: deliberately do NOT touch config_.denoising_steps here — it sizes the batch buffers allocated
+  // in init_buffers()/reinit_buffers(); mutating it on this light path (which does not reallocate) would
+  // desync the step count from the buffers. A genuine step-count change goes through need_rebuild ->
+  // reinit_buffers (which sets denoising_steps AND reallocates).
+  if(alpha_prod_t_sqrt.size() != n || beta_prod_t_sqrt.size() != n
+     || c_skip.size() != n || c_out.size() != n)
+    throw std::runtime_error("prepare_scheduler: coefficient spans must all match timesteps.size()");
   auto reuse = [&](std::unique_ptr<CUDATensor<float>>& b) {
     if(!b || b->size() != n) { b = std::make_unique<CUDATensor<float>>(n); }
   };
