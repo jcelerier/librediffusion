@@ -185,6 +185,13 @@ void LibreDiffusionPipeline::set_controlnet_scale(int index, float scale)
   if(index < 0 || index >= (int)controlnet_scales_.size())
     throw std::runtime_error("set_controlnet_scale: index out of range");
   controlnet_scales_[index] = scale;
+  // The scale reaches the captured 1-step graph via a skip-when-unchanged host-side H2D inside
+  // ControlNetWrapper::forward (staged into scale_buffer_). A graph REPLAY does not call forward, so
+  // that re-stage never runs and the engine keeps the capture-time scale. capture_signature() hashes
+  // only buffer addresses (this scale is a host scalar), so a value change is invisible to it. Force a
+  // recapture — same treatment as set_lora_scale / prepare_scheduler. Change-gated in the wrapper, so
+  // one recapture per (rare) edit.
+  graph_ready_ = false;
 }
 
 void LibreDiffusionPipeline::set_ipadapter_tokens(
@@ -243,11 +250,16 @@ void LibreDiffusionPipeline::set_ipadapter_scale(float scale)
   int n = unet_ ? unet_->numIpLayers() : 0;
   if(n <= 0) n = 16;  // SD1.5 base default if not yet known
   ipadapter_scale_vec_.assign(n, scale);
+  // Consumed via a skip-when-unchanged host-side H2D inside forward_ipadapter (staged into
+  // ipadapter_scale_buffer_); a graph REPLAY skips forward_ipadapter so the re-stage never runs and the
+  // engine keeps the capture-time scale. Force a recapture on a value change (mirrors set_lora_scale).
+  graph_ready_ = false;
 }
 
 void LibreDiffusionPipeline::set_ipadapter_scale_vector(const float* per_layer, int num_ip_layers)
 {
   ipadapter_scale_vec_.assign(per_layer, per_layer + num_ip_layers);
+  graph_ready_ = false;  // see set_ipadapter_scale — force recapture so a live scale change reaches the engine
 }
 
 int LibreDiffusionPipeline::num_runtime_loras() const
