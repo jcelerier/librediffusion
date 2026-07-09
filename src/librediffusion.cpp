@@ -101,16 +101,13 @@ void LibreDiffusionPipeline::prepare_scheduler(
   c_skip_host_.assign(c_skip.begin(), c_skip.end());
   c_out_host_.assign(c_out.begin(), c_out.end());
 
-  // Allocate and copy scheduler parameters. Grow-only / in-place: the captured 1-step CUDA graph reads
-  // sub_timesteps_ (and the scheduler step reads the coeff buffers) BY ADDRESS, and capture_signature()
-  // does NOT hash them. A live timesteps edit calls this every change; reallocating would move the
-  // device address and the replayed graph would read a stale/freed buffer -> "any change randomly breaks"
-  // (random because cudaFree+cudaMalloc may reuse the address). Reuse when the step count is unchanged
-  // (no recapture) and only (re)allocate + invalidate the graph on a size change. See reuse_or_realloc
-  // in librediffusion.embeddings.cpp and the set_controlnet_cond fix.
-  const size_t nsteps = (size_t)config_.denoising_steps;
+  // Size everything by the arrays the caller actually passed, NOT config_.denoising_steps. The two can
+  // disagree on the live-update path (the wrapper's updateScheduler pushes new coefficients without
+  // syncing the pipeline's denoising_steps), and using the stale config count would memcpy past the end
+  // of the *_host_ vectors (an OOB read). timesteps.size() is authoritative and self-consistent.
+  const size_t n = timesteps.size();
   auto reuse = [&](std::unique_ptr<CUDATensor<float>>& b) {
-    if(!b || b->size() != nsteps) { b = std::make_unique<CUDATensor<float>>(nsteps); graph_ready_ = false; }
+    if(!b || b->size() != n) { b = std::make_unique<CUDATensor<float>>(n); }
   };
   reuse(alpha_prod_t_sqrt_);
   reuse(beta_prod_t_sqrt_);
@@ -119,24 +116,22 @@ void LibreDiffusionPipeline::prepare_scheduler(
   reuse(sub_timesteps_);
 
   // Copy scheduler parameters to device
-
-  cudaMemcpy(
-      alpha_prod_t_sqrt_->data(), alpha_prod_t_sqrt_host_.data(),
-      config_.denoising_steps * sizeof(float), cudaMemcpyHostToDevice);
-  cudaMemcpy(
-      beta_prod_t_sqrt_->data(), beta_prod_t_sqrt_host_.data(),
-      config_.denoising_steps * sizeof(float), cudaMemcpyHostToDevice);
-  cudaMemcpy(
-      c_skip_->data(), c_skip_host_.data(), config_.denoising_steps * sizeof(float),
-      cudaMemcpyHostToDevice);
-  cudaMemcpy(
-      c_out_->data(), c_out_host_.data(), config_.denoising_steps * sizeof(float),
-      cudaMemcpyHostToDevice);
-  cudaMemcpy(
-      sub_timesteps_->data(), timesteps.data(), config_.denoising_steps * sizeof(float),
-      cudaMemcpyHostToDevice);
+  cudaMemcpy(alpha_prod_t_sqrt_->data(), alpha_prod_t_sqrt_host_.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(beta_prod_t_sqrt_->data(), beta_prod_t_sqrt_host_.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(c_skip_->data(), c_skip_host_.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(c_out_->data(), c_out_host_.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(sub_timesteps_->data(), timesteps.data(), n * sizeof(float), cudaMemcpyHostToDevice);
 
   cudaStreamSynchronize(stream_);
+
+  // Invalidate any captured 1-step CUDA graph. The graphed single-step body bakes the scheduler
+  // coefficients (alpha/beta/c_skip/c_out) as BY-VALUE kernel arguments at capture time (they leave the
+  // captured region as host scalars into launch_scheduler_step_fp16, NOT via a device buffer read), so
+  // refreshing the host vectors + device buffers above does NOT change what a graph replay computes. A
+  // live timestep/coefficient edit must therefore force a recapture, exactly as set_lora_scale does for
+  // its baked value. capture_signature() only hashes buffer ADDRESSES (stable here), so it cannot catch a
+  // value-only change — hence this explicit invalidation.
+  graph_ready_ = false;
 }
 
 void LibreDiffusionPipeline::set_init_noise(const __half* noise)
