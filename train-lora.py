@@ -230,12 +230,26 @@ def build_runtime_lora_unet(wrapped_unet, unet_model, onnx_path, engine_path,
 
 def parse_args():
     p = argparse.ArgumentParser(description="Export TensorRT engines (daydream API) for the C++ engine")
-    p.add_argument("-t", "--type", choices=["sd15", "sdxl", "klein", "img2img-turbo"], default="sd15",
+    p.add_argument("-t", "--type", choices=["sd15", "sdxl", "klein", "img2img-turbo", "sana"], default="sd15",
                    help="sd15/sdxl: this script's native diffusers export. img2img-turbo: GaParmar "
                         "pix2pix-turbo skip-VAE (1-step, sd-turbo base; --model = a pretrained name "
                         "like edge_to_image, or a path to a *.pkl). klein: FLUX.2-klein-4B "
                         "(dispatches to the vendored klein export scripts in ./src/streamdiffusion/klein/; "
-                        "needs the unified venv with diffusers Flux2 + nvidia-modelopt).")
+                        "needs the unified venv with diffusers Flux2 + nvidia-modelopt). "
+                        "sana: SANA-Streaming V2V (GDN DiT); exports the DiT weights (.bin) the "
+                        "librediffusion_sana C-API loads + the bf16 LTX-2 VAE enc/dec and gemma "
+                        "text-encoder TensorRT engines. --model = HF repo (Efficient-Large-Model/"
+                        "SANA-Streaming) or a local checkpoint/snapshot dir.")
+    p.add_argument("--sana-trt-dir", default=None,
+                   help="sana: dir holding prebuilt bf16 VAE + gemma .plan engines to reuse "
+                        "(e.g. .../sana-trt). If set and engines exist, they are copied into --output "
+                        "instead of rebuilt. Omit to (re)build from the sana export scripts.")
+    p.add_argument("--sana-scripts-dir", default=None,
+                   help="sana: dir with the vae/gemma export scripts (vae_{en,de}code_export_bf16.py, "
+                        "gemma_export.py, build_trt.py); needed only when (re)building engines.")
+    p.add_argument("--sana-python", default=None,
+                   help="sana: python exe for the sana export scripts (a venv with torch+diffusers+"
+                        "sana-src on PYTHONPATH); needed only when (re)building engines.")
     p.add_argument("--klein-scripts-dir",
                    default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                         "src", "streamdiffusion", "klein"),
@@ -513,6 +527,150 @@ def export_img2img_turbo(args):
             print(f"  {f}  ({sz:.0f} MB)")
 
 
+def export_sana(args):
+    """Export SANA-Streaming (GDN DiT) into the artifact set the librediffusion_sana
+    C-API consumes: fp32 DiT weights (.bin) + bf16 LTX-2 VAE enc/dec + gemma TensorRT
+    engines. Layout under --output:
+        <out>/dit/block{0..19}/*.bin   per-block weights
+        <out>/dit/*.bin                top-level weights (x/t/y embedders, final layer)
+        <out>/vae/ltx2_vae_{encoder,decoder}_bf16.plan
+        <out>/gemma/gemma_encoder.plan
+    DiT weight extraction is self-contained (torch only). The VAE/gemma engines are the
+    LTX-2 / gemma models (not SD-family), so — like the klein path calls its own scripts —
+    they are reused from --sana-trt-dir when present, else (re)built via the sana export
+    scripts (--sana-scripts-dir + --sana-python: a venv with torch+diffusers+sana-src)."""
+    import glob as _glob
+    import shutil
+    import subprocess
+    import numpy as np
+
+    out = os.path.abspath(args.output)
+    dit_dir = os.path.join(out, "dit")
+    os.makedirs(dit_dir, exist_ok=True)
+    C, HEADS, HD = 2240, 20, 112
+    SOFT = {3, 7, 11, 15, 19}
+
+    # ---- 1. locate the DiT checkpoint (local file / snapshot dir / HF cache / download) ----
+    def _find_ckpt(model):
+        if os.path.isfile(model):
+            return model
+        if os.path.isdir(model):
+            hits = _glob.glob(os.path.join(model, "**", "sana_streaming_ar.pth"), recursive=True)
+            if hits:
+                return hits[0]
+        hub = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
+        repo = "models--" + model.replace("/", "--")
+        hits = _glob.glob(os.path.join(hub, repo, "snapshots", "*", "dit", "sana_streaming_ar.pth"))
+        if hits:
+            return hits[0]
+        print(f"[sana] checkpoint not in cache; downloading {model} ...")
+        from huggingface_hub import hf_hub_download
+        return hf_hub_download(model, "dit/sana_streaming_ar.pth")
+
+    ckpt = _find_ckpt(args.model)
+    print(f"[sana] DiT checkpoint: {ckpt}")
+    try:
+        sd = torch.load(ckpt, map_location="cpu", weights_only=True)
+    except Exception:
+        sd = torch.load(ckpt, map_location="cpu", weights_only=False)
+    if isinstance(sd, dict) and "state_dict" in sd:
+        sd = sd["state_dict"]
+    sd = {k.removeprefix("model.").removeprefix("module."): v for k, v in sd.items()}
+
+    def w32(path, t):
+        np.ascontiguousarray(t.detach().float().cpu().numpy().astype("<f4")).tofile(path)
+
+    # ---- 2. per-block DiT weights ----
+    n_files = 0
+    for i in range(20):
+        pfx = f"blocks.{i}."
+        w = {k[len(pfx):]: v for k, v in sd.items() if k.startswith(pfx)}
+        d = os.path.join(dit_dir, f"block{i}")
+        os.makedirs(d, exist_ok=True)
+        soft = i in SOFT
+
+        def D(n, t):
+            nonlocal n_files
+            w32(os.path.join(d, n + ".bin"), t)
+            n_files += 1
+
+        D("scale_shift_table", w["scale_shift_table"])
+        if soft:  # softmax attn: q/k are Conv1d(k=3), the block uses the centre tap
+            D("attn_q_w", w["attn.q.weight"].float()[:, :, 1])
+            D("attn_k_w", w["attn.k.weight"].float()[:, :, 1])
+        else:     # GDN attn: q/k are Conv1d(k=1)
+            D("attn_q_w", w["attn.q.weight"].squeeze(-1))
+            D("attn_k_w", w["attn.k.weight"].squeeze(-1))
+        D("attn_v_w", w["attn.v.weight"]); D("attn_q_norm", w["attn.q_norm.weight"]); D("attn_k_norm", w["attn.k_norm.weight"])
+        D("attn_proj_w", w["attn.proj.weight"]); D("attn_proj_b", w["attn.proj.bias"])
+        D("attn_og_w", w["attn.output_gate.weight"]); D("attn_og_b", w["attn.output_gate.bias"])
+        if not soft:  # GDN-only gate params
+            D("beta_proj_w", w["attn.beta_proj.weight"]); D("beta_proj_b", w["attn.beta_proj.bias"])
+            D("gate_proj_w", w["attn.gate_proj.weight"]); D("gate_proj_b", w["attn.gate_proj.bias"])
+            D("A_log", w["attn.A_log"]); D("dt_bias", w["attn.dt_bias"])
+        D("cx_q_w", w["cross_attn.q_linear.weight"]); D("cx_q_b", w["cross_attn.q_linear.bias"])
+        D("cx_kv_w", w["cross_attn.kv_linear.weight"]); D("cx_kv_b", w["cross_attn.kv_linear.bias"])
+        D("cx_proj_w", w["cross_attn.proj.weight"]); D("cx_proj_b", w["cross_attn.proj.bias"])
+        D("cx_q_norm", w["cross_attn.q_norm.weight"]); D("cx_k_norm", w["cross_attn.k_norm.weight"])
+        D("ffn_inv_w", w["mlp.inverted_conv.conv.weight"].reshape(13440, C)); D("ffn_inv_b", w["mlp.inverted_conv.conv.bias"])
+        D("ffn_dw_w", w["mlp.depth_conv.conv.weight"].reshape(13440, 9)); D("ffn_dw_b", w["mlp.depth_conv.conv.bias"])
+        D("ffn_pw_w", w["mlp.point_conv.conv.weight"].reshape(C, 6720))
+        D("ffn_tc_w", w["mlp.t_conv.weight"].reshape(C, C, 3))
+
+    # ---- top-level weights ----
+    def T(n, t):
+        nonlocal n_files
+        w32(os.path.join(dit_dir, n + ".bin"), t)
+        n_files += 1
+
+    T("xemb_w", sd["x_embedder.proj.weight"].reshape(C, 256)); T("xemb_b", sd["x_embedder.proj.bias"])
+    T("temb0_w", sd["t_embedder.mlp.0.weight"]); T("temb0_b", sd["t_embedder.mlp.0.bias"])
+    T("temb2_w", sd["t_embedder.mlp.2.weight"]); T("temb2_b", sd["t_embedder.mlp.2.bias"])
+    T("tblock_w", sd["t_block.1.weight"]); T("tblock_b", sd["t_block.1.bias"])
+    T("yfc1_w", sd["y_embedder.y_proj.fc1.weight"]); T("yfc1_b", sd["y_embedder.y_proj.fc1.bias"])
+    T("yfc2_w", sd["y_embedder.y_proj.fc2.weight"]); T("yfc2_b", sd["y_embedder.y_proj.fc2.bias"])
+    T("ynorm_w", sd["attention_y_norm.weight"])
+    T("final_sst", sd["final_layer.scale_shift_table"])
+    T("final_lin_w", sd["final_layer.linear.weight"]); T("final_lin_b", sd["final_layer.linear.bias"])
+    print(f"[sana] wrote {n_files} DiT weight tensors -> {dit_dir}")
+
+    # ---- 3. bf16 VAE (enc/dec) + gemma TensorRT engines ----
+    vae_out = os.path.join(out, "vae"); gemma_out = os.path.join(out, "gemma")
+    os.makedirs(vae_out, exist_ok=True); os.makedirs(gemma_out, exist_ok=True)
+    wanted = {
+        os.path.join(vae_out, "ltx2_vae_encoder_bf16.plan"): "vae/ltx2_vae_encoder_bf16.plan",
+        os.path.join(vae_out, "ltx2_vae_decoder_bf16.plan"): "vae/ltx2_vae_decoder_bf16.plan",
+        os.path.join(gemma_out, "gemma_encoder.plan"): "gemma/gemma_encoder.plan",
+    }
+    reused = 0
+    if args.sana_trt_dir:
+        for dst, rel in wanted.items():
+            src = os.path.join(args.sana_trt_dir, rel)
+            if os.path.isfile(src) and not os.path.isfile(dst):
+                print(f"[sana] reuse engine {src} -> {dst}")
+                shutil.copy2(src, dst); reused += 1
+            elif os.path.isfile(dst):
+                reused += 1
+    missing = [d for d in wanted if not os.path.isfile(d)]
+    if missing:
+        if args.sana_scripts_dir and args.sana_python:
+            sp, sdir = args.sana_python, args.sana_scripts_dir
+            print(f"[sana] building missing engines via {sdir} ({sp}) ...")
+            # ONNX exports (need torch+diffusers+sana-src) then TRT build
+            for script in ("vae_encode_export_bf16.py", "vae_decode_export_bf16.py", "gemma_export.py"):
+                subprocess.run([sp, os.path.join(sdir, script)], check=True)
+            print("[sana] NOTE: engine .plan build is driven by build_trt.py per the sana-trt README "
+                  "(strongly-typed bf16); run it on the produced ONNX, then re-run this with "
+                  "--sana-trt-dir pointing at the built engines.")
+        else:
+            print("[sana] MISSING engines: " + ", ".join(os.path.basename(m) for m in missing))
+            print("[sana]   provide --sana-trt-dir <dir with prebuilt .plan> to reuse, or "
+                  "--sana-scripts-dir + --sana-python to (re)build the LTX-2 VAE(bf16)/gemma engines.")
+
+    print(f"[sana] DONE. weights_dir = {dit_dir}  (pass to librediffusion_sana_create); "
+          f"engines: {len(wanted) - len(missing)}/{len(wanted)} present under {out}")
+
+
 def main():
     args = parse_args()
     if args.type == "klein":
@@ -520,6 +678,9 @@ def main():
         return
     if args.type == "img2img-turbo":
         export_img2img_turbo(args)
+        return
+    if args.type == "sana":
+        export_sana(args)
         return
     device = torch.device("cuda")
     dtype = torch.float16
