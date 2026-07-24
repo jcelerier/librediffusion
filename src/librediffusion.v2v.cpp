@@ -2,6 +2,8 @@
 
 #include "tensorrt_wrappers.hpp"
 
+#include <stdexcept>
+
 namespace librediffusion
 {
 
@@ -20,6 +22,16 @@ void LibreDiffusionPipeline::enableTemporalCoherence(
     bool use_feature_injection, float injection_strength, float similarity_threshold,
     int cache_interval, int max_cached_frames)
 {
+  // Last line of defence for the two values that are not merely wrong but fatal: cache_interval is
+  // the divisor of `frame_id % cache_interval` in img2img_impl (0 -> SIGFPE, uncatchable), and
+  // cache_maxframes is compared against a size_t (negative -> SIZE_MAX -> the deque never evicts and
+  // VRAM grows by one latent per frame). The C API rejects both; refuse here too so no internal
+  // caller can install them.
+  if(cache_interval < 1)
+    throw std::invalid_argument("enableTemporalCoherence: cache_interval must be >= 1");
+  if(max_cached_frames < 1)
+    throw std::invalid_argument("enableTemporalCoherence: max_cached_frames must be >= 1");
+
   config_.mode = PipelineMode::TEMPORAL_V2V;
   config_.use_feature_injection = use_feature_injection;
   config_.feature_injection_strength = injection_strength;

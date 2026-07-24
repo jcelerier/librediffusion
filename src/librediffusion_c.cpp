@@ -506,6 +506,12 @@ librediffusion_config_set_temporal_params(
 {
   if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  // cache_interval is the divisor of `frame_id % cache_interval` on the img2img path — an integer
+  // division, so 0 is a SIGFPE that no try/catch can intercept. cache_maxframes is compared against
+  // a size_t, so a negative value becomes SIZE_MAX and the cache deque never drops a frame: one
+  // latent of VRAM per frame, forever. Both used to be stored verbatim.
+  if (cache_interval < 1 || cache_maxframes < 1)
+    return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
 
   config->cpp_config.use_cached_attn = (use_cached_attn != 0);
   config->cpp_config.use_feature_injection = (use_feature_injection != 0);
@@ -1392,6 +1398,10 @@ librediffusion_enable_temporal_coherence(
 {
   if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  // See config_set_temporal_params: cache_interval == 0 is a SIGFPE on the next img2img, and a
+  // negative cache_maxframes reads as SIZE_MAX, i.e. "cache every frame forever".
+  if (cache_interval < 1 || max_cached_frames < 1)
+    return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
 
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->enableTemporalCoherence(

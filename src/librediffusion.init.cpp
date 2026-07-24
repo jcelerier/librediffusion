@@ -318,8 +318,12 @@ void LibreDiffusionPipeline::reinit_buffers(const LibreDiffusionConfig& new_conf
   config_.use_feature_injection = new_config.use_feature_injection;
   config_.feature_injection_strength = new_config.feature_injection_strength;
   config_.feature_similarity_threshold = new_config.feature_similarity_threshold;
-  config_.cache_interval = new_config.cache_interval;
-  config_.cache_maxframes = new_config.cache_maxframes;
+  // reinit_buffers takes a whole config from the host: sanitize the two values that are fatal
+  // rather than merely wrong (0 -> SIGFPE in the img2img modulo; negative maxframes -> SIZE_MAX,
+  // i.e. an unbounded per-frame VRAM leak). The C-API setters reject them; a config that reached
+  // here another way is clamped rather than installed.
+  config_.cache_interval = new_config.cache_interval >= 1 ? new_config.cache_interval : 1;
+  config_.cache_maxframes = new_config.cache_maxframes >= 1 ? new_config.cache_maxframes : 1;
   config_.use_tome_cache = new_config.use_tome_cache;
   config_.tome_ratio = new_config.tome_ratio;
   config_.use_cuda_graph = new_config.use_cuda_graph;
