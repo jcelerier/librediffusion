@@ -136,6 +136,27 @@ librediffusion_error_t check_inference_ready(librediffusion_pipeline_handle pipe
   }
   return LIBREDIFFUSION_SUCCESS;
 }
+// Reject a prepare_* / token call whose DECLARED shape disagrees with the pipeline's configured text
+// geometry (L-06). These entry points size the device buffer from the CALL's arguments, but every
+// consumer reads config_.text_seq_len * config_.text_hidden_dim back out of it with a raw
+// cudaMemcpyAsync — so a smaller declared shape is an out-of-bounds DEVICE read that surfaces later,
+// somewhere else, as an opaque cudaErrorInvalidDevice, after the output buffer has already been
+// partially written.
+librediffusion_error_t check_text_dims(
+    librediffusion_pipeline_handle pipeline, int seq_len, int hidden_dim, const char* what)
+{
+  const auto& cfg = pipeline->cpp_pipeline->config();
+  if (seq_len != cfg.text_seq_len || hidden_dim != cfg.text_hidden_dim)
+  {
+    std::fprintf(
+        stderr,
+        "[librediffusion] INVALID_DIMENSIONS: %s got [seq=%d, hidden=%d] but the pipeline is "
+        "configured for [seq=%d, hidden=%d]\n",
+        what, seq_len, hidden_dim, cfg.text_seq_len, cfg.text_hidden_dim);
+    return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
+  }
+  return LIBREDIFFUSION_SUCCESS;
+}
 } // anonymous namespace
 
 /*===========================================================================*/
@@ -713,6 +734,9 @@ librediffusion_prepare_embeds(
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (seq_len <= 0 || hidden_dim <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  if (librediffusion_error_t e = check_text_dims(pipeline, seq_len, hidden_dim, "prepare_embeds");
+      e != LIBREDIFFUSION_SUCCESS)
+    return e;
 
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->prepare_embeds(
@@ -731,6 +755,9 @@ librediffusion_prepare_null_embeds(
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (seq_len <= 0 || hidden_dim <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  if (librediffusion_error_t e = check_text_dims(pipeline, seq_len, hidden_dim, "prepare_null_embeds");
+      e != LIBREDIFFUSION_SUCCESS)
+    return e;
 
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->prepare_null_embeds(
@@ -749,6 +776,9 @@ librediffusion_prepare_negative_embeds(
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (seq_len <= 0 || hidden_dim <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  if (librediffusion_error_t e = check_text_dims(pipeline, seq_len, hidden_dim, "prepare_negative_embeds");
+      e != LIBREDIFFUSION_SUCCESS)
+    return e;
 
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->prepare_negative_embeds(
@@ -768,6 +798,9 @@ librediffusion_blend_embeds(
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (num_embeddings <= 0 || seq_len <= 0 || hidden_dim <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  if (librediffusion_error_t e = check_text_dims(pipeline, seq_len, hidden_dim, "blend_embeds");
+      e != LIBREDIFFUSION_SUCCESS)
+    return e;
 
   return try_catch_wrapper([&]() {
     // Convert librediffusion_half_t* const* to __half* const*
@@ -790,6 +823,21 @@ librediffusion_prepare_sdxl_conditioning(
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!text_embeds || !time_ids)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  // No shapes are passed here: both buffers are read using the pipeline's OWN configured dimensions.
+  // The least we can do is refuse the call on a pipeline that has no SDXL conditioning to fill, where
+  // the dimensions are meaningless and the copy would be sized from stale defaults.
+  {
+    const auto& cfg = pipeline->cpp_pipeline->config();
+    if (cfg.pooled_embedding_dim <= 0 || cfg.time_ids_dim <= 0)
+    {
+      std::fprintf(
+          stderr,
+          "[librediffusion] INVALID_DIMENSIONS: prepare_sdxl_conditioning on a pipeline with "
+          "pooled_embedding_dim=%d, time_ids_dim=%d (call config_set_sdxl_config first)\n",
+          cfg.pooled_embedding_dim, cfg.time_ids_dim);
+      return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
+    }
+  }
 
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->prepare_sdxl_conditioning(
@@ -926,6 +974,20 @@ librediffusion_set_ipadapter_tokens(
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!pos_tokens)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  if (num_tokens <= 0 || dim <= 0)
+    return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  // Same class as L-06: the token buffer is sized num_tokens*dim from these arguments, but the
+  // extended-ehs assembly reads ipadapter_num_tokens_ * config_.text_hidden_dim back out of it. A
+  // `dim` that is not the pipeline's cross-attention width is an out-of-bounds device read.
+  if (dim != pipeline->cpp_pipeline->config().text_hidden_dim)
+  {
+    std::fprintf(
+        stderr,
+        "[librediffusion] INVALID_DIMENSIONS: set_ipadapter_tokens got dim=%d but the pipeline's "
+        "cross-attention width is %d\n",
+        dim, pipeline->cpp_pipeline->config().text_hidden_dim);
+    return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
+  }
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->set_ipadapter_tokens(
         to_half_ptr(pos_tokens), to_half_ptr(neg_tokens), num_tokens, dim);

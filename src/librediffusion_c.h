@@ -367,9 +367,12 @@ librediffusion_pipeline_reinit_buffers(
  *
  * @param pipeline      Pipeline handle
  * @param prompt_embeds Prompt embeddings [batch_size, seq_len, hidden_dim] as half
- * @param seq_len       Sequence length
- * @param hidden_dim    Hidden dimension
- * @return LIBREDIFFUSION_SUCCESS or error code
+ * @param seq_len       Sequence length; MUST equal the pipeline's configured text_seq_len
+ * @param hidden_dim    Hidden dimension; MUST equal the pipeline's configured text_hidden_dim
+ * @return LIBREDIFFUSION_SUCCESS, or LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS when the declared
+ *         shape disagrees with the pipeline's. The buffer is sized from these arguments while every
+ *         consumer reads text_seq_len*text_hidden_dim back out of it, so a mismatch would be an
+ *         out-of-bounds DEVICE read.
  */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_prepare_embeds(
@@ -395,9 +398,9 @@ librediffusion_prepare_null_embeds(
  *
  * @param pipeline         Pipeline handle
  * @param negative_embeds  Negative embeddings [1, seq_len, hidden_dim] as half
- * @param seq_len          Sequence length
- * @param hidden_dim       Hidden dimension
- * @return LIBREDIFFUSION_SUCCESS or error code
+ * @param seq_len          Sequence length; MUST equal the pipeline's configured text_seq_len
+ * @param hidden_dim       Hidden dimension; MUST equal the pipeline's configured text_hidden_dim
+ * @return LIBREDIFFUSION_SUCCESS or LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS (see prepare_embeds)
  */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_prepare_negative_embeds(
@@ -428,8 +431,14 @@ librediffusion_blend_embeds(
  * Prepare SDXL-specific conditioning.
  *
  * @param pipeline     Pipeline handle
- * @param text_embeds  Pooled text embeddings [batch_size, pooled_dim] as half
- * @param time_ids     Time IDs [batch_size, 6] as half
+ * The shapes are NOT passed: both buffers are read using the pipeline's own configured dimensions,
+ * so the caller must supply exactly [batch_size, pooled_embedding_dim] and [batch_size,
+ * time_ids_dim] as set via librediffusion_config_set_sdxl_config. Anything smaller is an
+ * out-of-bounds device read. Rejected outright on a pipeline that is not configured for SDXL
+ * conditioning.
+ *
+ * @param text_embeds  Pooled text embeddings [batch_size, pooled_embedding_dim] as half
+ * @param time_ids     Time IDs [batch_size, time_ids_dim] as half
  * @return LIBREDIFFUSION_SUCCESS or error code
  */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
