@@ -107,8 +107,8 @@ void LibreDiffusionPipeline::add_noise(
     int t_index, int N, cudaStream_t stream)
 {
   // Access host-side copies (safe for CPU access)
-  float alpha = alpha_prod_t_sqrt_host_[t_index];
-  float beta = beta_prod_t_sqrt_host_[t_index];
+  float alpha = alpha_at(t_index);
+  float beta = beta_at(t_index);
 
   launch_add_noise_fp16(original_samples, noise, noisy_samples, alpha, beta, N, stream);
 }
@@ -143,10 +143,10 @@ void LibreDiffusionPipeline::scheduler_step_batch(
   }
 
   // Access host-side copies (safe for CPU access)
-  float alpha = alpha_prod_t_sqrt_host_[idx];
-  float beta = beta_prod_t_sqrt_host_[idx];
-  float c_skip = c_skip_host_[idx];
-  float c_out = c_out_host_[idx];
+  float alpha = alpha_at(idx);
+  float beta = beta_at(idx);
+  float c_skip = c_skip_at(idx);
+  float c_out = c_out_at(idx);
 
   launch_scheduler_step_fp16(
       model_pred, x_t_latent, denoised_out, alpha, beta, c_skip, c_out,
@@ -646,7 +646,10 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
     // Stride is for ONE latent (one image at one timestep)
     int stride = 1 * 4 * config_.latent_height * config_.latent_width;
     int single_size = total_batch * 4 * config_.latent_height * config_.latent_width;
-    for(int i = 0; i < config_.denoising_steps; i++)
+    // Bound the scheduler loop by the coefficients we actually HAVE, not by the declared step count
+    // (L-16). prepare_scheduler now refuses a disagreeing length, so this is the same number; it
+    // stays correct-by-construction if the two ever drift again.
+    for(int i = 0; i < denoise_steps(); i++)
     {
       int offset = i * stride;
       scheduler_step_batch(
@@ -669,14 +672,14 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
     //       stock_noise = init_noise + delta_x
     if(config_.guidance_scale > 1.0f && (config_.cfg_type == 2 || config_.cfg_type == 3))
     {
-      int batch_size = config_.denoising_steps;  // Number of timesteps
+      int batch_size = denoise_steps();  // Number of timesteps (bounded by the schedule length)
 
       // scaled_noise = beta * stock_noise
       CUDATensor<__half> scaled_noise(single_size);
       for(int i = 0; i < batch_size; i++)
       {
         int offset = i * stride;
-        float beta = beta_prod_t_sqrt_host_[i];
+        float beta = beta_at(i);
         // Copy and scale: scaled_noise[i] = beta[i] * stock_noise[i]
         cudaMemcpyAsync(
             scaled_noise.data() + offset, stock_noise_->data() + offset,
@@ -700,8 +703,8 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
       for(int i = 0; i < batch_size; i++)
       {
         int offset = i * stride;
-        float alpha_next = (i < batch_size - 1) ? alpha_prod_t_sqrt_host_[i + 1] : 1.0f;
-        float beta_next = (i < batch_size - 1) ? beta_prod_t_sqrt_host_[i + 1] : 1.0f;
+        float alpha_next = (i < batch_size - 1) ? alpha_at(i + 1) : 1.0f;
+        float beta_next = (i < batch_size - 1) ? beta_at(i + 1) : 1.0f;
         float scale = alpha_next / beta_next;
         launch_scalar_mul_inplace_fp16(delta_x.data() + offset, scale, stride, stream);
       }
@@ -753,7 +756,7 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
 
         // DEBUG: Check what we're putting into the buffer update
         // FIXME this does not look like the correct thing ?
-        for(int i = 0; i < config_.denoising_steps - 1; i++)
+        for(int i = 0; i < denoise_steps() - 1; i++)
         {
           int denoised_offset = i * stride;    // denoised[i]
           int noise_offset = (i + 1) * stride; // noise[i+1]
@@ -774,11 +777,11 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
         // this raw-copied denoised[:-1] (omitting alpha<1), inflating the streaming buffer by
         // ~1/alpha and drifting the converged x0 magnitude ~5% high (validation harness:
         // cfg-none noise-0 predict_x0 rel 0.053, norm 146 vs golden 139).
-        for(int i = 0; i < config_.denoising_steps - 1; i++)
+        for(int i = 0; i < denoise_steps() - 1; i++)
         {
           int denoised_offset = i * stride; // denoised[i] = x_0_pred[i]
           int buffer_offset = i * stride;   // buffer[i]
-          float alpha_next = alpha_prod_t_sqrt_host_[i + 1]; // alpha[i+1]
+          float alpha_next = alpha_at(i + 1); // alpha[i+1]
           cudaMemcpyAsync(
               x_t_latent_buffer_->data() + buffer_offset, denoised.data() + denoised_offset,
               stride * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
@@ -930,7 +933,8 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
   CUDATensor<__half> current_latent(latent_size);
   current_latent.load_d2d(x_t_latent.data(), latent_size, stream);
 
-  for(int idx = 0; idx < config_.denoising_steps; idx++)
+  // Bounded by the schedule length, not the declared step count (L-16).
+  for(int idx = 0; idx < denoise_steps(); idx++)
   {
     // Prepare UNet inputs for this timestep
     std::unique_ptr<CUDATensor<__half>> unet_input_latent;
@@ -1267,7 +1271,7 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
     if(config_.guidance_scale > 1.0f && (config_.cfg_type == 2 || config_.cfg_type == 3))
     {
       int stride = latent_size;
-      float beta = beta_prod_t_sqrt_host_[idx];
+      float beta = beta_at(idx);
 
       // scaled_noise = beta * stock_noise
       CUDATensor<__half> scaled_noise(stride);
@@ -1283,8 +1287,8 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
           delta_x.data(), idx, stride, stream);
 
       // delta_x = alpha_next * delta_x / beta_next
-      float alpha_next = (idx < config_.denoising_steps - 1) ? alpha_prod_t_sqrt_host_[idx + 1] : 1.0f;
-      float beta_next = (idx < config_.denoising_steps - 1) ? beta_prod_t_sqrt_host_[idx + 1] : 1.0f;
+      float alpha_next = (idx < denoise_steps() - 1) ? alpha_at(idx + 1) : 1.0f;
+      float beta_next = (idx < denoise_steps() - 1) ? beta_at(idx + 1) : 1.0f;
       float scale = alpha_next / beta_next;
       launch_scalar_mul_inplace_fp16(delta_x.data(), scale, stride, stream);
 
@@ -1300,7 +1304,7 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
     }
 
     // If not the last timestep, prepare noisy latent for next iteration
-    if(idx < config_.denoising_steps - 1)
+    if(idx < denoise_steps() - 1)
     {
       if(config_.do_add_noise)
       {
@@ -1323,7 +1327,7 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
         // No noise: just scale with alpha
         // current_latent = alpha[idx+1] * x_0_pred
         int next_t_idx = idx + 1;
-        float alpha = alpha_prod_t_sqrt_host_[next_t_idx];
+        float alpha = alpha_at(next_t_idx);
 
         // Copy and scale x_0_pred by alpha
         current_latent.load_d2d(x_0_pred_step.data(), latent_size, stream);
