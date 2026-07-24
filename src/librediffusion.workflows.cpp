@@ -304,8 +304,11 @@ void LibreDiffusionPipeline::img2img(
       cpu_rgba_output, device_rgba_output_correct_size, rgba_input_size,
       cudaMemcpyDeviceToHost, stream_);
 
-  // Wait for all operations to complete
-  //cudaStreamSynchronize(stream_);
+  // Wait for all operations to complete. This must NOT be optional: the copy above targets the
+  // CALLER's host buffer, so returning while it is still in flight lets that buffer (or the whole
+  // pipeline, if the host destroys it) go away underneath an active DMA. txt2img() below has always
+  // synchronized; this one was commented out.
+  cudaStreamSynchronize(stream_);
 }
 
 void LibreDiffusionPipeline::txt2img(uint8_t* cpu_rgba_output, int iw, int ih)

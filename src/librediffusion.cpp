@@ -37,6 +37,13 @@ LibreDiffusionPipeline::LibreDiffusionPipeline(const LibreDiffusionConfig& confi
 
 LibreDiffusionPipeline::~LibreDiffusionPipeline()
 {
+  // Drain the stream FIRST. Every buffer below (and every TensorRT context the members own) may
+  // still be referenced by work this stream has not run yet — img2img in particular ends with an
+  // async D2H into the CALLER's host buffer. Destroying while that is in flight is a use-after-free
+  // in both directions; a destroy racing an in-flight frame is exactly how a host tears a node down.
+  if(stream_)
+    cudaStreamSynchronize(stream_);
+
   if(graph_exec_)
     cudaGraphExecDestroy(graph_exec_);
   if(graph_)
