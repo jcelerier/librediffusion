@@ -443,6 +443,14 @@ public:
    */
   EnginePtr insert(const std::string& engine_path, EnginePtr engine)
   {
+    // NEVER store a null entry. A failed load used to be inserted verbatim under its path, which
+    // (a) poisoned that path against every later retry — get() found the stored null and reported
+    // "not loadable" forever, even after the file was restored — and (b) made the next eviction a
+    // null dereference in get_lru()/evict_if_needed(). A failed load must leave the cache exactly
+    // as it was so a retry can succeed.
+    if(!engine)
+      return nullptr;
+
     EnginePtr result = engine;
 
     bool inserted = cache_.emplace_or_cvisit(
@@ -491,6 +499,12 @@ public:
 
     // Load the engine
     EnginePtr engine = loader();
+
+    // A loader failure (missing file, unreadable, corrupt, does not fit in VRAM) is transient from
+    // the cache's point of view: report it to the caller, but do NOT record it. insert() refuses a
+    // null too; this check keeps the intent explicit at the call site.
+    if(!engine)
+      return nullptr;
 
     // Insert and return
     return insert(engine_path, std::move(engine));
@@ -555,6 +569,15 @@ private:
     bool found = false;
 
     cache_.visit_all([&](const auto& entry) {
+      // Defence in depth: insert()/get_or_load() no longer admit a null, but an entry that somehow
+      // is one must be treated as the OLDEST (evict it) rather than dereferenced.
+      if(!entry.second)
+      {
+        oldest_time = 0;
+        lru_key = entry.first;
+        found = true;
+        return;
+      }
       uint64_t access_time = entry.second->lastAccessTime();
       if(access_time < oldest_time)
       {
