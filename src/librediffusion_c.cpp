@@ -25,15 +25,52 @@
 #define LIBREDIFFUSION_VERSION_PATCH 0
 #define LIBREDIFFUSION_VERSION_STRING "1.0.0"
 
+/* Handle validation (L-11).
+ *
+ * A C handle is the one thing a host cannot check for itself, so the library has to. Each handle
+ * carries a magic word that is set on construction and CLEARED just before the block is freed, and
+ * every entry point checks it. That turns the three mistakes hosts actually make — passing a
+ * destroyed handle, destroying twice, and using the out-parameter a failed create never wrote —
+ * into ordinary error codes instead of a glibc double-free abort, a SIGSEGV, or (worst of all) a
+ * destroyed handle that keeps answering queries with garbage.
+ *
+ * Reading the magic out of a freed block is not something the standard blesses, but it is the only
+ * mitigation available at a C boundary and it converts the overwhelmingly common cases (the block
+ * is still mapped and either untouched or reused) into a clean rejection. */
+#define LIBREDIFFUSION_CONFIG_MAGIC 0x4C524443u   /* 'LRDC' */
+#define LIBREDIFFUSION_PIPELINE_MAGIC 0x4C524450u /* 'LRDP' */
+
 struct librediffusion_config_t
 {
+  unsigned int magic{LIBREDIFFUSION_CONFIG_MAGIC};
   librediffusion::LibreDiffusionConfig cpp_config;
 };
 
 struct librediffusion_pipeline_t
 {
+  unsigned int magic{LIBREDIFFUSION_PIPELINE_MAGIC};
   std::unique_ptr<librediffusion::LibreDiffusionPipeline> cpp_pipeline;
 };
+
+namespace
+{
+// A live, never-destroyed config handle.
+inline bool valid(librediffusion_config_handle c)
+{
+  return c && c->magic == LIBREDIFFUSION_CONFIG_MAGIC;
+}
+// A live pipeline handle that also owns a pipeline (i.e. usable for real work).
+inline bool valid(librediffusion_pipeline_handle p)
+{
+  return p && p->magic == LIBREDIFFUSION_PIPELINE_MAGIC && p->cpp_pipeline;
+}
+// A live pipeline handle, whether or not construction got as far as the pipeline itself. Only
+// destroy needs this weaker form.
+inline bool valid_handle(librediffusion_pipeline_handle p)
+{
+  return p && p->magic == LIBREDIFFUSION_PIPELINE_MAGIC;
+}
+} // anonymous namespace
 
 /*===========================================================================*/
 /* Thread-Local Error State                                                  */
@@ -135,6 +172,7 @@ librediffusion_config_create(librediffusion_config_handle* config)
 {
   if (!config)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  *config = nullptr;
 
   return try_catch_wrapper([&]() { *config = new librediffusion_config_t{}; });
 }
@@ -142,6 +180,12 @@ librediffusion_config_create(librediffusion_config_handle* config)
 LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
 librediffusion_config_destroy(librediffusion_config_handle config)
 {
+  // NULL is documented as safe; so, now, is a handle that was already destroyed (previously a
+  // glibc "double free detected" -> SIGABRT). Clear the magic BEFORE freeing so the block cannot
+  // pass validation again even if the allocator hands it straight back out.
+  if (!valid(config))
+    return;
+  config->magic = 0;
   delete config;
 }
 
@@ -149,17 +193,19 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_clone(
     librediffusion_config_handle src, librediffusion_config_handle* dst)
 {
-  if (!src || !dst)
+  if (!valid(src) || !dst)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  *dst = nullptr;
 
-  return try_catch_wrapper(
-      [&]() { *dst = new librediffusion_config_t{src->cpp_config}; });
+  return try_catch_wrapper([&]() {
+    *dst = new librediffusion_config_t{LIBREDIFFUSION_CONFIG_MAGIC, src->cpp_config};
+  });
 }
 
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_device(librediffusion_config_handle config, int device)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   config->cpp_config.device = device;
   return LIBREDIFFUSION_SUCCESS;
@@ -169,7 +215,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_model_type(
     librediffusion_config_handle config, librediffusion_model_type_t type)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
   switch (type)
@@ -199,7 +245,7 @@ librediffusion_config_set_dimensions(
     librediffusion_config_handle config, int width, int height, int latent_width,
     int latent_height)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (width <= 0 || height <= 0 || latent_width <= 0 || latent_height <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
@@ -214,7 +260,7 @@ librediffusion_config_set_dimensions(
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_batch_size(librediffusion_config_handle config, int batch_size)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (batch_size <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
@@ -225,7 +271,7 @@ librediffusion_config_set_batch_size(librediffusion_config_handle config, int ba
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_denoising_steps(librediffusion_config_handle config, int steps)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (steps <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
@@ -237,7 +283,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_frame_buffer_size(
     librediffusion_config_handle config, int size)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (size <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
@@ -249,7 +295,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_guidance_scale(
     librediffusion_config_handle config, float scale)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   config->cpp_config.guidance_scale = scale;
   return LIBREDIFFUSION_SUCCESS;
@@ -258,7 +304,7 @@ librediffusion_config_set_guidance_scale(
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_delta(librediffusion_config_handle config, float delta)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   config->cpp_config.delta = delta;
   return LIBREDIFFUSION_SUCCESS;
@@ -267,7 +313,7 @@ librediffusion_config_set_delta(librediffusion_config_handle config, float delta
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_add_noise(librediffusion_config_handle config, int enabled)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   config->cpp_config.do_add_noise = (enabled != 0);
   return LIBREDIFFUSION_SUCCESS;
@@ -277,7 +323,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_denoising_batch(
     librediffusion_config_handle config, int enabled)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   config->cpp_config.use_denoising_batch = (enabled != 0);
   return LIBREDIFFUSION_SUCCESS;
@@ -286,7 +332,7 @@ librediffusion_config_set_denoising_batch(
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_cuda_graph(librediffusion_config_handle config, int enabled)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   config->cpp_config.use_cuda_graph = (enabled != 0);
   return LIBREDIFFUSION_SUCCESS;
@@ -295,7 +341,7 @@ librediffusion_config_set_cuda_graph(librediffusion_config_handle config, int en
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_seed(librediffusion_config_handle config, uint64_t seed)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   config->cpp_config.seed = seed;
   return LIBREDIFFUSION_SUCCESS;
@@ -305,7 +351,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_cfg_type(
     librediffusion_config_handle config, librediffusion_cfg_type_t type)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   config->cpp_config.cfg_type = static_cast<int>(type);
   return LIBREDIFFUSION_SUCCESS;
@@ -315,7 +361,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_text_config(
     librediffusion_config_handle config, int seq_len, int hidden_dim, int pad_token)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (seq_len <= 0 || hidden_dim <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
@@ -330,7 +376,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_sdxl_config(
     librediffusion_config_handle config, int pooled_embedding_dim, int time_ids_dim)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (pooled_embedding_dim <= 0 || time_ids_dim <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
@@ -344,7 +390,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_unet_engine(
     librediffusion_config_handle config, const char* path)
 {
-  if (!config || !path)
+  if (!valid(config) || !path)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
   return try_catch_wrapper([&]() {
@@ -356,7 +402,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_vae_encoder(
     librediffusion_config_handle config, const char* path)
 {
-  if (!config || !path)
+  if (!valid(config) || !path)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
   return try_catch_wrapper([&]() {
@@ -368,7 +414,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_vae_decoder(
     librediffusion_config_handle config, const char* path)
 {
-  if (!config || !path)
+  if (!valid(config) || !path)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
   return try_catch_wrapper([&]() {
@@ -382,7 +428,7 @@ librediffusion_config_add_controlnet(
 {
   // Returns the new ControlNet index (>=0), or -1 on error. Preprocessing is EXTERNAL: feed each
   // net's control image per-frame via librediffusion_set_controlnet_cond[_rgba](pipe, index, ...).
-  if (!config || !engine_path)
+  if (!valid(config) || !engine_path)
     return -1;
   try
   {
@@ -400,7 +446,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_timestep_indices(
     librediffusion_config_handle config, const int* indices, size_t count)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (count > 0 && !indices)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -414,7 +460,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_pipeline_mode(
     librediffusion_config_handle config, librediffusion_pipeline_mode_t mode)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
   switch (mode)
@@ -437,7 +483,7 @@ librediffusion_config_set_temporal_params(
     float injection_strength, float similarity_threshold, int cache_interval,
     int cache_maxframes)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
   config->cpp_config.use_cached_attn = (use_cached_attn != 0);
@@ -453,7 +499,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_tome(
     librediffusion_config_handle config, int enabled, float ratio)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
   config->cpp_config.use_tome_cache = (enabled != 0);
@@ -464,37 +510,37 @@ librediffusion_config_set_tome(
 LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
 librediffusion_config_get_width(librediffusion_config_handle config)
 {
-  return config ? config->cpp_config.width : 0;
+  return valid(config) ? config->cpp_config.width : 0;
 }
 
 LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
 librediffusion_config_get_height(librediffusion_config_handle config)
 {
-  return config ? config->cpp_config.height : 0;
+  return valid(config) ? config->cpp_config.height : 0;
 }
 
 LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
 librediffusion_config_get_latent_width(librediffusion_config_handle config)
 {
-  return config ? config->cpp_config.latent_width : 0;
+  return valid(config) ? config->cpp_config.latent_width : 0;
 }
 
 LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
 librediffusion_config_get_latent_height(librediffusion_config_handle config)
 {
-  return config ? config->cpp_config.latent_height : 0;
+  return valid(config) ? config->cpp_config.latent_height : 0;
 }
 
 LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
 librediffusion_config_get_batch_size(librediffusion_config_handle config)
 {
-  return config ? config->cpp_config.batch_size : 0;
+  return valid(config) ? config->cpp_config.batch_size : 0;
 }
 
 LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
 librediffusion_config_get_denoising_steps(librediffusion_config_handle config)
 {
-  return config ? config->cpp_config.denoising_steps : 0;
+  return valid(config) ? config->cpp_config.denoising_steps : 0;
 }
 
 /*===========================================================================*/
@@ -505,20 +551,34 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_pipeline_create(
     librediffusion_config_handle config, librediffusion_pipeline_handle* pipeline)
 {
-  if (!config || !pipeline)
+  if (!valid(config) || !pipeline)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
+  // ALWAYS write the out-parameter. It used to be left untouched on failure, so a host that checks
+  // the handle rather than the return code (or reuses an uninitialised local) carried a wild
+  // pointer into every later call — each of which dereferenced it inside its own `!pipeline` guard.
+  // The wrapper was leaked on failure too: the throw escaped before `*pipeline = p`, and nothing
+  // owned `p`.
+  *pipeline = nullptr;
+
   return try_catch_wrapper([&]() {
-    auto p = new librediffusion_pipeline_t{};
+    auto p = std::make_unique<librediffusion_pipeline_t>();
     p->cpp_pipeline = std::make_unique<librediffusion::LibreDiffusionPipeline>(
         config->cpp_config);
-    *pipeline = p;
+    *pipeline = p.release();
   });
 }
 
 LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
 librediffusion_pipeline_destroy(librediffusion_pipeline_handle pipeline)
 {
+  // NULL and already-destroyed are both no-ops (a second destroy used to re-run the whole dtor
+  // chain — CUDA stream, graph, TensorRT contexts — on freed memory, i.e. SIGSEGV). valid_handle()
+  // rather than valid(): a pipeline whose construction failed has no cpp_pipeline but still owns
+  // the wrapper, and must still be freed.
+  if (!valid_handle(pipeline))
+    return;
+  pipeline->magic = 0;
   delete pipeline;
 }
 
@@ -562,7 +622,7 @@ librediffusion_engine_cache_set_max_entries(unsigned long long max_entries)
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_pipeline_init_cuda(librediffusion_pipeline_handle pipeline)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
   return try_catch_wrapper([&]() {
@@ -573,7 +633,7 @@ librediffusion_pipeline_init_cuda(librediffusion_pipeline_handle pipeline)
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_pipeline_init_npp(librediffusion_pipeline_handle pipeline)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
   return try_catch_wrapper([&]() {
@@ -584,7 +644,7 @@ librediffusion_pipeline_init_npp(librediffusion_pipeline_handle pipeline)
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_pipeline_init_engines(librediffusion_pipeline_handle pipeline)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
   return try_catch_wrapper([&]() {
@@ -595,7 +655,7 @@ librediffusion_pipeline_init_engines(librediffusion_pipeline_handle pipeline)
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_pipeline_init_buffers(librediffusion_pipeline_handle pipeline)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
   return try_catch_wrapper([&]() {
@@ -628,9 +688,9 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_pipeline_reinit_buffers(
     librediffusion_pipeline_handle pipeline, librediffusion_config_handle config)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
   return try_catch_wrapper([&]() {
@@ -647,7 +707,7 @@ librediffusion_prepare_embeds(
     librediffusion_pipeline_handle pipeline, const librediffusion_half_t* prompt_embeds,
     int seq_len, int hidden_dim)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!prompt_embeds)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -665,7 +725,7 @@ librediffusion_prepare_null_embeds(
     librediffusion_pipeline_handle pipeline, const librediffusion_half_t* null_embeds,
     int seq_len, int hidden_dim)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!null_embeds)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -683,7 +743,7 @@ librediffusion_prepare_negative_embeds(
     librediffusion_pipeline_handle pipeline,
     const librediffusion_half_t* negative_embeds, int seq_len, int hidden_dim)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!negative_embeds)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -702,7 +762,7 @@ librediffusion_blend_embeds(
     const librediffusion_half_t* const* embeddings, const float* weights,
     int num_embeddings, int seq_len, int hidden_dim)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!embeddings || !weights)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -726,7 +786,7 @@ librediffusion_prepare_sdxl_conditioning(
     librediffusion_pipeline_handle pipeline, const librediffusion_half_t* text_embeds,
     const librediffusion_half_t* time_ids)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!text_embeds || !time_ids)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -743,7 +803,7 @@ librediffusion_prepare_scheduler(
     const float* alpha_prod_t_sqrt, const float* beta_prod_t_sqrt, const float* c_skip,
     const float* c_out, size_t num_timesteps)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!timesteps || !alpha_prod_t_sqrt || !beta_prod_t_sqrt || !c_skip || !c_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -766,7 +826,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_set_init_noise(
     librediffusion_pipeline_handle pipeline, const librediffusion_half_t* noise)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!noise)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -781,7 +841,7 @@ librediffusion_set_controlnet_cond(
     librediffusion_pipeline_handle pipeline, int index, const librediffusion_half_t* cond,
     int img_height, int img_width)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!cond)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -795,7 +855,7 @@ librediffusion_set_controlnet_cond_rgba(
     librediffusion_pipeline_handle pipeline, int index, const uint8_t* cpu_rgba,
     int img_height, int img_width)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!cpu_rgba)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -808,7 +868,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_set_controlnet_scale(
     librediffusion_pipeline_handle pipeline, int index, float scale)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->set_controlnet_scale(index, scale);
@@ -820,7 +880,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_ipadapter(
     librediffusion_config_handle config, int num_image_tokens, float scale)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   return try_catch_wrapper([&]() {
     config->cpp_config.ipadapter_num_tokens = num_image_tokens;
@@ -833,7 +893,7 @@ librediffusion_config_set_ipadapter_image_encoder(
     librediffusion_config_handle config, const char* image_encoder_engine,
     const char* image_proj_engine)
 {
-  if (!config)
+  if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (!image_encoder_engine || !image_proj_engine)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -848,7 +908,7 @@ librediffusion_set_ipadapter_image(
     librediffusion_pipeline_handle pipeline, const uint8_t* cpu_rgba, int img_height,
     int img_width)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!cpu_rgba)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -862,7 +922,7 @@ librediffusion_set_ipadapter_tokens(
     librediffusion_pipeline_handle pipeline, const librediffusion_half_t* pos_tokens,
     const librediffusion_half_t* neg_tokens, int num_tokens, int dim)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!pos_tokens)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -875,7 +935,7 @@ librediffusion_set_ipadapter_tokens(
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_set_ipadapter_scale(librediffusion_pipeline_handle pipeline, float scale)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   return try_catch_wrapper([&]() { pipeline->cpp_pipeline->set_ipadapter_scale(scale); });
 }
@@ -884,7 +944,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_set_ipadapter_scale_vector(
     librediffusion_pipeline_handle pipeline, const float* per_layer, int num_ip_layers)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!per_layer)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -896,7 +956,7 @@ librediffusion_set_ipadapter_scale_vector(
 LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
 librediffusion_num_runtime_loras(librediffusion_pipeline_handle pipeline)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return 0;
   return pipeline->cpp_pipeline->num_runtime_loras();
 }
@@ -904,7 +964,7 @@ librediffusion_num_runtime_loras(librediffusion_pipeline_handle pipeline)
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_set_lora_scale(librediffusion_pipeline_handle pipeline, int idx, float scale)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   return try_catch_wrapper([&]() { pipeline->cpp_pipeline->set_lora_scale(idx, scale); });
 }
@@ -913,7 +973,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_set_lora_scale_vector(
     librediffusion_pipeline_handle pipeline, const float* scales, int n)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!scales)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -923,7 +983,7 @@ librediffusion_set_lora_scale_vector(
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_reseed(librediffusion_pipeline_handle pipeline, int64_t seed)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
   return try_catch_wrapper([&]() {
@@ -935,7 +995,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_set_guidance_scale(
     librediffusion_pipeline_handle pipeline, float guidance)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
   return try_catch_wrapper([&]() {
@@ -946,7 +1006,7 @@ librediffusion_set_guidance_scale(
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_set_delta(librediffusion_pipeline_handle pipeline, float delta)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
   return try_catch_wrapper([&]() {
@@ -962,7 +1022,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL librediffusion_img
     librediffusion_pipeline_handle pipeline, const uint8_t* cpu_rgba_input,
     uint8_t* cpu_rgba_output, int width, int height)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!cpu_rgba_input || !cpu_rgba_output)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -981,7 +1041,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL librediffusion_txt
     librediffusion_pipeline_handle pipeline, uint8_t* cpu_rgba_output, int width,
     int height)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!cpu_rgba_output)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -1005,7 +1065,7 @@ librediffusion_img2img_gpu_half(
     librediffusion_pipeline_handle pipeline, const librediffusion_half_t* image_in,
     librediffusion_half_t* image_out, librediffusion_stream_t stream)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!image_in || !image_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -1026,7 +1086,7 @@ librediffusion_img2img_gpu_float(
     librediffusion_pipeline_handle pipeline, const float* image_in,
     librediffusion_half_t* image_out, librediffusion_stream_t stream)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!image_in || !image_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -1046,7 +1106,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL librediffusion_txt
     librediffusion_pipeline_handle pipeline, librediffusion_half_t* image_out,
     librediffusion_stream_t stream)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!image_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -1066,7 +1126,7 @@ librediffusion_txt2img_sd_turbo_gpu(
     librediffusion_pipeline_handle pipeline, librediffusion_half_t* image_out,
     librediffusion_stream_t stream)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!image_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -1089,7 +1149,7 @@ librediffusion_encode_image_half(
     librediffusion_pipeline_handle pipeline, const librediffusion_half_t* image,
     librediffusion_half_t* latent_out, librediffusion_stream_t stream)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!image || !latent_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -1107,7 +1167,7 @@ librediffusion_encode_image_float(
     librediffusion_pipeline_handle pipeline, const float* image,
     librediffusion_half_t* latent_out, librediffusion_stream_t stream)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!image || !latent_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -1125,7 +1185,7 @@ librediffusion_decode_latent(
     librediffusion_pipeline_handle pipeline, const librediffusion_half_t* latent,
     librediffusion_half_t* image_out, librediffusion_stream_t stream)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!latent || !image_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -1147,7 +1207,7 @@ librediffusion_predict_x0_batch(
     librediffusion_pipeline_handle pipeline, const librediffusion_half_t* x_t_latent_in,
     librediffusion_half_t* x_0_pred_out, librediffusion_stream_t stream)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!x_t_latent_in || !x_0_pred_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -1172,7 +1232,7 @@ librediffusion_rgba_nhwc_to_nchw_float(
     librediffusion_pipeline_handle pipeline, const uint8_t* rgba_nhwc_in,
     float* rgb_nchw_out, int width, int height, librediffusion_stream_t stream)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!rgba_nhwc_in || !rgb_nchw_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -1191,7 +1251,7 @@ librediffusion_rgba_nhwc_to_nchw_half(
     librediffusion_half_t* rgb_nchw_out, int width, int height,
     librediffusion_stream_t stream)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!rgba_nhwc_in || !rgb_nchw_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -1209,7 +1269,7 @@ librediffusion_nchw_half_to_rgba_nhwc(
     librediffusion_pipeline_handle pipeline, const librediffusion_half_t* rgb_nchw_in,
     uint8_t* rgba_nhwc_out, int width, int height, librediffusion_stream_t stream)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!rgb_nchw_in || !rgba_nhwc_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -1227,7 +1287,7 @@ librediffusion_nchw_float_to_rgba_nhwc(
     librediffusion_pipeline_handle pipeline, const float* rgb_nchw_in,
     uint8_t* rgba_nhwc_out, int width, int height, librediffusion_stream_t stream)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!rgb_nchw_in || !rgba_nhwc_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -1244,7 +1304,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL librediffusion_rgb
     librediffusion_pipeline_handle pipeline, uint8_t* rgba_input, int in_width,
     int in_height, uint8_t* rgba_output, int out_width, int out_height)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!rgba_input || !rgba_output)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
@@ -1268,7 +1328,7 @@ librediffusion_enable_temporal_coherence(
     float injection_strength, float similarity_threshold, int cache_interval,
     int max_cached_frames)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
   return try_catch_wrapper([&]() {
@@ -1284,7 +1344,7 @@ librediffusion_enable_temporal_coherence(
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_disable_temporal_coherence(librediffusion_pipeline_handle pipeline)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
   return try_catch_wrapper([&]() {
@@ -1295,7 +1355,7 @@ librediffusion_disable_temporal_coherence(librediffusion_pipeline_handle pipelin
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_reset_temporal_state(librediffusion_pipeline_handle pipeline)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
   return try_catch_wrapper([&]() {
@@ -1306,7 +1366,7 @@ librediffusion_reset_temporal_state(librediffusion_pipeline_handle pipeline)
 LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
 librediffusion_get_current_frame_id(librediffusion_pipeline_handle pipeline)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return -1;
 
   return pipeline->cpp_pipeline->getCurrentFrameId();
@@ -1439,7 +1499,7 @@ librediffusion_half_to_float(librediffusion_half_t value)
 LIBREDIFFUSION_API librediffusion_stream_t LIBREDIFFUSION_CALL
 librediffusion_pipeline_get_stream(librediffusion_pipeline_handle pipeline)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return nullptr;
 
   return static_cast<librediffusion_stream_t>(pipeline->cpp_pipeline->stream_);
@@ -1448,7 +1508,7 @@ librediffusion_pipeline_get_stream(librediffusion_pipeline_handle pipeline)
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_pipeline_synchronize(librediffusion_pipeline_handle pipeline)
 {
-  if (!pipeline || !pipeline->cpp_pipeline)
+  if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
   cudaError_t err = cudaStreamSynchronize(pipeline->cpp_pipeline->stream_);
