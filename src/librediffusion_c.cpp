@@ -85,6 +85,20 @@ librediffusion_error_t try_catch_wrapper(Func&& func)
     return LIBREDIFFUSION_ERROR_INTERNAL;
   }
 }
+
+// Guard every inference entry point against a pipeline whose conditioning / scheduler the host has
+// not supplied yet. Construction succeeds long before prepare_embeds()/prepare_scheduler() are
+// called, and the denoise path dereferences both unconditionally, so an early frame used to be a
+// guaranteed null-deref rather than an error code. Returns SUCCESS when the pipeline is ready.
+librediffusion_error_t check_inference_ready(librediffusion_pipeline_handle pipeline)
+{
+  if (const char* why = pipeline->cpp_pipeline->inference_readiness())
+  {
+    std::fprintf(stderr, "[librediffusion] NOT_INITIALIZED: %s\n", why);
+    return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  }
+  return LIBREDIFFUSION_SUCCESS;
+}
 } // anonymous namespace
 
 /*===========================================================================*/
@@ -955,6 +969,9 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL librediffusion_img
   if (width <= 0 || height <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
 
+  if (librediffusion_error_t e = check_inference_ready(pipeline); e != LIBREDIFFUSION_SUCCESS)
+    return e;
+
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->img2img(cpu_rgba_input, cpu_rgba_output, width, height);
   });
@@ -970,6 +987,9 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL librediffusion_txt
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (width <= 0 || height <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
+
+  if (librediffusion_error_t e = check_inference_ready(pipeline); e != LIBREDIFFUSION_SUCCESS)
+    return e;
 
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->txt2img(cpu_rgba_output, width, height);
@@ -990,6 +1010,9 @@ librediffusion_img2img_gpu_half(
   if (!image_in || !image_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
+  if (librediffusion_error_t e = check_inference_ready(pipeline); e != LIBREDIFFUSION_SUCCESS)
+    return e;
+
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->img2img_impl(
         to_half_ptr(image_in),
@@ -1008,6 +1031,9 @@ librediffusion_img2img_gpu_float(
   if (!image_in || !image_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
+  if (librediffusion_error_t e = check_inference_ready(pipeline); e != LIBREDIFFUSION_SUCCESS)
+    return e;
+
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->img2img_impl(
         image_in,
@@ -1025,6 +1051,9 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL librediffusion_txt
   if (!image_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
+  if (librediffusion_error_t e = check_inference_ready(pipeline); e != LIBREDIFFUSION_SUCCESS)
+    return e;
+
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->txt2img_impl(
         to_half_ptr(image_out),
@@ -1041,6 +1070,9 @@ librediffusion_txt2img_sd_turbo_gpu(
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!image_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
+
+  if (librediffusion_error_t e = check_inference_ready(pipeline); e != LIBREDIFFUSION_SUCCESS)
+    return e;
 
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->txt2img_sd_turbo_impl(
@@ -1119,6 +1151,9 @@ librediffusion_predict_x0_batch(
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!x_t_latent_in || !x_0_pred_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
+
+  if (librediffusion_error_t e = check_inference_ready(pipeline); e != LIBREDIFFUSION_SUCCESS)
+    return e;
 
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->predict_x0_batch(

@@ -225,6 +225,16 @@ public:
       std::span<float> c_out              // [num_timesteps] - output scaling
   );
 
+  // Is the pipeline in a state where txt2img()/img2img() can legally run?
+  //
+  // The constructor brings up CUDA, the engines and the buffers, and then reports success — but it
+  // does NOT bring up the conditioning (prepare_embeds) or the scheduler coefficients
+  // (prepare_scheduler). Those arrive later, from the host, and nothing used to record that they had
+  // not arrived: an inference call at that moment dereferenced a null unique_ptr and indexed an
+  // empty std::vector. Returns nullptr when ready, otherwise a static string naming what is missing
+  // (the C API turns that into LIBREDIFFUSION_ERROR_NOT_INITIALIZED).
+  const char* inference_readiness() const;
+
   // Set initial noise from Python (for testing/validation)
   void set_init_noise(const __half* noise); // [denoising_steps, 4, latent_h, latent_w]
 

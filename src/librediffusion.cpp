@@ -91,6 +91,26 @@ void LibreDiffusionPipeline::set_delta(float g)
   config_.delta = g;
 }
 
+const char* LibreDiffusionPipeline::inference_readiness() const
+{
+  // Conditioning: every UNet forward reads prompt_embeds_->data() unconditionally.
+  if(!prompt_embeds_)
+    return "prompt embeddings not prepared (call librediffusion_prepare_embeds first)";
+
+  // Scheduler: sub_timesteps_ is the device timestep buffer every forward binds, and the four
+  // coefficient vectors are indexed host-side ([0] on the 1-step turbo path, [i] on the multi-step
+  // one). An empty vector's data() is nullptr, so [0] is a null read, not merely a wrong number.
+  if(!sub_timesteps_ || alpha_prod_t_sqrt_host_.empty() || beta_prod_t_sqrt_host_.empty()
+     || c_skip_host_.empty() || c_out_host_.empty())
+    return "scheduler not prepared (call librediffusion_prepare_scheduler first)";
+
+  // SDXL additionally binds the pooled embeddings and the time ids on every path.
+  if(config_.model_type == ModelType::SDXL_TURBO && (!text_embeds_ || !time_ids_))
+    return "SDXL conditioning not prepared (call librediffusion_prepare_sdxl_conditioning first)";
+
+  return nullptr;
+}
+
 void LibreDiffusionPipeline::prepare_scheduler(
     std::span<float> timesteps, std::span<float> alpha_prod_t_sqrt,
     std::span<float> beta_prod_t_sqrt, std::span<float> c_skip, std::span<float> c_out)
