@@ -235,7 +235,7 @@ void LibreDiffusionPipeline::txt2img_sd_turbo_impl(
 
   // SD-Turbo formula: x_0_pred_out = (x_t_latent - beta * model_pred) / alpha
   // Step 1: model_pred *= beta
-  float beta = beta_prod_t_sqrt_host_[0];
+  float beta = beta_at(0);
   launch_scalar_mul_inplace_fp16(model_pred.data(), beta, latent_size, stream);
 
   // Step 2: x_0_pred_out = x_t_latent - model_pred
@@ -244,7 +244,7 @@ void LibreDiffusionPipeline::txt2img_sd_turbo_impl(
       latent_size, stream);
 
   // Step 3: x_0_pred_out /= alpha
-  float alpha = alpha_prod_t_sqrt_host_[0];
+  float alpha = alpha_at(0);
   CUDATensor<__half> x_0_pred_final(latent_size);
   launch_scalar_div_fp16(
       unet_output_x_0_pred_->data(), x_0_pred_final.data(), alpha, latent_size, stream);

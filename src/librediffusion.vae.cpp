@@ -10,8 +10,8 @@ void LibreDiffusionPipeline::add_noise_direct(
     cudaStream_t stream)
 {
   // Access host-side copies 
-  float alpha = alpha_prod_t_sqrt_host_[t_index];
-  float beta = beta_prod_t_sqrt_host_[t_index];
+  float alpha = alpha_at(t_index);
+  float beta = beta_at(t_index);
 
   launch_add_noise_direct_fp16(original_samples, noise, alpha, beta, N, stream);
 }
@@ -61,7 +61,7 @@ void LibreDiffusionPipeline::encode_image(
     if(config_.do_add_noise)
       add_noise_direct(latent_out, init_noise_->data(), /*t_index=*/0, latent_elements, stream);
     else
-      launch_scalar_mul_inplace_fp16(latent_out, alpha_prod_t_sqrt_host_[0], latent_elements, stream);
+      launch_scalar_mul_inplace_fp16(latent_out, alpha_at(0), latent_elements, stream);
   }
 }
 
@@ -88,7 +88,7 @@ void LibreDiffusionPipeline::encode_image(
     if(config_.do_add_noise)
       add_noise_direct(latent_out, init_noise_->data(), /*t_index=*/0, latent_elements, stream);
     else
-      launch_scalar_mul_inplace_fp16(latent_out, alpha_prod_t_sqrt_host_[0], latent_elements, stream);
+      launch_scalar_mul_inplace_fp16(latent_out, alpha_at(0), latent_elements, stream);
   }
 }
 

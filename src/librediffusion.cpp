@@ -98,6 +98,39 @@ void LibreDiffusionPipeline::set_delta(float g)
   config_.delta = g;
 }
 
+namespace
+{
+// One place for the bounds check so every coefficient read reports the same way: a clear exception
+// naming the array and both indices, which the C API turns into an error code, instead of an
+// unchecked read past the end of a std::vector.
+inline float coeff_at(const std::vector<float>& v, int i, const char* name)
+{
+  if(i < 0 || (size_t)i >= v.size())
+    throw std::out_of_range(
+        std::string("scheduler coefficient ") + name + "[" + std::to_string(i)
+        + "] out of range (schedule has " + std::to_string(v.size())
+        + " entries) — prepare_scheduler was not called with a schedule of this length");
+  return v[(size_t)i];
+}
+} // namespace
+
+float LibreDiffusionPipeline::alpha_at(int i) const
+{
+  return coeff_at(alpha_prod_t_sqrt_host_, i, "alpha_prod_t_sqrt");
+}
+float LibreDiffusionPipeline::beta_at(int i) const
+{
+  return coeff_at(beta_prod_t_sqrt_host_, i, "beta_prod_t_sqrt");
+}
+float LibreDiffusionPipeline::c_skip_at(int i) const
+{
+  return coeff_at(c_skip_host_, i, "c_skip");
+}
+float LibreDiffusionPipeline::c_out_at(int i) const
+{
+  return coeff_at(c_out_host_, i, "c_out");
+}
+
 const char* LibreDiffusionPipeline::inference_readiness() const
 {
   // Conditioning: every UNet forward reads prompt_embeds_->data() unconditionally.
@@ -143,6 +176,21 @@ void LibreDiffusionPipeline::prepare_scheduler(
   if(alpha_prod_t_sqrt.size() != n || beta_prod_t_sqrt.size() != n
      || c_skip.size() != n || c_out.size() != n)
     throw std::runtime_error("prepare_scheduler: coefficient spans must all match timesteps.size()");
+  if(n == 0)
+    throw std::runtime_error("prepare_scheduler: an empty schedule is not a schedule");
+  // ...and they must also match config_.denoising_steps, which is what the denoise loops iterate and
+  // what init_buffers()/reinit_buffers() sized every batch buffer from. The equal-span guard above
+  // only compares the five arrays to EACH OTHER; a schedule shorter than the declared step count used
+  // to render silently (denoising_steps=2 against a 1-entry schedule returned SUCCESS and a plausible
+  // frame while reading alpha_prod_t_sqrt_host_[1] past the end of a 1-element vector). A genuine
+  // step-count change goes through reinit_buffers FIRST — which sets denoising_steps and reallocates —
+  // and only then pushes the matching schedule, so this never fires on a legitimate live update.
+  if((int)n != config_.denoising_steps)
+    throw std::runtime_error(
+        "prepare_scheduler: schedule has " + std::to_string(n)
+        + " timesteps but the pipeline is configured for "
+        + std::to_string(config_.denoising_steps)
+        + " denoising steps (reinit_buffers with the new step count first)");
   auto reuse = [&](std::unique_ptr<CUDATensor<float>>& b) {
     if(!b || b->size() != n) { b = std::make_unique<CUDATensor<float>>(n); }
   };

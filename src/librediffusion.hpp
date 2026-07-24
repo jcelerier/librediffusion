@@ -235,6 +235,27 @@ public:
   // (the C API turns that into LIBREDIFFUSION_ERROR_NOT_INITIALIZED).
   const char* inference_readiness() const;
 
+  // Number of denoise iterations that are actually backed by scheduler coefficients.
+  //
+  // config_.denoising_steps and the length of the five coefficient vectors are two independent
+  // pieces of state; the denoise loops iterated the former and indexed the latter, so a schedule
+  // shorter than the declared step count read past the end of a std::vector on every frame and
+  // rendered a plausible-looking frame with SUCCESS. prepare_scheduler() now refuses a length that
+  // disagrees with config_.denoising_steps, so these are equal in practice — taking the min keeps
+  // every loop in bounds even if some future path lets them drift apart again.
+  int denoise_steps() const
+  {
+    const int n = (int)alpha_prod_t_sqrt_host_.size();
+    return config_.denoising_steps < n ? config_.denoising_steps : n;
+  }
+
+  // Bounds-checked scheduler coefficients. These were raw std::vector operator[]: for i >= size()
+  // an unchecked read past the end, and for an EMPTY vector a null dereference (data() == nullptr).
+  float alpha_at(int i) const;
+  float beta_at(int i) const;
+  float c_skip_at(int i) const;
+  float c_out_at(int i) const;
+
   // Set initial noise from Python (for testing/validation)
   void set_init_noise(const __half* noise); // [denoising_steps, 4, latent_h, latent_w]
 
