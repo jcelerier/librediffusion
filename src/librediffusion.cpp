@@ -191,6 +191,37 @@ void LibreDiffusionPipeline::prepare_scheduler(
         + " timesteps but the pipeline is configured for "
         + std::to_string(config_.denoising_steps)
         + " denoising steps (reinit_buffers with the new step count first)");
+
+  // Values, not just counts. NaN and inf propagate through the whole latent in one multiply and the
+  // frame comes back pure white (mean 255, std 0) with LIBREDIFFUSION_SUCCESS; alpha == 0 is a
+  // DIVISOR on the turbo path (x_0_pred /= alpha) and yields mean 249 / std 35. A host automating a
+  // coefficient through a bad value was told nothing at all. Timestep VALUES stay unconstrained
+  // beyond finiteness — -999 and 1e30 both produce ordinary frames, so they are not our business.
+  // NOTE: the library is compiled with -ffast-math, so std::isfinite() and `x == 0.f` are NOT
+  // reliable here — the compiler is allowed to assume no NaN/inf exists, which is precisely the
+  // assumption these inputs violate. Inspect the IEEE-754 bits instead.
+  auto bits = [](float f) {
+    unsigned int u = 0;
+    std::memcpy(&u, &f, sizeof(u));
+    return u;
+  };
+  auto reject_non_finite = [&](std::span<float> v, const char* name) {
+    for(size_t i = 0; i < v.size(); i++)
+      if((bits(v[i]) & 0x7F800000u) == 0x7F800000u) // exponent all ones => inf or NaN
+        throw std::runtime_error(
+            std::string("prepare_scheduler: ") + name + "[" + std::to_string(i)
+            + "] is not a finite number");
+  };
+  reject_non_finite(timesteps, "timesteps");
+  reject_non_finite(alpha_prod_t_sqrt, "alpha_prod_t_sqrt");
+  reject_non_finite(beta_prod_t_sqrt, "beta_prod_t_sqrt");
+  reject_non_finite(c_skip, "c_skip");
+  reject_non_finite(c_out, "c_out");
+  for(size_t i = 0; i < alpha_prod_t_sqrt.size(); i++)
+    if((bits(alpha_prod_t_sqrt[i]) & 0x7FFFFFFFu) == 0u) // +0.0 or -0.0
+      throw std::runtime_error(
+          "prepare_scheduler: alpha_prod_t_sqrt[" + std::to_string(i)
+          + "] is zero; it is a divisor on the single-step path");
   auto reuse = [&](std::unique_ptr<CUDATensor<float>>& b) {
     if(!b || b->size() != n) { b = std::make_unique<CUDATensor<float>>(n); }
   };
