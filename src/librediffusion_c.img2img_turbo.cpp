@@ -164,6 +164,18 @@ int librediffusion_img2img_turbo_ehs_elements(librediffusion_img2img_turbo_handl
   return h->pipe->ehsElements();
 }
 
+librediffusion_error_t librediffusion_img2img_turbo_frame_size(
+    librediffusion_img2img_turbo_handle h, int* out_width, int* out_height)
+{
+  if(!h || !h->pipe)
+    return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  if(!out_width || !out_height)
+    return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  *out_width = h->pipe->frameWidth();
+  *out_height = h->pipe->frameHeight();
+  return LIBREDIFFUSION_SUCCESS;
+}
+
 /* DEPRECATED: these declare no sizes, so the caller's buffers cannot be checked. Prefer _sized. */
 librediffusion_error_t librediffusion_img2img_turbo_frame(
     librediffusion_img2img_turbo_handle h, const unsigned char* in_rgba, const float* ehs,
