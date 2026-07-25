@@ -64,6 +64,23 @@ std::string dims_to_string(const std::vector<int>& d)
   return s + "]";
 }
 
+// getTensorShape() on a name the engine does not declare logs an error and yields nbDims < 0;
+// look the name up first.
+nvinfer1::Dims io_shape(const nvinfer1::ICudaEngine* eng, const char* name)
+{
+  nvinfer1::Dims none{};
+  none.nbDims = -1;
+  if(!eng)
+    return none;
+  for(int i = 0; i < eng->getNbIOTensors(); i++)
+  {
+    const char* n = eng->getIOTensorName(i);
+    if(n && std::string(n) == name)
+      return eng->getTensorShape(name);
+  }
+  return none;
+}
+
 // Empty if `want` is a shape the engine can actually be given for `tensor`: static dimensions must
 // match exactly, dynamic ones must fall inside optimization profile 0. An absent tensor, or one whose
 // rank we do not recognise, constrains nothing.
@@ -73,7 +90,7 @@ std::string shape_rejection(
 {
   if(!eng)
     return {};
-  const nvinfer1::Dims have = eng->getTensorShape(tensor);
+  const nvinfer1::Dims have = io_shape(eng, tensor);
   if(have.nbDims <= 0 || (size_t)have.nbDims != want.size())
     return {};
   if(eng->getTensorIOMode(tensor) != nvinfer1::TensorIOMode::kINPUT)
@@ -2215,26 +2232,6 @@ __half* CLIPWrapper::computeEmbeddingsWithPooled(
     return d_sequence_embeddings;
   }
 }
-
-namespace
-{
-// getTensorShape() on a name the engine does not declare logs an error and yields nbDims < 0;
-// look the name up first.
-nvinfer1::Dims io_shape(nvinfer1::ICudaEngine* eng, const char* name)
-{
-  nvinfer1::Dims none{};
-  none.nbDims = -1;
-  if(!eng)
-    return none;
-  for(int i = 0; i < eng->getNbIOTensors(); i++)
-  {
-    const char* n = eng->getIOTensorName(i);
-    if(n && std::string(n) == name)
-      return eng->getTensorShape(name);
-  }
-  return none;
-}
-} // namespace
 
 int CLIPWrapper::sequenceHiddenDim() const
 {
