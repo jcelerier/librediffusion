@@ -223,6 +223,7 @@ public:
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, img2img_turbo_frame_dev_sized);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, img2img_turbo_frame_bytes);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, img2img_turbo_ehs_elements);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, img2img_turbo_frame_size);
 
   /*=========================================================================*/
   /* Utility Functions                                                       */
@@ -515,6 +516,7 @@ private:
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_frame_dev_sized);
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_frame_bytes);
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_ehs_elements);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_frame_size);
 
     /*=====================================================================*/
     /* Utility Functions                                                   */

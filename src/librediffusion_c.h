@@ -1335,6 +1335,13 @@ librediffusion_img2img_turbo_frame_bytes(librediffusion_img2img_turbo_handle h);
 LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
 librediffusion_img2img_turbo_ehs_elements(librediffusion_img2img_turbo_handle h);
 
+/* The same geometry as width and height, for callers that must rescale their input to it or
+ * allocate an output texture (frame_bytes alone cannot tell a 512x512 engine from a 256x1024 one).
+ * Writes nothing and returns LIBREDIFFUSION_ERROR_NOT_INITIALIZED on a null handle. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_img2img_turbo_frame_size(
+    librediffusion_img2img_turbo_handle h, int* out_width, int* out_height);
+
 /* HOST-bytes convenience (mirrors flux2_stream_frame): RGBA8 [H,W,4] in + host ehs[1,77,1024]
  * -> RGBA8 [H,W,4] out. Does all host<->device copies + RGBA<->CHW conversion internally, so callers
  * with no CUDA (e.g. the score node) only pass plain byte/float buffers. The geometry is the
