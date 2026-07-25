@@ -123,6 +123,43 @@ librediffusion_error_t try_catch_wrapper(Func&& func)
   }
 }
 
+// Same as try_catch_wrapper, but WITHOUT the trailing check_cuda_error().
+//
+// L-13: cudaGetLastError() BRINGS UP the CUDA primary context. Wrapping the config entry points —
+// which allocate a struct of ints and strings and touch no device — in try_catch_wrapper therefore
+// made librediffusion_config_create() cost a full context creation (hundreds of ms, hundreds of MB
+// of VRAM) on whatever thread happened to deserialise a preset, pinned it to the DEFAULT device
+// before config_set_device was ever read, and left the process unable to fork a working child.
+// Measured: a child forked after version() can cudaMalloc; a child forked after config_create()
+// cannot (cudaErrorInitializationError).
+//
+// Use this for any entry point that cannot possibly have produced a CUDA error; keep
+// try_catch_wrapper where a CUDA call really may have happened.
+template <typename Func>
+librediffusion_error_t try_catch_host(Func&& func)
+{
+  try
+  {
+    func();
+    return LIBREDIFFUSION_SUCCESS;
+  }
+  catch (const std::bad_alloc&)
+  {
+    std::fprintf(stderr, "[librediffusion] OUT_OF_MEMORY\n");
+    return LIBREDIFFUSION_ERROR_OUT_OF_MEMORY;
+  }
+  catch (const std::exception& e)
+  {
+    std::fprintf(stderr, "[librediffusion] INTERNAL ERROR: %s\n", e.what());
+    return LIBREDIFFUSION_ERROR_INTERNAL;
+  }
+  catch (...)
+  {
+    std::fprintf(stderr, "[librediffusion] INTERNAL ERROR: unknown (non-std::exception)\n");
+    return LIBREDIFFUSION_ERROR_INTERNAL;
+  }
+}
+
 // Guard every inference entry point against a pipeline whose conditioning / scheduler the host has
 // not supplied yet. Construction succeeds long before prepare_embeds()/prepare_scheduler() are
 // called, and the denoise path dereferences both unconditionally, so an early frame used to be a
@@ -195,7 +232,7 @@ librediffusion_config_create(librediffusion_config_handle* config)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   *config = nullptr;
 
-  return try_catch_wrapper([&]() { *config = new librediffusion_config_t{}; });
+  return try_catch_host([&]() { *config = new librediffusion_config_t{}; });
 }
 
 LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
@@ -218,7 +255,7 @@ librediffusion_config_clone(
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   *dst = nullptr;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_host([&]() {
     *dst = new librediffusion_config_t{LIBREDIFFUSION_CONFIG_MAGIC, src->cpp_config};
   });
 }
@@ -414,7 +451,7 @@ librediffusion_config_set_unet_engine(
   if (!valid(config) || !path)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_host([&]() {
     config->cpp_config.unet_engine_path = path;
   });
 }
@@ -426,7 +463,7 @@ librediffusion_config_set_vae_encoder(
   if (!valid(config) || !path)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_host([&]() {
     config->cpp_config.vae_encoder_path = path;
   });
 }
@@ -438,7 +475,7 @@ librediffusion_config_set_vae_decoder(
   if (!valid(config) || !path)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_host([&]() {
     config->cpp_config.vae_decoder_path = path;
   });
 }
@@ -472,7 +509,7 @@ librediffusion_config_set_timestep_indices(
   if (count > 0 && !indices)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_host([&]() {
     config->cpp_config.timestep_indices.assign(indices, indices + count);
   });
 }
@@ -936,7 +973,7 @@ librediffusion_config_set_ipadapter(
 {
   if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
-  return try_catch_wrapper([&]() {
+  return try_catch_host([&]() {
     config->cpp_config.ipadapter_num_tokens = num_image_tokens;
     config->cpp_config.ipadapter_scale = scale;
   });
@@ -951,7 +988,7 @@ librediffusion_config_set_ipadapter_image_encoder(
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (!image_encoder_engine || !image_proj_engine)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
-  return try_catch_wrapper([&]() {
+  return try_catch_host([&]() {
     config->cpp_config.ipadapter_image_encoder_path = image_encoder_engine;
     config->cpp_config.ipadapter_image_proj_path = image_proj_engine;
   });
