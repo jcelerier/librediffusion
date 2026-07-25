@@ -175,14 +175,15 @@ void LibreDiffusionPipeline::prepare_scheduler(
   // reinit_buffers (which sets denoising_steps AND reallocates).
   if(alpha_prod_t_sqrt.size() != n || beta_prod_t_sqrt.size() != n
      || c_skip.size() != n || c_out.size() != n)
-    throw std::runtime_error("prepare_scheduler: coefficient spans must all match timesteps.size()");
+    throw invalid_dimensions_error(
+        "prepare_scheduler: coefficient spans must all match timesteps.size()");
   if(n == 0)
-    throw std::runtime_error("prepare_scheduler: an empty schedule is not a schedule");
+    throw invalid_argument_error("prepare_scheduler: an empty schedule is not a schedule");
   // ...and they must match config_.denoising_steps, which is what the denoise loops iterate and what
   // init_buffers()/reinit_buffers() sized every batch buffer from. A step-count change goes through
   // reinit_buffers first, so this never fires on a legitimate live update.
   if((int)n != config_.denoising_steps)
-    throw std::runtime_error(
+    throw invalid_dimensions_error(
         "prepare_scheduler: schedule has " + std::to_string(n)
         + " timesteps but the pipeline is configured for "
         + std::to_string(config_.denoising_steps)
@@ -200,7 +201,7 @@ void LibreDiffusionPipeline::prepare_scheduler(
   auto reject_non_finite = [&](std::span<float> v, const char* name) {
     for(size_t i = 0; i < v.size(); i++)
       if((bits(v[i]) & 0x7F800000u) == 0x7F800000u) // exponent all ones => inf or NaN
-        throw std::runtime_error(
+        throw invalid_argument_error(
             std::string("prepare_scheduler: ") + name + "[" + std::to_string(i)
             + "] is not a finite number");
   };
@@ -211,7 +212,7 @@ void LibreDiffusionPipeline::prepare_scheduler(
   reject_non_finite(c_out, "c_out");
   for(size_t i = 0; i < alpha_prod_t_sqrt.size(); i++)
     if((bits(alpha_prod_t_sqrt[i]) & 0x7FFFFFFFu) == 0u) // +0.0 or -0.0
-      throw std::runtime_error(
+      throw invalid_argument_error(
           "prepare_scheduler: alpha_prod_t_sqrt[" + std::to_string(i)
           + "] is zero; it is a divisor on the single-step path");
   auto reuse = [&](std::unique_ptr<CUDATensor<float>>& b, size_t want) {

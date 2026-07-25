@@ -16,11 +16,26 @@
 #include <deque>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace librediffusion
 {
+
+// Argument rejections, as opposed to internal failures. try_catch_wrapper maps these to
+// LIBREDIFFUSION_ERROR_INVALID_ARGUMENT / _INVALID_DIMENSIONS; a plain std::runtime_error thrown
+// from the same place collapses to -99 INTERNAL, which tells the caller nothing about whose fault
+// it is and is indistinguishable from a TensorRT failure.
+struct invalid_argument_error : std::invalid_argument
+{
+  using std::invalid_argument::invalid_argument;
+};
+
+struct invalid_dimensions_error : std::invalid_argument
+{
+  using std::invalid_argument::invalid_argument;
+};
 
 // Forward declarations
 class UNetWrapper;
