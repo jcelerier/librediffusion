@@ -160,6 +160,11 @@ librediffusion_config_set_device(librediffusion_config_handle config, int device
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_model_type(
     librediffusion_config_handle config, librediffusion_model_type_t type);
+/* Image and latent geometry. Validated: width/height must be positive, <= 16384, and multiples of
+ * 8; latent_width/latent_height must be exactly width/8 and height/8 (the VAE's downsampling
+ * factor). Anything else is LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS — every kernel indexes one grid
+ * and the engine the other, and an oversized pair overflows the int the buffer sizes are computed
+ * in before reaching an unchecked cudaMalloc. */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_dimensions(
     librediffusion_config_handle config, int width, int height, int latent_width,
