@@ -204,6 +204,10 @@ public:
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, rife_get_interpolation_exp);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, rife_interpolate);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, rife_interpolate_gpu);
+  // Capacity-declaring forms (preferred; absent from older .so builds, hence OPT below).
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, rife_interpolate_sized);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, rife_interpolate_gpu_sized);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, rife_required_out_bytes);
 
   /*=========================================================================*/
   /* img2img-turbo (pix2pix-turbo skip-VAE, github.com/GaParmar/img2img-turbo)*/
@@ -494,6 +498,9 @@ private:
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_get_interpolation_exp);
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_interpolate);
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_interpolate_gpu);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_interpolate_sized);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_interpolate_gpu_sized);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_required_out_bytes);
 
     /*=====================================================================*/
     /* img2img-turbo (pix2pix-turbo skip-VAE)                              */
