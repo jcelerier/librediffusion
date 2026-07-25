@@ -4,6 +4,7 @@
 #include "kernels.hpp"
 #include "nchw.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 #include <cassert>
@@ -270,8 +271,11 @@ void LibreDiffusionPipeline::prepare_scheduler(
 
 void LibreDiffusionPipeline::set_init_noise(const __half* noise)
 {
-  // Copy noise from Python to our internal buffer
-  size_t noise_size = init_noise_->size();
+  // Copy only what the caller supplies: init_noise_ is allocated wider than the documented
+  // [noise_batch, 4, lh, lw] input, and reading the surplus would run off the caller's buffer.
+  size_t noise_size = std::min(
+      init_noise_input_elems_ ? init_noise_input_elems_ : init_noise_->size(),
+      init_noise_->size());
   cudaMemcpyAsync(
       init_noise_->data(), noise, noise_size * sizeof(__half), cudaMemcpyDeviceToDevice,
       stream_);

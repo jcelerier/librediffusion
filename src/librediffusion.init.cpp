@@ -246,6 +246,8 @@ void LibreDiffusionPipeline::init_buffers()
   // ...but both buffers are READ at the latent extent: cfg-self/cfg-initialize copy `batch_size`
   // latents out of stock_noise_ and add_noise reads `total_batch` out of init_noise_, which match
   // `denoising_steps` only when batch_size == denoising_steps * frame_buffer_size.
+  init_noise_input_elems_
+      = (size_t)noise_batch_size * 4 * config_.latent_height * config_.latent_width;
   noise_batch_size = std::max({noise_batch_size, config_.batch_size, timestep_extent()});
   init_noise_ = std::make_unique<CUDATensor<__half>>(
       noise_batch_size * 4 * config_.latent_height * config_.latent_width);
