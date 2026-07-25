@@ -817,11 +817,17 @@ librediffusion_nchw_float_to_rgba_nhwc(
 /**
  * Resize RGBA image on GPU.
  *
+ * BOTH BUFFERS MUST BE DEVICE POINTERS. This runs NPP directly on the pointers it is given, with
+ * no host staging and no cudaPointerGetAttributes probe. Passing a host buffer is an illegal
+ * device access, which is a STICKY CUDA error: it does not fail this call, it destroys the CUDA
+ * context and every later entry point in the process returns
+ * LIBREDIFFUSION_ERROR_CUDA_CONTEXT_LOST. cudaMemcpy host pixels to a device buffer first.
+ *
  * @param pipeline      Pipeline handle
- * @param rgba_input    Input [in_height, in_width, 4] as uint8
+ * @param rgba_input    DEVICE pointer, input [in_height, in_width, 4] as uint8
  * @param in_width      Input width
  * @param in_height     Input height
- * @param rgba_output   Output [out_height, out_width, 4] as uint8
+ * @param rgba_output   DEVICE pointer, output [out_height, out_width, 4] as uint8
  * @param out_width     Output width
  * @param out_height    Output height
  * @return LIBREDIFFUSION_SUCCESS or error code
