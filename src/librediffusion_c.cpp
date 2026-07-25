@@ -147,6 +147,18 @@ librediffusion_error_t try_catch_wrapper(Func&& func)
     std::fprintf(stderr, "[librediffusion] OUT_OF_MEMORY\n");
     return LIBREDIFFUSION_ERROR_OUT_OF_MEMORY;
   }
+  catch (const librediffusion::invalid_dimensions_error& e)
+  {
+    drain_cuda_error();
+    std::fprintf(stderr, "[librediffusion] INVALID_DIMENSIONS: %s\n", e.what());
+    return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
+  }
+  catch (const librediffusion::invalid_argument_error& e)
+  {
+    drain_cuda_error();
+    std::fprintf(stderr, "[librediffusion] INVALID_ARGUMENT: %s\n", e.what());
+    return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  }
   catch (const std::exception& e)
   {
     // Surface the message so the C-API caller (harness/app) can see WHY an internal error
