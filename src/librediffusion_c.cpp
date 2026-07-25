@@ -9,6 +9,8 @@
 #include "librediffusion.hpp"
 #include "tensorrt_wrappers.hpp"
 
+#include "cuda_error_state.hpp"
+
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -78,27 +80,38 @@ inline bool valid_handle(librediffusion_pipeline_handle p)
 
 namespace
 {
-thread_local cudaError_t g_last_cuda_error = cudaSuccess;
+using librediffusion::cuda_context_lost;
+using librediffusion::cuda_error_is_context_fatal;
+using librediffusion::drain_cuda_error;
+using librediffusion::g_last_cuda_error;
+using librediffusion::set_cuda_error;
 
-void set_cuda_error(cudaError_t err)
+// For the entry points that hold a cudaError_t of their own: record it, consume whatever the runtime
+// still has pending, and answer with the right one of the two codes.
+librediffusion_error_t report_cuda_failure(cudaError_t err)
 {
-  g_last_cuda_error = err;
+  drain_cuda_error();
+  set_cuda_error(err);
+  if (cuda_error_is_context_fatal(err))
+    librediffusion::g_cuda_context_lost.store(true, std::memory_order_relaxed);
+  return cuda_error_is_context_fatal(err) ? LIBREDIFFUSION_ERROR_CUDA_CONTEXT_LOST
+                                          : LIBREDIFFUSION_ERROR_CUDA_ERROR;
 }
 
 librediffusion_error_t check_cuda_error()
 {
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess)
-  {
-    set_cuda_error(err);
-    return LIBREDIFFUSION_ERROR_CUDA_ERROR;
-  }
-  return LIBREDIFFUSION_SUCCESS;
+  cudaError_t err = drain_cuda_error();
+  if (err == cudaSuccess)
+    return LIBREDIFFUSION_SUCCESS;
+  return cuda_error_is_context_fatal(err) ? LIBREDIFFUSION_ERROR_CUDA_CONTEXT_LOST
+                                          : LIBREDIFFUSION_ERROR_CUDA_ERROR;
 }
 
 template <typename Func>
 librediffusion_error_t try_catch_wrapper(Func&& func)
 {
+  if (cuda_context_lost())
+    return LIBREDIFFUSION_ERROR_CUDA_CONTEXT_LOST;
   try
   {
     func();
@@ -106,6 +119,7 @@ librediffusion_error_t try_catch_wrapper(Func&& func)
   }
   catch (const std::bad_alloc&)
   {
+    drain_cuda_error();
     std::fprintf(stderr, "[librediffusion] OUT_OF_MEMORY\n");
     return LIBREDIFFUSION_ERROR_OUT_OF_MEMORY;
   }
@@ -113,11 +127,13 @@ librediffusion_error_t try_catch_wrapper(Func&& func)
   {
     // Surface the message so the C-API caller (harness/app) can see WHY an internal error
     // occurred instead of an opaque -99. Without this every throw collapsed to the same code.
+    drain_cuda_error();
     std::fprintf(stderr, "[librediffusion] INTERNAL ERROR: %s\n", e.what());
     return LIBREDIFFUSION_ERROR_INTERNAL;
   }
   catch (...)
   {
+    drain_cuda_error();
     std::fprintf(stderr, "[librediffusion] INTERNAL ERROR: unknown (non-std::exception)\n");
     return LIBREDIFFUSION_ERROR_INTERNAL;
   }
@@ -1594,6 +1610,8 @@ librediffusion_error_string(librediffusion_error_t error)
       return "Invalid dimensions";
     case LIBREDIFFUSION_ERROR_FILE_NOT_FOUND:
       return "File not found";
+    case LIBREDIFFUSION_ERROR_CUDA_CONTEXT_LOST:
+      return "CUDA context lost (unrecoverable; restart the process)";
     case LIBREDIFFUSION_ERROR_INTERNAL:
     default:
       return "Internal error";
@@ -1639,10 +1657,7 @@ librediffusion_pipeline_synchronize(librediffusion_pipeline_handle pipeline)
 
   cudaError_t err = cudaStreamSynchronize(pipeline->cpp_pipeline->stream_);
   if (err != cudaSuccess)
-  {
-    set_cuda_error(err);
-    return LIBREDIFFUSION_ERROR_CUDA_ERROR;
-  }
+    return report_cuda_failure(err);
   return LIBREDIFFUSION_SUCCESS;
 }
 
@@ -1667,7 +1682,7 @@ LIBREDIFFUSION_API void* LIBREDIFFUSION_CALL librediffusion_cuda_malloc(size_t s
   cudaError_t err = cudaMalloc(&ptr, size);
   if (err != cudaSuccess)
   {
-    set_cuda_error(err);
+    report_cuda_failure(err);
     return nullptr;
   }
   return ptr;
@@ -1679,9 +1694,7 @@ LIBREDIFFUSION_API void LIBREDIFFUSION_CALL librediffusion_cuda_free(void* ptr)
   {
     cudaError_t err = cudaFree(ptr);
     if (err != cudaSuccess)
-    {
-      set_cuda_error(err);
-    }
+      report_cuda_failure(err);
   }
 }
 
@@ -1691,7 +1704,7 @@ LIBREDIFFUSION_API void* LIBREDIFFUSION_CALL librediffusion_cuda_malloc_host(siz
   cudaError_t err = cudaMallocHost(&ptr, size);
   if (err != cudaSuccess)
   {
-    set_cuda_error(err);
+    report_cuda_failure(err);
     return nullptr;
   }
   return ptr;
@@ -1703,9 +1716,7 @@ LIBREDIFFUSION_API void LIBREDIFFUSION_CALL librediffusion_cuda_free_host(void* 
   {
     cudaError_t err = cudaFreeHost(ptr);
     if (err != cudaSuccess)
-    {
-      set_cuda_error(err);
-    }
+      report_cuda_failure(err);
   }
 }
 
@@ -1714,10 +1725,7 @@ librediffusion_cuda_memcpy_h2d(void* dst, const void* src, size_t size)
 {
   cudaError_t err = cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice);
   if (err != cudaSuccess)
-  {
-    set_cuda_error(err);
-    return LIBREDIFFUSION_ERROR_CUDA_ERROR;
-  }
+    return report_cuda_failure(err);
   return LIBREDIFFUSION_SUCCESS;
 }
 
@@ -1726,10 +1734,7 @@ librediffusion_cuda_memcpy_d2h(void* dst, const void* src, size_t size)
 {
   cudaError_t err = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost);
   if (err != cudaSuccess)
-  {
-    set_cuda_error(err);
-    return LIBREDIFFUSION_ERROR_CUDA_ERROR;
-  }
+    return report_cuda_failure(err);
   return LIBREDIFFUSION_SUCCESS;
 }
 
@@ -1738,10 +1743,7 @@ librediffusion_cuda_device_synchronize(void)
 {
   cudaError_t err = cudaDeviceSynchronize();
   if (err != cudaSuccess)
-  {
-    set_cuda_error(err);
-    return LIBREDIFFUSION_ERROR_CUDA_ERROR;
-  }
+    return report_cuda_failure(err);
   return LIBREDIFFUSION_SUCCESS;
 }
 
