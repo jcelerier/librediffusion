@@ -2123,42 +2123,115 @@ __half* CLIPWrapper::computeEmbeddingsWithPooled(
   }
 }
 
+namespace
+{
+// getTensorShape() on a name the engine does not declare logs an error and yields nbDims < 0;
+// look the name up first.
+nvinfer1::Dims io_shape(nvinfer1::ICudaEngine* eng, const char* name)
+{
+  nvinfer1::Dims none{};
+  none.nbDims = -1;
+  if(!eng)
+    return none;
+  for(int i = 0; i < eng->getNbIOTensors(); i++)
+  {
+    const char* n = eng->getIOTensorName(i);
+    if(n && std::string(n) == name)
+      return eng->getTensorShape(name);
+  }
+  return none;
+}
+} // namespace
+
+int CLIPWrapper::sequenceHiddenDim() const
+{
+  auto* eng = cached_engine_ ? cached_engine_->getEngine() : nullptr;
+  nvinfer1::Dims te = io_shape(eng, "text_embeddings");
+  if(te.nbDims == 3 && te.d[2] > 0)
+    return (int)te.d[2];
+  nvinfer1::Dims hs = io_shape(eng, "hidden_states");
+  return (hs.nbDims == 3 && hs.d[2] > 0) ? (int)hs.d[2] : 0;
+}
+
+int CLIPWrapper::pooledDim() const
+{
+  auto* eng = cached_engine_ ? cached_engine_->getEngine() : nullptr;
+  nvinfer1::Dims te = io_shape(eng, "text_embeddings");
+  return (te.nbDims == 2 && te.d[1] > 0) ? (int)te.d[1] : 0;
+}
+
+namespace
+{
+void* checked_malloc(size_t bytes, const char* what)
+{
+  void* p = nullptr;
+  cudaError_t e = cudaMalloc(&p, bytes);
+  if(e != cudaSuccess || !p)
+    throw std::runtime_error(
+        std::string("computeClipEmbeddings_SDXL: cudaMalloc(") + what + ", "
+        + std::to_string(bytes) + " bytes) failed: " + cudaGetErrorString(e));
+  return p;
+}
+} // namespace
+
 SDXLPromptEmbeddings computeClipEmbeddings_SDXL(
     CLIPWrapper& clip, CLIPWrapper& clip2, const std::string& prompt, int batch_size,
     int height, int width, cudaStream_t clip_stream)
 {
+  if(batch_size < 1)
+    throw std::invalid_argument("computeClipEmbeddings_SDXL: batch_size must be >= 1");
+
+  const int h1 = clip.sequenceHiddenDim();
+  const int h2 = clip2.sequenceHiddenDim();
+  const int pooled_dim = clip2.pooledDim();
+  if(h1 <= 0 || h2 <= 0)
+    throw std::runtime_error(
+        "computeClipEmbeddings_SDXL: CLIP engines declare no per-token embeddings ("
+        + std::to_string(h1) + " + " + std::to_string(h2) + ")");
+  if(pooled_dim <= 0)
+    throw std::runtime_error(
+        "computeClipEmbeddings_SDXL: the second engine has no pooled output — it is not an "
+        "SDXL CLIP2 (text_embeddings must be 2-D)");
+
   SDXLPromptEmbeddings ret;
 
-  // CLIP encoder 1: 768-dim with EOS padding (49407)
+  // CLIP encoder 1: EOS padding (49407)
   __half* d_embeds1 = clip.computeEmbeddings(prompt, clip_stream, 49407);
 
-  // CLIP encoder 2: 1280-dim with pooled output, PAD padding (0)
+  // CLIP encoder 2: pooled output, PAD padding (0)
+  __half* d_pooled_row = nullptr;
   __half* d_embeds2
-      = clip2.computeEmbeddingsWithPooled(prompt, clip_stream, 0, &ret.pooled_embeds);
+      = clip2.computeEmbeddingsWithPooled(prompt, clip_stream, 0, &d_pooled_row);
 
-  // Concatenate embeddings: [batch, 77, 768+1280] = [batch, 77, 2048]
-  size_t total_size = batch_size * 77 * 2048;
+  // Both encoders run one prompt, so each source holds exactly ONE [77, h] row. Every batch element
+  // shares that prompt: broadcast row 0 rather than indexing the source by b.
+  const int hidden = h1 + h2;
+  ret.embeddings
+      = (__half*)checked_malloc((size_t)batch_size * 77 * hidden * sizeof(__half), "embeddings");
 
-  cudaMalloc(&ret.embeddings, total_size * sizeof(__half));
-
-  // Copy embeddings sequentially for each batch element and sequence position
   for(int b = 0; b < batch_size; ++b)
   {
     for(int s = 0; s < 77; ++s)
     {
-      // Copy 768-dim from encoder 1
       cudaMemcpy(
-          ret.embeddings + (b * 77 + s) * 2048, d_embeds1 + (b * 77 + s) * 768,
-          768 * sizeof(__half), cudaMemcpyDeviceToDevice);
-      // Copy 1280-dim from encoder 2
+          ret.embeddings + ((size_t)b * 77 + s) * hidden, d_embeds1 + (size_t)s * h1,
+          h1 * sizeof(__half), cudaMemcpyDeviceToDevice);
       cudaMemcpy(
-          ret.embeddings + (b * 77 + s) * 2048 + 768, d_embeds2 + (b * 77 + s) * 1280,
-          1280 * sizeof(__half), cudaMemcpyDeviceToDevice);
+          ret.embeddings + ((size_t)b * 77 + s) * hidden + h1, d_embeds2 + (size_t)s * h2,
+          h2 * sizeof(__half), cudaMemcpyDeviceToDevice);
     }
   }
 
+  ret.pooled_embeds
+      = (__half*)checked_malloc((size_t)batch_size * pooled_dim * sizeof(__half), "pooled_embeds");
+  for(int b = 0; b < batch_size; ++b)
+    cudaMemcpy(
+        ret.pooled_embeds + (size_t)b * pooled_dim, d_pooled_row,
+        pooled_dim * sizeof(__half), cudaMemcpyDeviceToDevice);
+
   cudaFree(d_embeds1);
   cudaFree(d_embeds2);
+  cudaFree(d_pooled_row);
 
   // Prepare time_ids: [original_height, original_width, crop_top, crop_left, target_height, target_width]
   std::vector<__half> time_ids_host(batch_size * 6);
@@ -2172,7 +2245,8 @@ SDXLPromptEmbeddings computeClipEmbeddings_SDXL(
     time_ids_host[i * 6 + 5] = __half(static_cast<float>(width));  // target_width
   }
 
-  cudaMalloc(&ret.time_ids, batch_size * 6 * sizeof(__half));
+  ret.time_ids
+      = (__half*)checked_malloc((size_t)batch_size * 6 * sizeof(__half), "time_ids");
   cudaMemcpy(
       ret.time_ids, time_ids_host.data(), batch_size * 6 * sizeof(__half),
       cudaMemcpyHostToDevice);
