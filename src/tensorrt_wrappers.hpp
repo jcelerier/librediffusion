@@ -127,6 +127,9 @@ public:
   /// True if the loaded engine declares the input_control_* residual inputs (control-aware UNet).
   bool hasControlInputs() const { return has_control_inputs_; }
 
+  /// True if the engine declares the SDXL added conditioning inputs (text_embeds + time_ids).
+  bool hasSdxlConditioning() const { return has_sdxl_conditioning_; }
+
   /// True if the loaded engine is an IP-Adapter variant (declares the `ipadapter_scale` input).
   bool hasIpAdapter() const { return has_ipadapter_; }
   /// Length of the ipadapter_scale vector (= num cross-attn IP layers), detected at load (0 if none).
@@ -192,6 +195,8 @@ public:
 
   /// True if the loaded engine declares the kvo_cache_in_* inputs (live StreamV2V UNet).
   bool hasV2VKvo() const { return has_v2v_kvo_; }
+  /// True if the engine declares the legacy attention_* StreamV2V outputs.
+  bool hasV2VOutputs() const { return has_v2v_outputs_; }
   /// True if the engine banks attention OUTPUTS (3-component [K,V,O]) — i.e. feature injection is baked.
   bool hasV2VInject() const { return kvo_components_ >= 3; }
   /// Clear the rolling K/V bank (zeros) so the next frame starts an empty temporal context.
@@ -292,6 +297,7 @@ private:
 
   // IP-Adapter: engine declares an `ipadapter_scale` fp32 vector input (+ a longer ehs seq). The IP
   // attention is baked into the engine; we only bind the per-layer scale vector here.
+  bool has_sdxl_conditioning_ = false;  // engine declares text_embeds + time_ids
   bool has_ipadapter_ = false;
   int num_ip_layers_ = 0;
   std::unique_ptr<CUDATensor<float>> ipadapter_scale_buffer_;

@@ -41,10 +41,41 @@ void LibreDiffusionPipeline::init_cuda()
 
 void LibreDiffusionPipeline::init_engines()
 {
+  // FLUX.2-klein is a rectified-flow MMDiT with its own engines and its own C API
+  // (librediffusion_flux2_*). Declaring it here used to be "recorded for completeness": the SD
+  // pipeline ran, rendered ordinary SD frames, and reported success, so a host that mis-declared its
+  // model got a plausible image and no signal.
+  if(config_.model_type == ModelType::FLUX2_KLEIN_4B)
+    throw std::runtime_error(
+        "model_type FLUX2_KLEIN_4B is not a Stable Diffusion pipeline; drive klein through "
+        "librediffusion_flux2_stream_create");
+
   bool use_v2v = (config_.mode == PipelineMode::TEMPORAL_V2V);
   unet_ = std::make_unique<UNetWrapper>(config_.unet_engine_path, use_v2v);
   vae_encoder_ = std::make_unique<VAEEncoderWrapper>(config_.vae_encoder_path);
   vae_decoder_ = std::make_unique<VAEDecoderWrapper>(config_.vae_decoder_path);
+
+  // Same rule as ControlNet / IP-Adapter below: a mode the engine cannot honour is a configuration
+  // error, not a stderr line followed by plain img2img.
+  if(use_v2v && !(unet_->hasV2VKvo() || unet_->hasV2VOutputs()))
+    throw std::runtime_error(
+        "TEMPORAL_V2V requested but the UNet engine '" + config_.unet_engine_path
+        + "' is neither a kvo (kvo_cache_in_*) nor an attention_* StreamV2V UNet; export a v2v "
+          "UNet, or use MODE_SINGLE_FRAME");
+
+  // SDXL added conditioning (pooled text_embeds + time_ids) is an ENGINE property. Declaring it
+  // against an engine that has no text_embeds input made config_set_sdxl_config and
+  // prepare_sdxl_conditioning both return SUCCESS while the buffers went nowhere: the frame was
+  // byte-identical to not declaring it at all.
+  if(config_.model_type == ModelType::SDXL_TURBO && !unet_->hasSdxlConditioning())
+    throw std::runtime_error(
+        "model_type SDXL_TURBO but the UNet engine '" + config_.unet_engine_path
+        + "' declares no text_embeds/time_ids inputs; it is not an SDXL UNet");
+  if(config_.model_type != ModelType::SDXL_TURBO && unet_->hasSdxlConditioning())
+    throw std::runtime_error(
+        "the UNet engine '" + config_.unet_engine_path
+        + "' declares the SDXL text_embeds/time_ids inputs but model_type is not SDXL_TURBO; the "
+          "SD path never binds them");
 
   // ControlNet (optional, multi): create a wrapper per configured net. Enabled only when at least one
   // net is configured AND the UNet engine is control-aware (declares input_control_* inputs).
