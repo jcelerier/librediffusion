@@ -271,7 +271,11 @@ void LibreDiffusionPipeline::init_buffers()
 
 void LibreDiffusionPipeline::init_npp()
 {
-  NppStreamContext npp_stream_;
+  // This used to declare a LOCAL `NppStreamContext npp_stream_;` that shadowed the member of the
+  // same name: everything below filled the local, the member stayed uninitialised, and the local was
+  // discarded on return. It was harmless only because its sole consumer — rgba_resize — began with
+  // an unconditional `return;` and never ran. Now that the resize is live, the member must be real.
+  npp_stream_ = NppStreamContext{};
 
   int device = config_.device;
   cudaGetDevice(&device);
@@ -287,6 +291,11 @@ void LibreDiffusionPipeline::init_npp()
   npp_stream_.nCudaDevAttrComputeCapabilityMajor = prop.major;
   npp_stream_.nCudaDevAttrComputeCapabilityMinor = prop.minor;
   npp_stream_.hStream = this->stream_;
+  unsigned int flags = 0;
+  if(this->stream_ && cudaStreamGetFlags(this->stream_, &flags) == cudaSuccess)
+    npp_stream_.nStreamFlags = flags;
+  else
+    npp_stream_.nStreamFlags = 0;
 }
 
 void LibreDiffusionPipeline::reinit_buffers(const LibreDiffusionConfig& new_config)
