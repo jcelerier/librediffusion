@@ -307,6 +307,22 @@ librediffusion_config_set_dimensions(
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (width <= 0 || height <= 0 || latent_width <= 0 || latent_height <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
+  // Everything that is not <= 0 used to be accepted verbatim, including combinations that cannot
+  // describe a real image: 185600x185600 (batch*4*lh*lw overflows the int it is computed in ->
+  // negative -> a huge size_t -> a cudaMalloc that fails and whose result is never checked), 513x511
+  // (the VAE's 8x downsampling cannot express it), and a latent grid unrelated to the pixel grid
+  // (every kernel indexes one and the engine the other). Downstream those were contained only by
+  // luck. Refuse them here, where the caller still has a return code to look at.
+  //
+  // 16384 is well past any diffusion model in existence and keeps every width*height*4 and
+  // batch*4*lh*lw product far inside an int.
+  constexpr int kMaxDim = 16384;
+  if (width > kMaxDim || height > kMaxDim)
+    return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
+  if ((width % 8) != 0 || (height % 8) != 0)
+    return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
+  if (latent_width != width / 8 || latent_height != height / 8)
+    return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
 
   config->cpp_config.width = width;
   config->cpp_config.height = height;
