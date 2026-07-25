@@ -801,18 +801,11 @@ librediffusion_pipeline_reinit_buffers(
   if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
-  bool rejected = false;
-  librediffusion_error_t err = try_catch_wrapper([&]() {
-    std::string why = pipeline->cpp_pipeline->geometry_rejection(config->cpp_config);
-    if(!why.empty())
-    {
-      std::fprintf(stderr, "[librediffusion] INVALID_DIMENSIONS: %s\n", why.c_str());
-      rejected = true;
-      return;
-    }
+  // reinit_buffers runs geometry_rejection itself and throws invalid_dimensions_error, which
+  // try_catch_wrapper turns into LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS.
+  return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->reinit_buffers(config->cpp_config);
   });
-  return rejected ? LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS : err;
 }
 
 /*===========================================================================*/
