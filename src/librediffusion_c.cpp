@@ -17,9 +17,12 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <span>
 #include <string>
+#include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 #define LIBREDIFFUSION_VERSION_MAJOR 1
@@ -27,50 +30,77 @@
 #define LIBREDIFFUSION_VERSION_PATCH 0
 #define LIBREDIFFUSION_VERSION_STRING "1.0.0"
 
-/* Handle validation (L-11).
+/* Handle validation (L-11, S-03).
  *
- * A C handle is the one thing a host cannot check for itself, so the library has to. Each handle
- * carries a magic word that is set on construction and CLEARED just before the block is freed, and
- * every entry point checks it. That turns the three mistakes hosts actually make — passing a
- * destroyed handle, destroying twice, and using the out-parameter a failed create never wrote —
- * into ordinary error codes instead of a glibc double-free abort, a SIGSEGV, or (worst of all) a
- * destroyed handle that keeps answering queries with garbage.
+ * A C handle is the one thing a host cannot check for itself, so the library has to: passing a
+ * destroyed handle, destroying twice, and using the out-parameter a failed create never wrote all
+ * have to become ordinary error codes rather than a glibc double-free abort or a SIGSEGV.
  *
- * Reading the magic out of a freed block is not something the standard blesses, but it is the only
- * mitigation available at a C boundary and it converts the overwhelmingly common cases (the block
- * is still mapped and either untouched or reused) into a clean rejection. */
-#define LIBREDIFFUSION_CONFIG_MAGIC 0x4C524443u   /* 'LRDC' */
-#define LIBREDIFFUSION_PIPELINE_MAGIC 0x4C524450u /* 'LRDP' */
+ * The check therefore lives OUTSIDE the block it validates. A registry of live handles is consulted
+ * by pointer value and never dereferences an untrusted handle. */
 
 struct librediffusion_config_t
 {
-  unsigned int magic{LIBREDIFFUSION_CONFIG_MAGIC};
   librediffusion::LibreDiffusionConfig cpp_config;
 };
 
 struct librediffusion_pipeline_t
 {
-  unsigned int magic{LIBREDIFFUSION_PIPELINE_MAGIC};
   std::unique_ptr<librediffusion::LibreDiffusionPipeline> cpp_pipeline;
 };
 
 namespace
 {
+template <typename T>
+struct handle_registry
+{
+  std::mutex mutex;
+  std::unordered_set<const void*> live;
+};
+
+// Deliberately leaked: a host may destroy a handle from a static destructor of its own, which can
+// run after any function-local static would have been torn down.
+template <typename T>
+handle_registry<T>& registry()
+{
+  static auto* r = new handle_registry<T>{};
+  return *r;
+}
+
+template <typename H>
+void register_handle(H h)
+{
+  auto& r = registry<std::remove_pointer_t<H>>();
+  std::lock_guard lock{r.mutex};
+  r.live.insert(h);
+}
+
+// True only for the caller that actually removed it, so two concurrent destroys cannot both free.
+template <typename H>
+bool unregister_handle(H h)
+{
+  auto& r = registry<std::remove_pointer_t<H>>();
+  std::lock_guard lock{r.mutex};
+  return r.live.erase(h) != 0;
+}
+
+template <typename H>
+bool is_live(H h)
+{
+  auto& r = registry<std::remove_pointer_t<H>>();
+  std::lock_guard lock{r.mutex};
+  return r.live.count(h) != 0;
+}
+
 // A live, never-destroyed config handle.
 inline bool valid(librediffusion_config_handle c)
 {
-  return c && c->magic == LIBREDIFFUSION_CONFIG_MAGIC;
+  return c && is_live(c);
 }
 // A live pipeline handle that also owns a pipeline (i.e. usable for real work).
 inline bool valid(librediffusion_pipeline_handle p)
 {
-  return p && p->magic == LIBREDIFFUSION_PIPELINE_MAGIC && p->cpp_pipeline;
-}
-// A live pipeline handle, whether or not construction got as far as the pipeline itself. Only
-// destroy needs this weaker form.
-inline bool valid_handle(librediffusion_pipeline_handle p)
-{
-  return p && p->magic == LIBREDIFFUSION_PIPELINE_MAGIC;
+  return p && is_live(p) && p->cpp_pipeline;
 }
 } // anonymous namespace
 
@@ -248,18 +278,20 @@ librediffusion_config_create(librediffusion_config_handle* config)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   *config = nullptr;
 
-  return try_catch_host([&]() { *config = new librediffusion_config_t{}; });
+  return try_catch_host([&]() {
+    auto c = std::make_unique<librediffusion_config_t>();
+    register_handle(c.get());
+    *config = c.release();
+  });
 }
 
 LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
 librediffusion_config_destroy(librediffusion_config_handle config)
 {
-  // NULL is documented as safe; so, now, is a handle that was already destroyed (previously a
-  // glibc "double free detected" -> SIGABRT). Clear the magic BEFORE freeing so the block cannot
-  // pass validation again even if the allocator hands it straight back out.
-  if (!valid(config))
+  // NULL is documented as safe; so is a handle that was already destroyed (previously a glibc
+  // "double free detected" -> SIGABRT).
+  if (!config || !unregister_handle(config))
     return;
-  config->magic = 0;
   delete config;
 }
 
@@ -272,7 +304,9 @@ librediffusion_config_clone(
   *dst = nullptr;
 
   return try_catch_host([&]() {
-    *dst = new librediffusion_config_t{LIBREDIFFUSION_CONFIG_MAGIC, src->cpp_config};
+    auto c = std::make_unique<librediffusion_config_t>(src->cpp_config);
+    register_handle(c.get());
+    *dst = c.release();
   });
 }
 
@@ -661,6 +695,7 @@ librediffusion_pipeline_create(
     auto p = std::make_unique<librediffusion_pipeline_t>();
     p->cpp_pipeline = std::make_unique<librediffusion::LibreDiffusionPipeline>(
         config->cpp_config);
+    register_handle(p.get());
     *pipeline = p.release();
   });
 }
@@ -669,12 +704,10 @@ LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
 librediffusion_pipeline_destroy(librediffusion_pipeline_handle pipeline)
 {
   // NULL and already-destroyed are both no-ops (a second destroy used to re-run the whole dtor
-  // chain — CUDA stream, graph, TensorRT contexts — on freed memory, i.e. SIGSEGV). valid_handle()
-  // rather than valid(): a pipeline whose construction failed has no cpp_pipeline but still owns
-  // the wrapper, and must still be freed.
-  if (!valid_handle(pipeline))
+  // chain — CUDA stream, graph, TensorRT contexts — on freed memory, i.e. SIGSEGV). Registration is
+  // not conditional on cpp_pipeline: a pipeline whose construction failed still owns the wrapper.
+  if (!pipeline || !unregister_handle(pipeline))
     return;
-  pipeline->magic = 0;
   delete pipeline;
 }
 
