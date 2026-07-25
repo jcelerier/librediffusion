@@ -253,6 +253,11 @@ public:
   // missing (the C API turns that into LIBREDIFFUSION_ERROR_NOT_INITIALIZED).
   const char* inference_readiness() const;
 
+  // Narrower forms for the standalone VAE entry points, which need neither conditioning nor a
+  // schedule -- only the engine they drive. Same contract as inference_readiness().
+  const char* encode_readiness() const;
+  const char* decode_readiness() const;
+
   /// Number of timestep entries the UNet paths copy out of sub_timesteps_ per forward.
   int timestep_extent() const
   {

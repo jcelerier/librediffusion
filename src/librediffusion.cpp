@@ -151,6 +151,22 @@ const char* LibreDiffusionPipeline::inference_readiness() const
   return nullptr;
 }
 
+const char* LibreDiffusionPipeline::encode_readiness() const
+{
+  if(!vae_encoder_)
+    return "no VAE encoder (call librediffusion_pipeline_init_engines, and configure "
+           "vae_encoder_path first)";
+  return nullptr;
+}
+
+const char* LibreDiffusionPipeline::decode_readiness() const
+{
+  if(!vae_decoder_)
+    return "no VAE decoder (call librediffusion_pipeline_init_engines, and configure "
+           "vae_decoder_path first)";
+  return nullptr;
+}
+
 void LibreDiffusionPipeline::prepare_scheduler(
     std::span<float> timesteps, std::span<float> alpha_prod_t_sqrt,
     std::span<float> beta_prod_t_sqrt, std::span<float> c_skip, std::span<float> c_out)

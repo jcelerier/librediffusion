@@ -215,6 +215,16 @@ librediffusion_error_t check_inference_ready(librediffusion_pipeline_handle pipe
   }
   return LIBREDIFFUSION_SUCCESS;
 }
+
+librediffusion_error_t check_ready(const char* why)
+{
+  if (why)
+  {
+    std::fprintf(stderr, "[librediffusion] NOT_INITIALIZED: %s\n", why);
+    return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  }
+  return LIBREDIFFUSION_SUCCESS;
+}
 // These entry points size the device buffer from the CALL's arguments, but every consumer reads
 // config_.text_seq_len * config_.text_hidden_dim back out of it with a raw cudaMemcpyAsync — so a
 // declared shape that disagrees with the config is an out-of-bounds DEVICE read.
@@ -1303,6 +1313,9 @@ librediffusion_encode_image_half(
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!image || !latent_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  if (librediffusion_error_t e = check_ready(pipeline->cpp_pipeline->encode_readiness());
+      e != LIBREDIFFUSION_SUCCESS)
+    return e;
 
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->encode_image(
@@ -1321,6 +1334,9 @@ librediffusion_encode_image_float(
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!image || !latent_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  if (librediffusion_error_t e = check_ready(pipeline->cpp_pipeline->encode_readiness());
+      e != LIBREDIFFUSION_SUCCESS)
+    return e;
 
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->encode_image(
@@ -1339,6 +1355,9 @@ librediffusion_decode_latent(
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!latent || !image_out)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  if (librediffusion_error_t e = check_ready(pipeline->cpp_pipeline->decode_readiness());
+      e != LIBREDIFFUSION_SUCCESS)
+    return e;
 
   return try_catch_wrapper([&]() {
     pipeline->cpp_pipeline->decode_latent(
