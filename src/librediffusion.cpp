@@ -401,8 +401,15 @@ int LibreDiffusionPipeline::num_runtime_loras() const
 
 void LibreDiffusionPipeline::set_lora_scale(int idx, float scale)
 {
-  if(unet_)
-    unet_->setLoraScale(idx, scale);
+  // UNetWrapper::setLoraScale bounds-checks and returns silently, so a host that asked for a slot the
+  // engine does not have was told the scale had been applied. An engine with no runtime LoRA at all
+  // has zero slots, and every set on it was a no-op reported as success.
+  const int slots = num_runtime_loras();
+  if(idx < 0 || idx >= slots)
+    throw std::out_of_range(
+        "set_lora_scale: slot " + std::to_string(idx) + " but the UNet engine declares "
+        + std::to_string(slots) + " runtime LoRA slot(s)");
+  unet_->setLoraScale(idx, scale);
   // The captured 1-step CUDA graph bakes the lora_scale H2D (contents staged before enqueue). A value
   // change must re-stage -> force a recapture (the buffer address is stable + hashed in capture_signature,
   // so a no-op set leaves the graph intact). Same discipline as a prompt/scheduler change.
@@ -411,9 +418,13 @@ void LibreDiffusionPipeline::set_lora_scale(int idx, float scale)
 
 void LibreDiffusionPipeline::set_lora_scale_vector(const float* scales, int n)
 {
-  if(unet_)
-    for(int i = 0; i < n; i++)
-      unet_->setLoraScale(i, scales[i]);
+  const int slots = num_runtime_loras();
+  if(n < 0 || n > slots)
+    throw std::out_of_range(
+        "set_lora_scale_vector: " + std::to_string(n) + " scales but the UNet engine declares "
+        + std::to_string(slots) + " runtime LoRA slot(s)");
+  for(int i = 0; i < n; i++)
+    unet_->setLoraScale(i, scales[i]);
   graph_ready_ = false;
 }
 

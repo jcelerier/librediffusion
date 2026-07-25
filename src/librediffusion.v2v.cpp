@@ -32,6 +32,15 @@ void LibreDiffusionPipeline::enableTemporalCoherence(
   if(max_cached_frames < 1)
     throw std::invalid_argument("enableTemporalCoherence: max_cached_frames must be >= 1");
 
+  // L-15's shape, in the corner L-15 did not cover: on an engine that is neither a kvo nor a legacy
+  // attention_* StreamV2V UNet this returned SUCCESS, printed a line to stderr, and rendered frames
+  // byte-identical to plain img2img. A feature the bundle cannot honour is an error.
+  if(!unet_ || !(unet_->hasV2VKvo() || unet_->hasV2VOutputs()))
+    throw std::runtime_error(
+        "enableTemporalCoherence: the UNet engine '" + config_.unet_engine_path
+        + "' is neither a kvo (kvo_cache_in_*) nor an attention_* StreamV2V UNet, so temporal "
+          "coherence cannot be applied; export a v2v UNet or stay in single-frame mode");
+
   config_.mode = PipelineMode::TEMPORAL_V2V;
   config_.use_feature_injection = use_feature_injection;
   config_.feature_injection_strength = injection_strength;

@@ -169,6 +169,10 @@ void UNetWrapper::loadEngine(const std::string& engine_path)
         // StreamV2V dynamic feature injection: [fi_strength, threshold] fp32 [2] bound at runtime.
         has_v2v_inject_params_ = true;
       }
+      else if(nm == "text_embeds" && eng->getTensorIOMode(tn) == nvinfer1::TensorIOMode::kINPUT)
+      {
+        has_sdxl_conditioning_ = true;
+      }
       else if(nm == "ipadapter_scale" && eng->getTensorIOMode(tn) == nvinfer1::TensorIOMode::kINPUT)
       {
         has_ipadapter_ = true;
