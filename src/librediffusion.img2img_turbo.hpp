@@ -61,6 +61,13 @@ public:
       const unsigned char* in_rgba, const void* ehs_dev_fp16, unsigned char* out_rgba,
       cudaStream_t stream);
 
+  // The geometry the engines were built for. Callers of the host-bytes entry points need this to
+  // size their buffers (and the C API needs it to VALIDATE the sizes they declare).
+  int frameWidth() const { return W_; }
+  int frameHeight() const { return H_; }
+  // Elements the ehs buffer must contain: 1 * 77 * 1024 floats (SD2.1 cross-attention width).
+  static constexpr int kEhsElements = 77 * 1024;
+
   // sd-turbo scheduler alphas_cumprod[999] (the 1-step constant). Override if a model differs.
   // Clamp to (0,1] so the kernel's sqrtf(acp)/sqrtf(1-acp) can never hit a div-by-zero / NaN.
   void set_alpha_cumprod(float a) { acp_ = a < 1e-6f ? 1e-6f : (a > 1.0f ? 1.0f : a); }
