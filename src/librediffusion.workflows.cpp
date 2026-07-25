@@ -257,8 +257,8 @@ void LibreDiffusionPipeline::img2img(
     const uint8_t* cpu_rgba_input, uint8_t* cpu_rgba_output, int iw, int ih)
 {
   int batch_size = config_.batch_size;
-  // The HOST buffers hold ONE frame: the caller passes iw*ih*4 bytes, and img_preprocess /
-  // img_postprocess convert exactly one image ("FIXME batch not handled" in images.cpp). Sizing the
+  // The HOST buffers hold ONE frame: the caller passes iw*ih*4 bytes, and only one frame crosses the
+  // boundary in either direction (img_preprocess replicates it to the batch extent). Sizing the
   // host<->device copies by batch_size read `batch_size-1` extra frames past the end of the caller's
   // input and wrote that much past the end of its output — a plain heap overflow of a buffer this
   // library does not own, which is why batch 2 surfaced as glibc corruption or a SIGSEGV in cudaFree
@@ -322,8 +322,8 @@ void LibreDiffusionPipeline::img2img(
 void LibreDiffusionPipeline::txt2img(uint8_t* cpu_rgba_output, int iw, int ih)
 {
   int batch_size = config_.batch_size;
-  // The HOST buffers hold ONE frame: the caller passes iw*ih*4 bytes, and img_preprocess /
-  // img_postprocess convert exactly one image ("FIXME batch not handled" in images.cpp). Sizing the
+  // The HOST buffers hold ONE frame: the caller passes iw*ih*4 bytes, and only one frame crosses the
+  // boundary in either direction (img_preprocess replicates it to the batch extent). Sizing the
   // host<->device copies by batch_size read `batch_size-1` extra frames past the end of the caller's
   // input and wrote that much past the end of its output — a plain heap overflow of a buffer this
   // library does not own, which is why batch 2 surfaced as glibc corruption or a SIGSEGV in cudaFree
