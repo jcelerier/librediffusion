@@ -749,18 +749,7 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
 
       if(config_.do_add_noise)
       {
-        // Need to add noise: buffer = alpha * denoised + beta * noise
-        // Python: self.x_t_latent_buffer = alpha[1:] * x_0_pred[:-1] + beta[1:] * noise[1:]
-        // This means: buffer[i] = alpha[i+1] * denoised[i] + beta[i+1] * noise[i+1]
-        // For denoising_steps=2: buffer[0] = alpha[1] * denoised[0] + beta[1] * noise[1]
-
-        // WAIT - re-reading Python code more carefully:
-        // x_0_pred[:-1] means "all but the last", so denoised[0:denoising_steps-1]
-        // noise[1:] means "skip first", so noise[1:denoising_steps]
-        // alpha[1:] means "skip first", so alpha[1:denoising_steps]
-
-        // DEBUG: Check what we're putting into the buffer update
-        // FIXME this does not look like the correct thing ?
+        // buffer[i] = alpha[i+1] * denoised[i] + beta[i+1] * noise[i+1]
         for(int i = 0; i < denoise_steps() - 1; i++)
         {
           int denoised_offset = i * stride;    // denoised[i]
@@ -775,13 +764,8 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
       }
       else
       {
-        // No noise: buffer[i] = alpha[i+1] * denoised[i]  (beta*noise term is 0).
-        // Python (do_add_noise=False): x_t_latent_buffer = alpha_prod_t_sqrt[1:] * x_0_pred[:-1].
-        // The alpha scaling is NOT baked into the scheduler step output (denoised here IS
-        // x_0_pred, the clean prediction), so we must apply alpha[i+1] explicitly. Previously
-        // this raw-copied denoised[:-1] (omitting alpha<1), inflating the streaming buffer by
-        // ~1/alpha and drifting the converged x0 magnitude ~5% high (validation harness:
-        // cfg-none noise-0 predict_x0 rel 0.053, norm 146 vs golden 139).
+        // buffer[i] = alpha[i+1] * denoised[i]. `denoised` is x_0_pred, so the alpha scaling is not
+        // already applied and must be explicit.
         for(int i = 0; i < denoise_steps() - 1; i++)
         {
           int denoised_offset = i * stride; // denoised[i] = x_0_pred[i]
