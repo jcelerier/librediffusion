@@ -570,6 +570,11 @@ public:
       const std::string& prompt, cudaStream_t stream, int pad_token,
       __half** pooled_output);
 
+  /// Last dim of the per-token embeddings this engine emits, or 0 if it declares none.
+  int sequenceHiddenDim() const;
+  /// Last dim of the pooled embedding (CLIP2 only), or 0 if this engine has no pooled output.
+  int pooledDim() const;
+
 private:
   std::shared_ptr<CachedTensorRTEngine> cached_engine_;  // Shared cached engine
   std::unique_ptr<nvinfer1::IExecutionContext> context_; // Per-wrapper context
