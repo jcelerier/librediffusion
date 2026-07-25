@@ -4,6 +4,7 @@
 #include "nchw.hpp"
 #include "tensorrt_wrappers.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 #include <cassert>
@@ -224,6 +225,12 @@ void LibreDiffusionPipeline::init_buffers()
   // When use_denoising_batch=true, we need noise for each timestep (denoising_steps), not batch_size
   int noise_batch_size
       = config_.use_denoising_batch ? config_.denoising_steps : config_.batch_size;
+  // ...but both buffers are READ at the latent extent: cfg-self and cfg-initialize copy
+  // `batch_size` latents out of stock_noise_, and add_noise reads `total_batch` out of init_noise_.
+  // Those match `denoising_steps` only when batch_size == denoising_steps * frame_buffer_size. On
+  // any other combination the copy ran off the end of the allocation — batch 2 at 1 step over-read a
+  // whole latent, which is the corruption the sweep saw surface at teardown.
+  noise_batch_size = std::max({noise_batch_size, config_.batch_size, timestep_extent()});
   init_noise_ = std::make_unique<CUDATensor<__half>>(
       noise_batch_size * 4 * config_.latent_height * config_.latent_width);
 

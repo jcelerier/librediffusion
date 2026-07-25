@@ -144,6 +144,12 @@ const char* LibreDiffusionPipeline::inference_readiness() const
      || c_skip_host_.empty() || c_out_host_.empty())
     return "scheduler not prepared (call librediffusion_prepare_scheduler first)";
 
+  // reinit_buffers can raise batch_size / frame_buffer_size after the schedule was uploaded, and the
+  // forwards read sub_timesteps_ by that extent.
+  if(sub_timesteps_->size() < (size_t)timestep_extent())
+    return "the scheduler was prepared for a smaller batch (call librediffusion_prepare_scheduler "
+           "again after changing batch_size or frame_buffer_size)";
+
   // SDXL additionally binds the pooled embeddings and the time ids on every path.
   if(config_.model_type == ModelType::SDXL_TURBO && (!text_embeds_ || !time_ids_))
     return "SDXL conditioning not prepared (call librediffusion_prepare_sdxl_conditioning first)";
@@ -222,21 +228,31 @@ void LibreDiffusionPipeline::prepare_scheduler(
       throw std::runtime_error(
           "prepare_scheduler: alpha_prod_t_sqrt[" + std::to_string(i)
           + "] is zero; it is a divisor on the single-step path");
-  auto reuse = [&](std::unique_ptr<CUDATensor<float>>& b) {
-    if(!b || b->size() != n) { b = std::make_unique<CUDATensor<float>>(n); }
+  auto reuse = [&](std::unique_ptr<CUDATensor<float>>& b, size_t want) {
+    if(!b || b->size() != want) { b = std::make_unique<CUDATensor<float>>(want); }
   };
-  reuse(alpha_prod_t_sqrt_);
-  reuse(beta_prod_t_sqrt_);
-  reuse(c_skip_);
-  reuse(c_out_);
-  reuse(sub_timesteps_);
+  reuse(alpha_prod_t_sqrt_, n);
+  reuse(beta_prod_t_sqrt_, n);
+  reuse(c_skip_, n);
+  reuse(c_out_, n);
+
+  // sub_timesteps_ is the one buffer the UNet paths read by BATCH extent, not by step index: every
+  // forward copies `total_batch` (or batch_size) floats out of it. Those extents equal `n` only when
+  // batch_size == denoising_steps and frame_buffer_size == 1; anywhere else the copy ran past the end
+  // of the allocation. Hold the schedule cycled to the extent the forwards actually read, so `n` rows
+  // stay bit-identical and the surplus rows repeat the schedule instead of reading whatever followed.
+  const size_t extent = std::max(n, (size_t)timestep_extent());
+  reuse(sub_timesteps_, extent);
+  std::vector<float> cycled(extent);
+  for(size_t i = 0; i < extent; i++)
+    cycled[i] = timesteps[i % n];
 
   // Copy scheduler parameters to device
   cudaMemcpy(alpha_prod_t_sqrt_->data(), alpha_prod_t_sqrt_host_.data(), n * sizeof(float), cudaMemcpyHostToDevice);
   cudaMemcpy(beta_prod_t_sqrt_->data(), beta_prod_t_sqrt_host_.data(), n * sizeof(float), cudaMemcpyHostToDevice);
   cudaMemcpy(c_skip_->data(), c_skip_host_.data(), n * sizeof(float), cudaMemcpyHostToDevice);
   cudaMemcpy(c_out_->data(), c_out_host_.data(), n * sizeof(float), cudaMemcpyHostToDevice);
-  cudaMemcpy(sub_timesteps_->data(), timesteps.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(sub_timesteps_->data(), cycled.data(), extent * sizeof(float), cudaMemcpyHostToDevice);
 
   cudaStreamSynchronize(stream_);
 
