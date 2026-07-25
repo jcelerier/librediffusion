@@ -59,12 +59,12 @@ void librediffusion_rife_set_interpolation_exp(librediffusion_rife_handle h, int
   h->exp = exp;
 }
 
-int librediffusion_rife_required_out_bytes(librediffusion_rife_handle h, int H, int W)
+size_t librediffusion_rife_required_out_bytes(librediffusion_rife_handle h, int H, int W)
 {
   if(!h || H <= 0 || W <= 0)
     return 0;
   const int eff_exp = h->enabled ? h->exp : 0;
-  return (1 << eff_exp) * H * W * 4;
+  return (size_t)(1u << eff_exp) * (size_t)H * (size_t)W * 4u;
 }
 
 int librediffusion_rife_get_interpolation_exp(librediffusion_rife_handle h)

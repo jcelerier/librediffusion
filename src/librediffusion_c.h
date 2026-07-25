@@ -1266,8 +1266,9 @@ LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
 librediffusion_rife_get_interpolation_exp(librediffusion_rife_handle h);
 
 /* Exact byte capacity out_frames must have for the CURRENT exp / enabled state at this geometry:
- * (2^exp)*H*W*4, or H*W*4 when disabled. 0 on a null handle or non-positive geometry. */
-LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+ * (2^exp)*H*W*4, or H*W*4 when disabled. 0 on a null handle or non-positive geometry. size_t,
+ * because the product exceeds INT_MAX well inside the supported range (4096x4096 at exp 4). */
+LIBREDIFFUSION_API size_t LIBREDIFFUSION_CALL
 librediffusion_rife_required_out_bytes(librediffusion_rife_handle h, int H, int W);
 
 /* Interpolate between two consecutive real RGBA frames (HOST uint8 [H*W*4] each).
