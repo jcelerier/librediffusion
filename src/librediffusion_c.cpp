@@ -976,6 +976,7 @@ librediffusion_config_set_ipadapter(
   return try_catch_host([&]() {
     config->cpp_config.ipadapter_num_tokens = num_image_tokens;
     config->cpp_config.ipadapter_scale = scale;
+    config->cpp_config.ipadapter_requested = true;
   });
 }
 
