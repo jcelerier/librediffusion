@@ -78,20 +78,23 @@ librediffusion_error_t check_frame_sizes(
 {
   const size_t need = (size_t)h->pipe->frameHeight() * h->pipe->frameWidth() * 4;
   const size_t need_ehs = (size_t)librediffusion::Img2ImgTurboPipeline::kEhsElements;
-  if(in_bytes != need || out_bytes != need)
+  // Capacity, not equality (same contract as rife's check_out_capacity): the entry points read
+  // `need` bytes and write `need` bytes, so a caller who over-allocated is safe and must not be
+  // refused. Only a SHORT buffer is a bug.
+  if(in_bytes < need || out_bytes < need)
   {
     fprintf(
         stderr,
-        "img2img_turbo: buffer size mismatch — model is %dx%d (%zu bytes per frame), caller "
+        "img2img_turbo: buffer too small — model is %dx%d (%zu bytes per frame), caller "
         "declared in=%zu out=%zu\n",
         h->pipe->frameWidth(), h->pipe->frameHeight(), need, in_bytes, out_bytes);
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
   }
-  if(ehs_elements != need_ehs)
+  if(ehs_elements < need_ehs)
   {
     fprintf(
         stderr,
-        "img2img_turbo: embedding size mismatch — the model reads %zu floats [1,77,1024], caller "
+        "img2img_turbo: embedding too small — the model reads %zu floats [1,77,1024], caller "
         "declared %zu\n",
         need_ehs, ehs_elements);
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;

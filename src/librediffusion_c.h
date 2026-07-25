@@ -1338,12 +1338,13 @@ librediffusion_img2img_turbo_ehs_elements(librediffusion_img2img_turbo_handle h)
  * -> RGBA8 [H,W,4] out. Does all host<->device copies + RGBA<->CHW conversion internally, so callers
  * with no CUDA (e.g. the score node) only pass plain byte/float buffers. Model is static 512x512.
  *
- * PREFERRED FORM. The caller declares the length of every buffer the call touches, so a mismatch is
- * LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS instead of a silent overflow: the implementation copies
- * H*W*4 bytes out of in_rgba, H*W*4 bytes into out_rgba and 77*1024 floats out of ehs, all sized
- * from the ENGINE, not from anything the caller said.
- *   in_bytes / out_bytes  = librediffusion_img2img_turbo_frame_bytes(h)
- *   ehs_elements          = librediffusion_img2img_turbo_ehs_elements(h) */
+ * PREFERRED FORM. The caller declares the CAPACITY of every buffer the call touches, so a short
+ * buffer is LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS instead of a silent overflow: the
+ * implementation copies H*W*4 bytes out of in_rgba, H*W*4 bytes into out_rgba and 77*1024 floats
+ * out of ehs, all sized from the ENGINE, not from anything the caller said. Over-allocating is
+ * accepted; the extra bytes are untouched.
+ *   in_bytes / out_bytes  >= librediffusion_img2img_turbo_frame_bytes(h)
+ *   ehs_elements          >= librediffusion_img2img_turbo_ehs_elements(h) */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_img2img_turbo_frame_sized(
     librediffusion_img2img_turbo_handle h, const unsigned char* in_rgba, size_t in_bytes,
