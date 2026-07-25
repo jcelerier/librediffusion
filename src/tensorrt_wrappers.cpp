@@ -52,6 +52,80 @@ void TensorRTLogger::log(Severity severity, const char* msg) noexcept
 }
 
 // ============================================================================
+// Optimization-profile checks (S-02)
+// ============================================================================
+namespace
+{
+std::string dims_to_string(const std::vector<int>& d)
+{
+  std::string s = "[";
+  for(size_t i = 0; i < d.size(); i++)
+    s += (i ? ", " : "") + std::to_string(d[i]);
+  return s + "]";
+}
+
+// Empty if `want` is a shape the engine can actually be given for `tensor`: static dimensions must
+// match exactly, dynamic ones must fall inside optimization profile 0. An absent tensor, or one whose
+// rank we do not recognise, constrains nothing.
+std::string shape_rejection(
+    const nvinfer1::ICudaEngine* eng, const char* role, const char* tensor,
+    const std::vector<int>& want)
+{
+  if(!eng)
+    return {};
+  const nvinfer1::Dims have = eng->getTensorShape(tensor);
+  if(have.nbDims <= 0 || (size_t)have.nbDims != want.size())
+    return {};
+  if(eng->getTensorIOMode(tensor) != nvinfer1::TensorIOMode::kINPUT)
+    return {};
+
+  bool dynamic = false;
+  for(int i = 0; i < have.nbDims; i++)
+    dynamic = dynamic || have.d[i] < 0;
+
+  nvinfer1::Dims lo{}, hi{};
+  if(dynamic)
+  {
+    lo = eng->getProfileShape(tensor, 0, nvinfer1::OptProfileSelector::kMIN);
+    hi = eng->getProfileShape(tensor, 0, nvinfer1::OptProfileSelector::kMAX);
+    if(lo.nbDims != have.nbDims || hi.nbDims != have.nbDims)
+      return {};
+  }
+
+  for(int i = 0; i < have.nbDims; i++)
+  {
+    if(have.d[i] >= 0)
+    {
+      if(want[i] != have.d[i])
+        return std::string(role) + " engine input '" + tensor + "' is a fixed "
+               + std::to_string(have.d[i]) + " in dimension " + std::to_string(i) + ", but "
+               + dims_to_string(want) + " asks for " + std::to_string(want[i]);
+    }
+    else if(want[i] < lo.d[i] || want[i] > hi.d[i])
+    {
+      return std::string(role) + " engine input '" + tensor + "' admits "
+             + std::to_string(lo.d[i]) + ".." + std::to_string(hi.d[i]) + " in dimension "
+             + std::to_string(i) + ", but " + dims_to_string(want) + " asks for "
+             + std::to_string(want[i]);
+    }
+  }
+  return {};
+}
+} // anonymous namespace
+
+std::string UNetWrapper::rejectGeometry(
+    int batch, int latent_height, int latent_width, int seq_len, int hidden_dim) const
+{
+  const nvinfer1::ICudaEngine* eng = cached_engine_ ? cached_engine_->getEngine() : nullptr;
+  std::string why = shape_rejection(
+      eng, "UNet", "sample", {batch, 4, latent_height, latent_width});
+  if(why.empty())
+    why = shape_rejection(
+        eng, "UNet", "encoder_hidden_states", {batch, seq_len, hidden_dim});
+  return why;
+}
+
+// ============================================================================
 // UNetWrapper Implementation
 // ============================================================================
 
@@ -1667,6 +1741,13 @@ void VAEEncoderWrapper::encode(
   }
 }
 
+std::string VAEEncoderWrapper::rejectGeometry(int batch, int height, int width) const
+{
+  return shape_rejection(
+      cached_engine_ ? cached_engine_->getEngine() : nullptr, "VAE encoder", "images",
+      {batch, 3, height, width});
+}
+
 // ============================================================================
 // VAEDecoderWrapper Implementation
 // ============================================================================
@@ -1755,6 +1836,14 @@ void VAEDecoderWrapper::decode(
   {
     throw std::runtime_error("Failed to enqueue inference");
   }
+}
+
+std::string VAEDecoderWrapper::rejectGeometry(
+    int batch, int latent_height, int latent_width) const
+{
+  return shape_rejection(
+      cached_engine_ ? cached_engine_->getEngine() : nullptr, "VAE decoder", "latent",
+      {batch, 4, latent_height, latent_width});
 }
 
 // ============================================================================

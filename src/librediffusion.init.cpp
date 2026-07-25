@@ -353,8 +353,40 @@ void LibreDiffusionPipeline::init_npp()
     npp_stream_.nStreamFlags = 0;
 }
 
+std::string
+LibreDiffusionPipeline::geometry_rejection(const LibreDiffusionConfig& cfg) const
+{
+  // The UNet is driven at unet_batch_size(); cfg-full doubles that, so this is the loosest bound and
+  // cannot refuse a geometry that would have worked.
+  const int unet_batch
+      = cfg.batch_size + (cfg.denoising_steps - 1) * cfg.frame_buffer_size;
+
+  if(vae_encoder_)
+    if(auto why = vae_encoder_->rejectGeometry(cfg.batch_size, cfg.height, cfg.width);
+       !why.empty())
+      return why;
+  if(vae_decoder_)
+    if(auto why = vae_decoder_->rejectGeometry(
+           cfg.batch_size, cfg.latent_height, cfg.latent_width);
+       !why.empty())
+      return why;
+  if(unet_)
+    if(auto why = unet_->rejectGeometry(
+           unet_batch, cfg.latent_height, cfg.latent_width, cfg.text_seq_len,
+           cfg.text_hidden_dim);
+       !why.empty())
+      return why;
+  return {};
+}
+
 void LibreDiffusionPipeline::reinit_buffers(const LibreDiffusionConfig& new_config)
 {
+  // F-07's rule at the seam F-07's fix did not cover: engines cannot be reloaded here, so a geometry
+  // outside their profiles used to be installed, reported as success, and refused by TensorRT one
+  // call later as an opaque INTERNAL error from img2img.
+  if(auto why = geometry_rejection(new_config); !why.empty())
+    throw std::invalid_argument("reinit_buffers: " + why);
+
   // Preserve engine paths and mode (these cannot change without engine reload)
   // But update all other parameters
   config_.width = new_config.width;
