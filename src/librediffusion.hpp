@@ -191,6 +191,10 @@ public:
    */
   void reinit_buffers(const LibreDiffusionConfig& new_config);
 
+  /// Empty if the LOADED engines' optimization profiles admit `cfg`'s geometry, otherwise why not.
+  /// reinit_buffers cannot reload an engine, so a geometry outside them is unusable.
+  std::string geometry_rejection(const LibreDiffusionConfig& cfg) const;
+
   // Prepare the pipeline with prompt embeddings and scheduler parameters
   void prepare_embeds(
       const __half* prompt_embeds, // [batch_size, seq_len, hidden_dim]

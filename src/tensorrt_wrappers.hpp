@@ -193,6 +193,10 @@ public:
   /// runtime-adjustable rather than baked).
   bool hasV2VDynamicInject() const { return has_v2v_inject_params_; }
 
+  /// Empty if the engine's optimization profile admits this geometry, otherwise why not.
+  std::string rejectGeometry(
+      int batch, int latent_height, int latent_width, int seq_len, int hidden_dim) const;
+
   /// True if the loaded engine declares the kvo_cache_in_* inputs (live StreamV2V UNet).
   bool hasV2VKvo() const { return has_v2v_kvo_; }
   /// True if the engine declares the legacy attention_* StreamV2V outputs.
@@ -441,6 +445,9 @@ public:
       const float* images, __half* latent, int batch, int height, int width,
       cudaStream_t stream);
 
+  /// Empty if the engine's optimization profile admits this geometry, otherwise why not.
+  std::string rejectGeometry(int batch, int height, int width) const;
+
 private:
   std::shared_ptr<CachedTensorRTEngine> cached_engine_;  // Shared cached engine
   std::unique_ptr<nvinfer1::IExecutionContext> context_; // Per-wrapper context
@@ -494,6 +501,9 @@ public:
   void decode(
       const __half* latent, __half* images, int batch, int height, int width,
       cudaStream_t stream);
+
+  /// Empty if the engine's optimization profile admits this geometry, otherwise why not.
+  std::string rejectGeometry(int batch, int latent_height, int latent_width) const;
 
 private:
   std::shared_ptr<CachedTensorRTEngine> cached_engine_;  // Shared cached engine
