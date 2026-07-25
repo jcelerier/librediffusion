@@ -364,7 +364,7 @@ void LibreDiffusionPipeline::reinit_buffers(const LibreDiffusionConfig& new_conf
 {
   // Engines cannot be reloaded here, so a geometry outside their profiles is unusable.
   if(auto why = geometry_rejection(new_config); !why.empty())
-    throw std::invalid_argument("reinit_buffers: " + why);
+    throw invalid_dimensions_error("reinit_buffers: " + why);
 
   // Preserve engine paths and mode (these cannot change without engine reload)
   // But update all other parameters
