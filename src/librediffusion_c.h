@@ -1243,23 +1243,55 @@ librediffusion_rife_set_enabled(librediffusion_rife_handle h, int enabled);
 LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
 librediffusion_rife_is_enabled(librediffusion_rife_handle h);
 
-/* interpolation_exp: 0 = off (1 frame out), 1 = 2x, 2 = 4x, 3 = 8x displayed frames. */
+/* Largest interpolation exponent the library accepts: 2^4 = 16 frames per real frame, already far
+ * beyond what any display pipeline consumes. set_interpolation_exp CLAMPS to [0, this]. */
+#define LIBREDIFFUSION_RIFE_MAX_EXP 4
+
+/* interpolation_exp: 0 = off (1 frame out), 1 = 2x, 2 = 4x, 3 = 8x displayed frames.
+ * Clamped to [0, LIBREDIFFUSION_RIFE_MAX_EXP]: it used to be clamped only from below and stored
+ * verbatim, so a readback of 2147483647 was possible and the internal `total_out *= 2` loop was
+ * signed overflow (UB) from exp = 31 up. */
 LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
 librediffusion_rife_set_interpolation_exp(librediffusion_rife_handle h, int exp);
 
 LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
 librediffusion_rife_get_interpolation_exp(librediffusion_rife_handle h);
 
+/* Exact byte capacity out_frames must have for the CURRENT exp / enabled state at this geometry:
+ * (2^exp)*H*W*4, or H*W*4 when disabled. 0 on a null handle or non-positive geometry. */
+LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+librediffusion_rife_required_out_bytes(librediffusion_rife_handle h, int H, int W);
+
 /* Interpolate between two consecutive real RGBA frames (HOST uint8 [H*W*4] each).
- * Writes up to (2^exp) frames into out_frames (caller-sized (2^exp)*H*W*4); display order,
- * last frame == cur. *out_count receives the number of frames written.
- * When disabled (or exp==0), writes 1 frame (cur) and *out_count = 1. */
+ * Writes up to (2^exp) frames into out_frames; display order, last frame == cur. *out_count
+ * receives the number of frames written. When disabled (or exp==0), writes 1 frame (cur) and
+ * *out_count = 1.
+ *
+ * PREFERRED FORM. out_capacity_bytes is what the caller actually allocated; the number of frames
+ * written is derived from state set in a DIFFERENT call (set_interpolation_exp), so the two drift
+ * apart trivially — any host that raises the interpolation factor without re-sizing its buffer used
+ * to overflow it silently. A capacity smaller than
+ * librediffusion_rife_required_out_bytes() is LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_rife_interpolate_sized(
+    librediffusion_rife_handle h, const unsigned char* prev_rgba, const unsigned char* cur_rgba,
+    int H, int W, unsigned char* out_frames, size_t out_capacity_bytes, int* out_count);
+
+/* Device-pointer variant of _sized: prev/cur RGBA uint8 on DEVICE; out_frames RGBA uint8 on DEVICE. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_rife_interpolate_gpu_sized(
+    librediffusion_rife_handle h, const unsigned char* prev_rgba_dev,
+    const unsigned char* cur_rgba_dev, int H, int W, unsigned char* out_frames_dev,
+    size_t out_capacity_bytes, int* out_count);
+
+/* DEPRECATED (kept for ABI compatibility): out_frames carries no length, so the library cannot
+ * check that it is big enough for the (2^exp)*H*W*4 bytes it is about to write. The caller must
+ * size it from librediffusion_rife_required_out_bytes() itself. Prefer the _sized forms. */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_rife_interpolate(
     librediffusion_rife_handle h, const unsigned char* prev_rgba, const unsigned char* cur_rgba,
     int H, int W, unsigned char* out_frames, int* out_count);
 
-/* Device-pointer variant: prev/cur RGBA uint8 on DEVICE; out_frames RGBA uint8 on DEVICE. */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_rife_interpolate_gpu(
     librediffusion_rife_handle h, const unsigned char* prev_rgba_dev,
