@@ -4,6 +4,11 @@
 // and reading it clears it; unread, it is reported by the next entry point instead. A context-level
 // failure (illegal address, launch failure, ECC) cannot be cleared at all — every subsequent CUDA
 // call in the process returns it forever.
+//
+// Only errors the CUDA runtime itself declares STICKY belong in cuda_error_is_context_fatal():
+// latching one refuses every later entry point, pipeline_create included, for the life of the
+// process. cudaErrorContextIsDestroyed / cudaErrorDeviceUninitialized are deliberately absent —
+// a host that calls cudaDeviceReset() gets them once and recovers on the next call.
 #pragma once
 
 #include <cuda_runtime.h>
@@ -36,8 +41,8 @@ inline bool cuda_error_is_context_fatal(cudaError_t err)
     case cudaErrorInvalidAddressSpace:
     case cudaErrorInvalidPc:
     case cudaErrorECCUncorrectable:
-    case cudaErrorContextIsDestroyed:
-    case cudaErrorDeviceUninitialized:
+    case cudaErrorNvlinkUncorrectable:
+    case cudaErrorAssert:
       return true;
     default:
       return false;
