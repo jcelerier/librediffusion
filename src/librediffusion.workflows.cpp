@@ -257,9 +257,17 @@ void LibreDiffusionPipeline::img2img(
     const uint8_t* cpu_rgba_input, uint8_t* cpu_rgba_output, int iw, int ih)
 {
   int batch_size = config_.batch_size;
-  size_t rgba_input_size = batch_size * ih * iw * 4;
-  size_t rgba_vae_size = batch_size * this->config_.height * this->config_.width * 4;
-  size_t tensor_size = batch_size * 3 * this->config_.height * this->config_.width;
+  // The HOST buffers hold ONE frame: the caller passes iw*ih*4 bytes, and img_preprocess /
+  // img_postprocess convert exactly one image ("FIXME batch not handled" in images.cpp). Sizing the
+  // host<->device copies by batch_size read `batch_size-1` extra frames past the end of the caller's
+  // input and wrote that much past the end of its output — a plain heap overflow of a buffer this
+  // library does not own, which is why batch 2 surfaced as glibc corruption or a SIGSEGV in cudaFree
+  // at teardown, long after the frame had been returned. The DEVICE staging buffers keep the batch
+  // extent because the VAE really does run batch_size rows.
+  size_t rgba_frame_size = (size_t)ih * iw * 4;
+  size_t rgba_input_size = (size_t)batch_size * ih * iw * 4;
+  size_t rgba_vae_size = (size_t)batch_size * this->config_.height * this->config_.width * 4;
+  size_t tensor_size = (size_t)batch_size * 3 * this->config_.height * this->config_.width;
 
   // Allocate or resize device buffers if needed
   if(!device_rgba_input_ || device_rgba_input_->size() < rgba_input_size)
@@ -288,7 +296,7 @@ void LibreDiffusionPipeline::img2img(
 
   // Copy input from CPU to GPU
   cudaMemcpyAsync(
-      device_rgba_input_->data(), cpu_rgba_input, rgba_input_size,
+      device_rgba_input_->data(), cpu_rgba_input, rgba_frame_size,
       cudaMemcpyHostToDevice, stream_);
 
   img_preprocess(device_rgba_input_->data(), iw, ih);
@@ -301,7 +309,7 @@ void LibreDiffusionPipeline::img2img(
 
   // Copy output from GPU to CPU
   cudaMemcpyAsync(
-      cpu_rgba_output, device_rgba_output_correct_size, rgba_input_size,
+      cpu_rgba_output, device_rgba_output_correct_size, rgba_frame_size,
       cudaMemcpyDeviceToHost, stream_);
 
   // Wait for all operations to complete. This must NOT be optional: the copy above targets the
@@ -314,9 +322,17 @@ void LibreDiffusionPipeline::img2img(
 void LibreDiffusionPipeline::txt2img(uint8_t* cpu_rgba_output, int iw, int ih)
 {
   int batch_size = config_.batch_size;
-  size_t rgba_input_size = batch_size * ih * iw * 4;
-  size_t rgba_vae_size = batch_size * this->config_.height * this->config_.width * 4;
-  size_t tensor_size = batch_size * 3 * this->config_.height * this->config_.width;
+  // The HOST buffers hold ONE frame: the caller passes iw*ih*4 bytes, and img_preprocess /
+  // img_postprocess convert exactly one image ("FIXME batch not handled" in images.cpp). Sizing the
+  // host<->device copies by batch_size read `batch_size-1` extra frames past the end of the caller's
+  // input and wrote that much past the end of its output — a plain heap overflow of a buffer this
+  // library does not own, which is why batch 2 surfaced as glibc corruption or a SIGSEGV in cudaFree
+  // at teardown, long after the frame had been returned. The DEVICE staging buffers keep the batch
+  // extent because the VAE really does run batch_size rows.
+  size_t rgba_frame_size = (size_t)ih * iw * 4;
+  size_t rgba_input_size = (size_t)batch_size * ih * iw * 4;
+  size_t rgba_vae_size = (size_t)batch_size * this->config_.height * this->config_.width * 4;
+  size_t tensor_size = (size_t)batch_size * 3 * this->config_.height * this->config_.width;
 
   // Allocate or resize device buffers if needed
   if(!device_rgba_output_ || device_rgba_output_->size() < rgba_input_size)
@@ -340,7 +356,7 @@ void LibreDiffusionPipeline::txt2img(uint8_t* cpu_rgba_output, int iw, int ih)
 
   // Copy output from GPU to CPU
   cudaMemcpyAsync(
-      cpu_rgba_output, device_rgba_output_correct_size, rgba_input_size,
+      cpu_rgba_output, device_rgba_output_correct_size, rgba_frame_size,
       cudaMemcpyDeviceToHost, stream_);
 
   // Wait for all operations to complete

@@ -239,6 +239,13 @@ public:
   // (the C API turns that into LIBREDIFFUSION_ERROR_NOT_INITIALIZED).
   const char* inference_readiness() const;
 
+  /// Number of timestep entries the UNet paths copy out of sub_timesteps_ per forward.
+  int timestep_extent() const
+  {
+    return config_.batch_size
+           + (config_.denoising_steps - 1) * config_.frame_buffer_size;
+  }
+
   // Number of denoise iterations that are actually backed by scheduler coefficients.
   //
   // config_.denoising_steps and the length of the five coefficient vectors are two independent
