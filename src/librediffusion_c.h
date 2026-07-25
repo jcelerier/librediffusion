@@ -1161,7 +1161,7 @@ LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
 librediffusion_flux2_stream_destroy(librediffusion_flux2_stream_handle s);
 
 /* Number of inference steps (default 2). */
-LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_flux2_stream_set_steps(librediffusion_flux2_stream_handle s, int num_steps);
 
 /* img2img strength [0..1] (default 1.0). 1.0 = edit from pure noise (reference as conditioning only);
