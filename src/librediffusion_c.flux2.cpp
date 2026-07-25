@@ -307,9 +307,15 @@ void librediffusion_flux2_stream_destroy(librediffusion_flux2_stream_handle s)
   delete s;
 }
 
-void librediffusion_flux2_stream_set_steps(librediffusion_flux2_stream_handle s, int num_steps)
+librediffusion_error_t
+librediffusion_flux2_stream_set_steps(librediffusion_flux2_stream_handle s, int num_steps)
 {
-  if(s && num_steps > 0) s->num_steps = num_steps;
+  if(!s)
+    return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  if(num_steps <= 0)
+    return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  s->num_steps = num_steps;
+  return LIBREDIFFUSION_SUCCESS;
 }
 
 void librediffusion_flux2_stream_set_strength(librediffusion_flux2_stream_handle s, float strength)
