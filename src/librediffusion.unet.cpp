@@ -142,6 +142,17 @@ void LibreDiffusionPipeline::scheduler_step_batch(
         + " (denoising_steps=" + std::to_string(config_.denoising_steps) + ")");
   }
 
+  // N is the element count the caller wants stepped; the kernel takes it as batch x 4 x H x W. It was
+  // hardcoded to a single row, so at batch_size > 1 every row but the first came back unwritten and
+  // the store_d2d that follows read uninitialised VRAM. Callers that step one row at a time pass
+  // exactly `stride` and are unaffected.
+  const int stride = 4 * config_.latent_height * config_.latent_width;
+  if(stride <= 0 || N <= 0 || N % stride != 0)
+    throw std::runtime_error(
+        "scheduler_step_batch: element count " + std::to_string(N)
+        + " is not a whole number of 4x" + std::to_string(config_.latent_height) + "x"
+        + std::to_string(config_.latent_width) + " latents");
+
   // Access host-side copies (safe for CPU access)
   float alpha = alpha_at(idx);
   float beta = beta_at(idx);
@@ -150,8 +161,8 @@ void LibreDiffusionPipeline::scheduler_step_batch(
 
   launch_scheduler_step_fp16(
       model_pred, x_t_latent, denoised_out, alpha, beta, c_skip, c_out,
-      1, // FIXME double-check that batch size is 1 in this case by comparing with the python version
-      4, // channels
+      N / stride, // rows
+      4,          // channels
       config_.latent_height, config_.latent_width, stream);
 }
 

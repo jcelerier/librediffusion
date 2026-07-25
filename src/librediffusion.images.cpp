@@ -152,7 +152,6 @@ void LibreDiffusionPipeline::rgba_resize(
 float*
 LibreDiffusionPipeline::img_preprocess(const uint8_t* device_rgba_input, int iw, int ih)
 {
-  // FIXME batch not handled
   uint8_t* device_rgba_input_correct_size{};
   // SHAPE, not area. This used to compare iw*ih against width*height, so 1024x256 was accepted as
   // "already 512x512" and processed with the wrong strides — silently scrambled rather than resized.
@@ -167,6 +166,15 @@ LibreDiffusionPipeline::img_preprocess(const uint8_t* device_rgba_input, int iw,
         this->config_.width, this->config_.height);
     device_rgba_input_correct_size = device_rgba_input_vae_size_->data();
   }
+
+  // Exactly ONE frame reaches this buffer — img2img uploads one, rgba_resize writes one — while the
+  // conversion below and the VAE encoder both run config_.batch_size rows. Replicate it rather than
+  // hand rows 1..batch-1 to whatever the allocator last left in that VRAM.
+  const size_t frame_bytes = (size_t)this->config_.width * this->config_.height * 4;
+  for(int i = 1; i < this->config_.batch_size; i++)
+    cudaMemcpyAsync(
+        device_rgba_input_correct_size + (size_t)i * frame_bytes,
+        device_rgba_input_correct_size, frame_bytes, cudaMemcpyDeviceToDevice, stream_);
 
   // Convert RGBA NHWC to float NCHW on GPU
   rgba_nhwc_to_nchw_gpu(
