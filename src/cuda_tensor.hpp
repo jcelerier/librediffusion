@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include <nppi.h>
 #include <stdexcept>
+#include <string>
 
 namespace librediffusion
 {
@@ -18,11 +19,32 @@ public:
   {
   }
 
-  CUDATensor(size_t size)
-      : size_(size)
+  // Checked allocation. `data_` used to be missing from the member-init list entirely and the
+  // cudaMalloc result was discarded, so a failed allocation (an overflowed size, genuine VRAM
+  // exhaustion) left the object holding an INDETERMINATE pointer that every later kernel and
+  // memcpy dereferenced. Follows the pattern RifeInterpolator::ensureScratch already uses: throw,
+  // so the C boundary turns it into an error code instead of a device fault.
+  explicit CUDATensor(size_t size)
+      : data_(nullptr)
+      , size_(size)
       , owns_memory_(true)
   {
-    cudaMalloc(&data_, size * sizeof(T));
+    const size_t bytes = size * sizeof(T);
+    // size * sizeof(T) must not have wrapped: a caller computing an element count in `int` can hand
+    // us something absurd, and the allocator would happily be asked for a nonsense length.
+    if(size != 0 && bytes / sizeof(T) != size)
+      throw std::runtime_error("CUDATensor: requested element count overflows size_t");
+    if(bytes == 0)
+      return; // a zero-length tensor is legal and owns nothing
+    cudaError_t e = cudaMalloc(&data_, bytes);
+    if(e != cudaSuccess || !data_)
+    {
+      data_ = nullptr;
+      owns_memory_ = false;
+      throw std::runtime_error(
+          std::string("CUDATensor: cudaMalloc of ") + std::to_string(bytes)
+          + " bytes failed: " + cudaGetErrorString(e));
+    }
   }
 
   CUDATensor(T* data, size_t size)
