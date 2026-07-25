@@ -96,6 +96,10 @@ struct LibreDiffusionConfig
   // Image tokens are computed HOST-SIDE and fed in via the C-API (external, like controlnet preproc).
   int ipadapter_num_tokens = 4;       // image tokens appended to the 77 text tokens (4 base / 16 plus)
   float ipadapter_scale = 1.0f;       // uniform per-layer scale (overridable per-layer via the C-API)
+  // Did the HOST ask for IP-Adapter? The two fields above have usable defaults, so they cannot tell
+  // us. Set by librediffusion_config_set_ipadapter. When true and the UNet engine turns out not to
+  // be an IP variant, init_engines() reports it instead of silently rendering plain frames (L-15).
+  bool ipadapter_requested = false;
   // On-device IP-Adapter image encoder (optional). When BOTH paths are set, the pipeline loads a
   // CLIPImageEncoderWrapper so the host can feed a RAW style image (set_ipadapter_image) instead of
   // precomputed tokens. clip_image_encoder = CLIP ViT-H/14 (pixel_values[1,3,224,224]->image_embeds

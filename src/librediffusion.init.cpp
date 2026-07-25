@@ -57,9 +57,16 @@ void LibreDiffusionPipeline::init_engines()
   {
     if(!unet_->hasControlInputs())
     {
-      std::cout << "Warning: " << config_.controlnets.size() << " controlnet(s) configured but the UNet "
-                   "engine has no input_control_* inputs; ControlNet DISABLED (use a control-aware "
-                   "unet.engine)" << std::endl;
+      // L-15: this used to print a warning to STDOUT, disable ControlNet, and carry on rendering
+      // ordinary frames — statistically identical to the plain model's — while the host believed its
+      // control image was steering the output. The C API reported success throughout; the only hint
+      // was set_controlnet_cond_rgba later returning -99 for an index that no longer existed.
+      // A feature the bundle cannot honour is a configuration error, not a footnote.
+      throw std::runtime_error(
+          std::to_string(config_.controlnets.size())
+          + " ControlNet(s) configured but the UNet engine '" + config_.unet_engine_path
+          + "' has no input_control_* inputs; use a control-aware unet.engine, or do not configure "
+            "ControlNet");
     }
     else
     {
@@ -77,6 +84,16 @@ void LibreDiffusionPipeline::init_engines()
   // tokens are fed host-side via set_ipadapter_tokens; default the per-layer scale vector to a uniform
   // config_.ipadapter_scale (length = the engine's num_ip_layers).
   ipadapter_enabled_ = unet_->hasIpAdapter();
+  // L-15, second half — and the quieter one: an IP-Adapter configured against a plain UNet gave the
+  // host NO signal at all. set_ipadapter_tokens returned SUCCESS, inference returned SUCCESS, and
+  // the frame was identical to the one the plain model would have produced.
+  if(config_.ipadapter_requested && !ipadapter_enabled_)
+  {
+    throw std::runtime_error(
+        "IP-Adapter configured but the UNet engine '" + config_.unet_engine_path
+        + "' is not an IP variant (no ipadapter_scale input); use an IP-Adapter unet.engine, or do "
+          "not configure IP-Adapter");
+  }
   if(ipadapter_enabled_)
   {
     int n = unet_->numIpLayers();
