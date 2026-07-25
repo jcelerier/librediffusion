@@ -49,10 +49,7 @@ int librediffusion_rife_is_enabled(librediffusion_rife_handle h)
 
 void librediffusion_rife_set_interpolation_exp(librediffusion_rife_handle h, int exp)
 {
-  // Clamp BOTH ways. This used to clamp only from below, so any value was stored verbatim: a
-  // readback of 2147483647 was possible, and `for(i = 0; i < exp; ++i) total_out *= 2` is signed
-  // overflow (UB) from exp = 31 up. 2^LIBREDIFFUSION_RIFE_MAX_EXP frames per real frame is already
-  // far beyond anything a display pipeline can consume.
+  // Clamp both ways: `for(i = 0; i < exp; ++i) total_out *= 2` is signed overflow from exp = 31 up.
   if(!h)
     return;
   if(exp < 0)
@@ -77,11 +74,8 @@ int librediffusion_rife_get_interpolation_exp(librediffusion_rife_handle h)
 
 namespace
 {
-// L-05: interpolate() writes 2^exp * H*W*4 bytes into a caller buffer that carried no length, and
-// the frame count comes from state the caller set in a DIFFERENT call (set_interpolation_exp). Any
-// host that raises the interpolation factor without re-sizing its output buffer overflows it —
-// measured at 98 304 bytes past a 32 768-byte buffer for exp 1 -> 3. The _sized entry points let the
-// caller declare the capacity so the mismatch is an error code instead.
+// interpolate() writes 2^exp * H*W*4 bytes, and the frame count comes from state the caller set in a
+// DIFFERENT call (set_interpolation_exp), so the two drift apart trivially.
 librediffusion_error_t check_out_capacity(
     librediffusion_rife_handle h, int H, int W, size_t out_capacity_bytes)
 {
@@ -130,8 +124,7 @@ librediffusion_error_t librediffusion_rife_interpolate_gpu_sized(
       h, prev_rgba_dev, cur_rgba_dev, H, W, out_frames_dev, out_count);
 }
 
-/* DEPRECATED, kept for ABI compatibility: no capacity is declared, so the library cannot check that
- * out_frames is big enough for the 2^exp frames it is about to write. Prefer the _sized form. */
+/* DEPRECATED: no capacity is declared, so out_frames cannot be checked. Prefer the _sized form. */
 librediffusion_error_t librediffusion_rife_interpolate(
     librediffusion_rife_handle h, const unsigned char* prev_rgba, const unsigned char* cur_rgba,
     int H, int W, unsigned char* out_frames, int* out_count)

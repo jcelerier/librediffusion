@@ -164,11 +164,9 @@ librediffusion_config_set_device(librediffusion_config_handle config, int device
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_model_type(
     librediffusion_config_handle config, librediffusion_model_type_t type);
-/* Image and latent geometry. Validated: width/height must be positive, <= 16384, and multiples of
- * 8; latent_width/latent_height must be exactly width/8 and height/8 (the VAE's downsampling
- * factor). Anything else is LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS — every kernel indexes one grid
- * and the engine the other, and an oversized pair overflows the int the buffer sizes are computed
- * in before reaching an unchecked cudaMalloc. */
+/* Image and latent geometry. width/height must be positive, <= 16384 and multiples of 8;
+ * latent_width/latent_height must be exactly width/8 and height/8 (the VAE's downsampling factor).
+ * Anything else returns LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS. */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_config_set_dimensions(
     librediffusion_config_handle config, int width, int height, int latent_width,
@@ -379,9 +377,7 @@ librediffusion_pipeline_reinit_buffers(
  * @param seq_len       Sequence length; MUST equal the pipeline's configured text_seq_len
  * @param hidden_dim    Hidden dimension; MUST equal the pipeline's configured text_hidden_dim
  * @return LIBREDIFFUSION_SUCCESS, or LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS when the declared
- *         shape disagrees with the pipeline's. The buffer is sized from these arguments while every
- *         consumer reads text_seq_len*text_hidden_dim back out of it, so a mismatch would be an
- *         out-of-bounds DEVICE read.
+ *         shape disagrees with the pipeline's.
  */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_prepare_embeds(
@@ -1252,14 +1248,11 @@ librediffusion_rife_set_enabled(librediffusion_rife_handle h, int enabled);
 LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
 librediffusion_rife_is_enabled(librediffusion_rife_handle h);
 
-/* Largest interpolation exponent the library accepts: 2^4 = 16 frames per real frame, already far
- * beyond what any display pipeline consumes. set_interpolation_exp CLAMPS to [0, this]. */
+/* Largest interpolation exponent the library accepts (2^4 = 16 frames per real frame). */
 #define LIBREDIFFUSION_RIFE_MAX_EXP 4
 
 /* interpolation_exp: 0 = off (1 frame out), 1 = 2x, 2 = 4x, 3 = 8x displayed frames.
- * Clamped to [0, LIBREDIFFUSION_RIFE_MAX_EXP]: it used to be clamped only from below and stored
- * verbatim, so a readback of 2147483647 was possible and the internal `total_out *= 2` loop was
- * signed overflow (UB) from exp = 31 up. */
+ * Clamped to [0, LIBREDIFFUSION_RIFE_MAX_EXP]. */
 LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
 librediffusion_rife_set_interpolation_exp(librediffusion_rife_handle h, int exp);
 
@@ -1278,9 +1271,8 @@ librediffusion_rife_required_out_bytes(librediffusion_rife_handle h, int H, int 
  *
  * PREFERRED FORM. out_capacity_bytes is what the caller actually allocated; the number of frames
  * written is derived from state set in a DIFFERENT call (set_interpolation_exp), so the two drift
- * apart trivially — any host that raises the interpolation factor without re-sizing its buffer used
- * to overflow it silently. A capacity smaller than
- * librediffusion_rife_required_out_bytes() is LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS. */
+ * apart trivially. A capacity smaller than librediffusion_rife_required_out_bytes() returns
+ * LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS. */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_rife_interpolate_sized(
     librediffusion_rife_handle h, const unsigned char* prev_rgba, const unsigned char* cur_rgba,
@@ -1293,9 +1285,8 @@ librediffusion_rife_interpolate_gpu_sized(
     const unsigned char* cur_rgba_dev, int H, int W, unsigned char* out_frames_dev,
     size_t out_capacity_bytes, int* out_count);
 
-/* DEPRECATED (kept for ABI compatibility): out_frames carries no length, so the library cannot
- * check that it is big enough for the (2^exp)*H*W*4 bytes it is about to write. The caller must
- * size it from librediffusion_rife_required_out_bytes() itself. Prefer the _sized forms. */
+/* DEPRECATED: out_frames carries no length, so the (2^exp)*H*W*4 bytes it is about to write cannot
+ * be checked. Size it from librediffusion_rife_required_out_bytes(). Prefer the _sized forms. */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_rife_interpolate(
     librediffusion_rife_handle h, const unsigned char* prev_rgba, const unsigned char* cur_rgba,
@@ -1329,8 +1320,7 @@ librediffusion_img2img_turbo_forward(
 
 /* Exact buffer requirements of the _frame entry points below, for the loaded engines.
  * frame_bytes = H*W*4 (each of in_rgba and out_rgba); ehs_elements = 77*1024 floats.
- * Both return 0 on a null handle. ADDED alongside the _sized entry points; a caller that cannot
- * resolve them is running an older .so and must assume the historical static 512x512 / 77x1024. */
+ * Both return 0 on a null handle, and are absent from older .so builds (assume 512x512 / 77x1024). */
 LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
 librediffusion_img2img_turbo_frame_bytes(librediffusion_img2img_turbo_handle h);
 
@@ -1344,7 +1334,7 @@ librediffusion_img2img_turbo_ehs_elements(librediffusion_img2img_turbo_handle h)
  * PREFERRED FORM. The caller declares the length of every buffer the call touches, so a mismatch is
  * LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS instead of a silent overflow: the implementation copies
  * H*W*4 bytes out of in_rgba, H*W*4 bytes into out_rgba and 77*1024 floats out of ehs, all sized
- * from the ENGINE rather than from anything the caller said.
+ * from the ENGINE, not from anything the caller said.
  *   in_bytes / out_bytes  = librediffusion_img2img_turbo_frame_bytes(h)
  *   ehs_elements          = librediffusion_img2img_turbo_ehs_elements(h) */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
@@ -1360,10 +1350,8 @@ librediffusion_img2img_turbo_frame_dev_sized(
     librediffusion_img2img_turbo_handle h, const unsigned char* in_rgba, size_t in_bytes,
     const librediffusion_half_t* ehs_dev, unsigned char* out_rgba, size_t out_bytes);
 
-/* DEPRECATED (kept for ABI compatibility with existing callers). Identical behaviour to
- * _frame_sized called with the model's own sizes — which means it CANNOT detect a caller whose
- * buffers are smaller than that, because it is never told how big they are. Migrate to
- * _frame_sized / _frame_dev_sized. */
+/* DEPRECATED. Identical to _frame_sized called with the model's own sizes — which means it CANNOT
+ * detect a caller whose buffers are smaller. Migrate to _frame_sized / _frame_dev_sized. */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_img2img_turbo_frame(
     librediffusion_img2img_turbo_handle h, const unsigned char* in_rgba, const float* ehs,

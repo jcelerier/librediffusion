@@ -30,14 +30,8 @@
 #define LIBREDIFFUSION_VERSION_PATCH 0
 #define LIBREDIFFUSION_VERSION_STRING "1.0.0"
 
-/* Handle validation (L-11, S-03).
- *
- * A C handle is the one thing a host cannot check for itself, so the library has to: passing a
- * destroyed handle, destroying twice, and using the out-parameter a failed create never wrote all
- * have to become ordinary error codes rather than a glibc double-free abort or a SIGSEGV.
- *
- * The check therefore lives OUTSIDE the block it validates. A registry of live handles is consulted
- * by pointer value and never dereferences an untrusted handle. */
+/* Handle validation: a registry of live handles, consulted by pointer value. The check must live
+ * OUTSIDE the block it validates, so an untrusted (possibly freed) handle is never dereferenced. */
 
 struct librediffusion_config_t
 {
@@ -59,7 +53,7 @@ struct handle_registry
 };
 
 // Deliberately leaked: a host may destroy a handle from a static destructor of its own, which can
-// run after any function-local static would have been torn down.
+// run after a function-local static would have been torn down.
 template <typename T>
 handle_registry<T>& registry()
 {
@@ -116,8 +110,8 @@ using librediffusion::drain_cuda_error;
 using librediffusion::g_last_cuda_error;
 using librediffusion::set_cuda_error;
 
-// For the entry points that hold a cudaError_t of their own: record it, consume whatever the runtime
-// still has pending, and answer with the right one of the two codes.
+// For entry points holding a cudaError_t of their own: record it, consume whatever is still pending,
+// and answer with the right one of the two codes.
 librediffusion_error_t report_cuda_failure(cudaError_t err)
 {
   drain_cuda_error();
@@ -169,18 +163,10 @@ librediffusion_error_t try_catch_wrapper(Func&& func)
   }
 }
 
-// Same as try_catch_wrapper, but WITHOUT the trailing check_cuda_error().
-//
-// L-13: cudaGetLastError() BRINGS UP the CUDA primary context. Wrapping the config entry points —
-// which allocate a struct of ints and strings and touch no device — in try_catch_wrapper therefore
-// made librediffusion_config_create() cost a full context creation (hundreds of ms, hundreds of MB
-// of VRAM) on whatever thread happened to deserialise a preset, pinned it to the DEFAULT device
-// before config_set_device was ever read, and left the process unable to fork a working child.
-// Measured: a child forked after version() can cudaMalloc; a child forked after config_create()
-// cannot (cudaErrorInitializationError).
-//
-// Use this for any entry point that cannot possibly have produced a CUDA error; keep
-// try_catch_wrapper where a CUDA call really may have happened.
+// Same as try_catch_wrapper, but WITHOUT the trailing check_cuda_error(): cudaGetLastError() BRINGS
+// UP the CUDA primary context, so wrapping an entry point that touches no device in it would cost a
+// full context creation on the calling thread, on the default device. Use this for any entry point
+// that cannot possibly have produced a CUDA error.
 template <typename Func>
 librediffusion_error_t try_catch_host(Func&& func)
 {
@@ -206,10 +192,8 @@ librediffusion_error_t try_catch_host(Func&& func)
   }
 }
 
-// Guard every inference entry point against a pipeline whose conditioning / scheduler the host has
-// not supplied yet. Construction succeeds long before prepare_embeds()/prepare_scheduler() are
-// called, and the denoise path dereferences both unconditionally, so an early frame used to be a
-// guaranteed null-deref rather than an error code. Returns SUCCESS when the pipeline is ready.
+// Construction succeeds long before prepare_embeds()/prepare_scheduler() are called, and the denoise
+// path dereferences both unconditionally. Returns SUCCESS when the pipeline is ready.
 librediffusion_error_t check_inference_ready(librediffusion_pipeline_handle pipeline)
 {
   if (const char* why = pipeline->cpp_pipeline->inference_readiness())
@@ -219,12 +203,9 @@ librediffusion_error_t check_inference_ready(librediffusion_pipeline_handle pipe
   }
   return LIBREDIFFUSION_SUCCESS;
 }
-// Reject a prepare_* / token call whose DECLARED shape disagrees with the pipeline's configured text
-// geometry (L-06). These entry points size the device buffer from the CALL's arguments, but every
-// consumer reads config_.text_seq_len * config_.text_hidden_dim back out of it with a raw
-// cudaMemcpyAsync — so a smaller declared shape is an out-of-bounds DEVICE read that surfaces later,
-// somewhere else, as an opaque cudaErrorInvalidDevice, after the output buffer has already been
-// partially written.
+// These entry points size the device buffer from the CALL's arguments, but every consumer reads
+// config_.text_seq_len * config_.text_hidden_dim back out of it with a raw cudaMemcpyAsync — so a
+// declared shape that disagrees with the config is an out-of-bounds DEVICE read.
 librediffusion_error_t check_text_dims(
     librediffusion_pipeline_handle pipeline, int seq_len, int hidden_dim, const char* what)
 {
@@ -288,8 +269,7 @@ librediffusion_config_create(librediffusion_config_handle* config)
 LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
 librediffusion_config_destroy(librediffusion_config_handle config)
 {
-  // NULL is documented as safe; so is a handle that was already destroyed (previously a glibc
-  // "double free detected" -> SIGABRT).
+  // NULL is documented as safe; so is a handle that was already destroyed.
   if (!config || !unregister_handle(config))
     return;
   delete config;
@@ -357,15 +337,8 @@ librediffusion_config_set_dimensions(
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (width <= 0 || height <= 0 || latent_width <= 0 || latent_height <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
-  // Everything that is not <= 0 used to be accepted verbatim, including combinations that cannot
-  // describe a real image: 185600x185600 (batch*4*lh*lw overflows the int it is computed in ->
-  // negative -> a huge size_t -> a cudaMalloc that fails and whose result is never checked), 513x511
-  // (the VAE's 8x downsampling cannot express it), and a latent grid unrelated to the pixel grid
-  // (every kernel indexes one and the engine the other). Downstream those were contained only by
-  // luck. Refuse them here, where the caller still has a return code to look at.
-  //
-  // 16384 is well past any diffusion model in existence and keeps every width*height*4 and
-  // batch*4*lh*lw product far inside an int.
+  // Every kernel indexes the pixel grid and the engine the latent one, so they must agree; and
+  // 16384 keeps every width*height*4 and batch*4*lh*lw product (computed in int) from overflowing.
   constexpr int kMaxDim = 16384;
   if (width > kMaxDim || height > kMaxDim)
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
@@ -609,10 +582,8 @@ librediffusion_config_set_temporal_params(
 {
   if (!valid(config))
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
-  // cache_interval is the divisor of `frame_id % cache_interval` on the img2img path — an integer
-  // division, so 0 is a SIGFPE that no try/catch can intercept. cache_maxframes is compared against
-  // a size_t, so a negative value becomes SIZE_MAX and the cache deque never drops a frame: one
-  // latent of VRAM per frame, forever. Both used to be stored verbatim.
+  // cache_interval divides `frame_id % cache_interval` on the img2img path — an integer division, so
+  // 0 is an uncatchable SIGFPE. cache_maxframes is compared against a size_t: negative = SIZE_MAX.
   if (cache_interval < 1 || cache_maxframes < 1)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
 
@@ -684,11 +655,8 @@ librediffusion_pipeline_create(
   if (!valid(config) || !pipeline)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
-  // ALWAYS write the out-parameter. It used to be left untouched on failure, so a host that checks
-  // the handle rather than the return code (or reuses an uninitialised local) carried a wild
-  // pointer into every later call — each of which dereferenced it inside its own `!pipeline` guard.
-  // The wrapper was leaked on failure too: the throw escaped before `*pipeline = p`, and nothing
-  // owned `p`.
+  // ALWAYS write the out-parameter, so a host that checks the handle rather than the return code
+  // does not carry an uninitialised local into every later call.
   *pipeline = nullptr;
 
   return try_catch_wrapper([&]() {
@@ -703,9 +671,8 @@ librediffusion_pipeline_create(
 LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
 librediffusion_pipeline_destroy(librediffusion_pipeline_handle pipeline)
 {
-  // NULL and already-destroyed are both no-ops (a second destroy used to re-run the whole dtor
-  // chain — CUDA stream, graph, TensorRT contexts — on freed memory, i.e. SIGSEGV). Registration is
-  // not conditional on cpp_pipeline: a pipeline whose construction failed still owns the wrapper.
+  // NULL and already-destroyed are both no-ops. Registration is not conditional on cpp_pipeline: a
+  // pipeline whose construction failed still owns the wrapper.
   if (!pipeline || !unregister_handle(pipeline))
     return;
   delete pipeline;
@@ -940,9 +907,8 @@ librediffusion_prepare_sdxl_conditioning(
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!text_embeds || !time_ids)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
-  // No shapes are passed here: both buffers are read using the pipeline's OWN configured dimensions.
-  // The least we can do is refuse the call on a pipeline that has no SDXL conditioning to fill, where
-  // the dimensions are meaningless and the copy would be sized from stale defaults.
+  // No shapes are passed here: both buffers are read at the pipeline's OWN configured dimensions, so
+  // on a pipeline with no SDXL conditioning the copy would be sized from stale defaults.
   {
     const auto& cfg = pipeline->cpp_pipeline->config();
     if (cfg.pooled_embedding_dim <= 0 || cfg.time_ids_dim <= 0)
@@ -1094,9 +1060,8 @@ librediffusion_set_ipadapter_tokens(
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (num_tokens <= 0 || dim <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
-  // Same class as L-06: the token buffer is sized num_tokens*dim from these arguments, but the
-  // extended-ehs assembly reads ipadapter_num_tokens_ * config_.text_hidden_dim back out of it. A
-  // `dim` that is not the pipeline's cross-attention width is an out-of-bounds device read.
+  // The token buffer is sized num_tokens*dim from these arguments, but the extended-ehs assembly
+  // reads ipadapter_num_tokens_ * config_.text_hidden_dim back out of it.
   if (dim != pipeline->cpp_pipeline->config().text_hidden_dim)
   {
     std::fprintf(
@@ -1510,8 +1475,7 @@ librediffusion_enable_temporal_coherence(
 {
   if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
-  // See config_set_temporal_params: cache_interval == 0 is a SIGFPE on the next img2img, and a
-  // negative cache_maxframes reads as SIZE_MAX, i.e. "cache every frame forever".
+  // See config_set_temporal_params.
   if (cache_interval < 1 || max_cached_frames < 1)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
 

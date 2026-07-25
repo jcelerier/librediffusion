@@ -142,10 +142,7 @@ void LibreDiffusionPipeline::scheduler_step_batch(
         + " (denoising_steps=" + std::to_string(config_.denoising_steps) + ")");
   }
 
-  // N is the element count the caller wants stepped; the kernel takes it as batch x 4 x H x W. It was
-  // hardcoded to a single row, so at batch_size > 1 every row but the first came back unwritten and
-  // the store_d2d that follows read uninitialised VRAM. Callers that step one row at a time pass
-  // exactly `stride` and are unaffected.
+  // N is the element count the caller wants stepped; the kernel takes it as batch x 4 x H x W.
   const int stride = 4 * config_.latent_height * config_.latent_width;
   if(stride <= 0 || N <= 0 || N % stride != 0)
     throw std::runtime_error(
@@ -657,9 +654,6 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
     // Stride is for ONE latent (one image at one timestep)
     int stride = 1 * 4 * config_.latent_height * config_.latent_width;
     int single_size = total_batch * 4 * config_.latent_height * config_.latent_width;
-    // Bound the scheduler loop by the coefficients we actually HAVE, not by the declared step count
-    // (L-16). prepare_scheduler now refuses a disagreeing length, so this is the same number; it
-    // stays correct-by-construction if the two ever drift again.
     for(int i = 0; i < denoise_steps(); i++)
     {
       int offset = i * stride;
@@ -683,7 +677,7 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
     //       stock_noise = init_noise + delta_x
     if(config_.guidance_scale > 1.0f && (config_.cfg_type == 2 || config_.cfg_type == 3))
     {
-      int batch_size = denoise_steps();  // Number of timesteps (bounded by the schedule length)
+      int batch_size = denoise_steps();  // Number of timesteps
 
       // scaled_noise = beta * stock_noise
       CUDATensor<__half> scaled_noise(single_size);
@@ -944,7 +938,6 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
   CUDATensor<__half> current_latent(latent_size);
   current_latent.load_d2d(x_t_latent.data(), latent_size, stream);
 
-  // Bounded by the schedule length, not the declared step count (L-16).
   for(int idx = 0; idx < denoise_steps(); idx++)
   {
     // Prepare UNet inputs for this timestep

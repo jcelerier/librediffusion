@@ -128,19 +128,13 @@ void LibreDiffusionPipeline::rgba_resize(
   // 3. Choose Interpolation
   int eInterpolation = NPPI_INTER_LINEAR;
 
-  // NOTE: there used to be an unconditional `return;` right here — the resize had NEVER run. Any
-  // img2img whose input pixel count differed from the configured size was therefore processed from
-  // the UNINITIALISED VRAM of the VAE-sized staging buffer: measured on a 512px bundle, a 256x256
-  // frame came back pure black and byte-identical for two completely different inputs.
-  //
   // 5. Execute Resize
   NppStatus status = nppiResize_8u_C4R_Ctx(
       device_rgba_input_, nSrcStep, oSrcSize, oSrcRectROI, device_rgba_resized_,
       nDstStep, oDstSize, oDstRectROI, eInterpolation, this->npp_stream_);
 
-  // 6. Error Handling. A failed resize leaves the destination untouched, i.e. exactly the
-  // uninitialised-VRAM situation this function exists to prevent — so it must be an error, not a
-  // line on stderr.
+  // 6. Error Handling. A failed resize leaves the destination UNINITIALISED, so it cannot be
+  // downgraded to a warning.
   if(status != NPP_NO_ERROR)
   {
     throw std::runtime_error(
@@ -153,8 +147,7 @@ float*
 LibreDiffusionPipeline::img_preprocess(const uint8_t* device_rgba_input, int iw, int ih)
 {
   uint8_t* device_rgba_input_correct_size{};
-  // SHAPE, not area. This used to compare iw*ih against width*height, so 1024x256 was accepted as
-  // "already 512x512" and processed with the wrong strides — silently scrambled rather than resized.
+  // Shape, not area: 1024x256 has the same pixel count as 512x512 but different strides.
   if(iw == this->config_.width && ih == this->config_.height)
   {
     device_rgba_input_correct_size = device_rgba_input_->data();
@@ -167,9 +160,8 @@ LibreDiffusionPipeline::img_preprocess(const uint8_t* device_rgba_input, int iw,
     device_rgba_input_correct_size = device_rgba_input_vae_size_->data();
   }
 
-  // Exactly ONE frame reaches this buffer — img2img uploads one, rgba_resize writes one — while the
-  // conversion below and the VAE encoder both run config_.batch_size rows. Replicate it rather than
-  // hand rows 1..batch-1 to whatever the allocator last left in that VRAM.
+  // Exactly ONE frame reaches this buffer (img2img uploads one, rgba_resize writes one) while the
+  // conversion below and the VAE encoder both run config_.batch_size rows: replicate it.
   const size_t frame_bytes = (size_t)this->config_.width * this->config_.height * 4;
   for(int i = 1; i < this->config_.batch_size; i++)
     cudaMemcpyAsync(
@@ -194,7 +186,7 @@ LibreDiffusionPipeline::img_postprocess(__half* device_rgba_output, int iw, int 
       config_.height, stream_);
 
   uint8_t* device_rgba_output_correct_size{};
-  // SHAPE, not area (see img_preprocess).
+  // Shape, not area (see img_preprocess).
   if(iw == this->config_.width && ih == this->config_.height)
   {
     device_rgba_output_correct_size = device_rgba_output_vae_size_->data();

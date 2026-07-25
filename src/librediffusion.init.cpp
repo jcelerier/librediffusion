@@ -42,9 +42,7 @@ void LibreDiffusionPipeline::init_cuda()
 void LibreDiffusionPipeline::init_engines()
 {
   // FLUX.2-klein is a rectified-flow MMDiT with its own engines and its own C API
-  // (librediffusion_flux2_*). Declaring it here used to be "recorded for completeness": the SD
-  // pipeline ran, rendered ordinary SD frames, and reported success, so a host that mis-declared its
-  // model got a plausible image and no signal.
+  // (librediffusion_flux2_*); the SD pipeline cannot run it.
   if(config_.model_type == ModelType::FLUX2_KLEIN_4B)
     throw std::runtime_error(
         "model_type FLUX2_KLEIN_4B is not a Stable Diffusion pipeline; drive klein through "
@@ -55,18 +53,15 @@ void LibreDiffusionPipeline::init_engines()
   vae_encoder_ = std::make_unique<VAEEncoderWrapper>(config_.vae_encoder_path);
   vae_decoder_ = std::make_unique<VAEDecoderWrapper>(config_.vae_decoder_path);
 
-  // Same rule as ControlNet / IP-Adapter below: a mode the engine cannot honour is a configuration
-  // error, not a stderr line followed by plain img2img.
+  // A mode the engine cannot honour is a configuration error.
   if(use_v2v && !(unet_->hasV2VKvo() || unet_->hasV2VOutputs()))
     throw std::runtime_error(
         "TEMPORAL_V2V requested but the UNet engine '" + config_.unet_engine_path
         + "' is neither a kvo (kvo_cache_in_*) nor an attention_* StreamV2V UNet; export a v2v "
           "UNet, or use MODE_SINGLE_FRAME");
 
-  // SDXL added conditioning (pooled text_embeds + time_ids) is an ENGINE property. Declaring it
-  // against an engine that has no text_embeds input made config_set_sdxl_config and
-  // prepare_sdxl_conditioning both return SUCCESS while the buffers went nowhere: the frame was
-  // byte-identical to not declaring it at all.
+  // SDXL added conditioning (pooled text_embeds + time_ids) is an ENGINE property: model_type and
+  // the engine must agree, or the buffers are prepared and then bound nowhere.
   if(config_.model_type == ModelType::SDXL_TURBO && !unet_->hasSdxlConditioning())
     throw std::runtime_error(
         "model_type SDXL_TURBO but the UNet engine '" + config_.unet_engine_path
@@ -89,11 +84,6 @@ void LibreDiffusionPipeline::init_engines()
   {
     if(!unet_->hasControlInputs())
     {
-      // L-15: this used to print a warning to STDOUT, disable ControlNet, and carry on rendering
-      // ordinary frames — statistically identical to the plain model's — while the host believed its
-      // control image was steering the output. The C API reported success throughout; the only hint
-      // was set_controlnet_cond_rgba later returning -99 for an index that no longer existed.
-      // A feature the bundle cannot honour is a configuration error, not a footnote.
       throw std::runtime_error(
           std::to_string(config_.controlnets.size())
           + " ControlNet(s) configured but the UNet engine '" + config_.unet_engine_path
@@ -116,9 +106,6 @@ void LibreDiffusionPipeline::init_engines()
   // tokens are fed host-side via set_ipadapter_tokens; default the per-layer scale vector to a uniform
   // config_.ipadapter_scale (length = the engine's num_ip_layers).
   ipadapter_enabled_ = unet_->hasIpAdapter();
-  // L-15, second half — and the quieter one: an IP-Adapter configured against a plain UNet gave the
-  // host NO signal at all. set_ipadapter_tokens returned SUCCESS, inference returned SUCCESS, and
-  // the frame was identical to the one the plain model would have produced.
   if(config_.ipadapter_requested && !ipadapter_enabled_)
   {
     throw std::runtime_error(
@@ -256,11 +243,9 @@ void LibreDiffusionPipeline::init_buffers()
   // When use_denoising_batch=true, we need noise for each timestep (denoising_steps), not batch_size
   int noise_batch_size
       = config_.use_denoising_batch ? config_.denoising_steps : config_.batch_size;
-  // ...but both buffers are READ at the latent extent: cfg-self and cfg-initialize copy
-  // `batch_size` latents out of stock_noise_, and add_noise reads `total_batch` out of init_noise_.
-  // Those match `denoising_steps` only when batch_size == denoising_steps * frame_buffer_size. On
-  // any other combination the copy ran off the end of the allocation — batch 2 at 1 step over-read a
-  // whole latent, which is the corruption the sweep saw surface at teardown.
+  // ...but both buffers are READ at the latent extent: cfg-self/cfg-initialize copy `batch_size`
+  // latents out of stock_noise_ and add_noise reads `total_batch` out of init_noise_, which match
+  // `denoising_steps` only when batch_size == denoising_steps * frame_buffer_size.
   noise_batch_size = std::max({noise_batch_size, config_.batch_size, timestep_extent()});
   init_noise_ = std::make_unique<CUDATensor<__half>>(
       noise_batch_size * 4 * config_.latent_height * config_.latent_width);
@@ -326,10 +311,6 @@ void LibreDiffusionPipeline::init_buffers()
 
 void LibreDiffusionPipeline::init_npp()
 {
-  // This used to declare a LOCAL `NppStreamContext npp_stream_;` that shadowed the member of the
-  // same name: everything below filled the local, the member stayed uninitialised, and the local was
-  // discarded on return. It was harmless only because its sole consumer — rgba_resize — began with
-  // an unconditional `return;` and never ran. Now that the resize is live, the member must be real.
   npp_stream_ = NppStreamContext{};
 
   int device = config_.device;
@@ -381,9 +362,7 @@ LibreDiffusionPipeline::geometry_rejection(const LibreDiffusionConfig& cfg) cons
 
 void LibreDiffusionPipeline::reinit_buffers(const LibreDiffusionConfig& new_config)
 {
-  // F-07's rule at the seam F-07's fix did not cover: engines cannot be reloaded here, so a geometry
-  // outside their profiles used to be installed, reported as success, and refused by TensorRT one
-  // call later as an opaque INTERNAL error from img2img.
+  // Engines cannot be reloaded here, so a geometry outside their profiles is unusable.
   if(auto why = geometry_rejection(new_config); !why.empty())
     throw std::invalid_argument("reinit_buffers: " + why);
 
@@ -414,10 +393,8 @@ void LibreDiffusionPipeline::reinit_buffers(const LibreDiffusionConfig& new_conf
   config_.use_feature_injection = new_config.use_feature_injection;
   config_.feature_injection_strength = new_config.feature_injection_strength;
   config_.feature_similarity_threshold = new_config.feature_similarity_threshold;
-  // reinit_buffers takes a whole config from the host: sanitize the two values that are fatal
-  // rather than merely wrong (0 -> SIGFPE in the img2img modulo; negative maxframes -> SIZE_MAX,
-  // i.e. an unbounded per-frame VRAM leak). The C-API setters reject them; a config that reached
-  // here another way is clamped rather than installed.
+  // Clamp the two values that are fatal rather than merely wrong: 0 is a SIGFPE in the img2img
+  // modulo, a negative maxframes reads as SIZE_MAX (the deque never evicts).
   config_.cache_interval = new_config.cache_interval >= 1 ? new_config.cache_interval : 1;
   config_.cache_maxframes = new_config.cache_maxframes >= 1 ? new_config.cache_maxframes : 1;
   config_.use_tome_cache = new_config.use_tome_cache;

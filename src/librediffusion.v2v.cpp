@@ -22,19 +22,14 @@ void LibreDiffusionPipeline::enableTemporalCoherence(
     bool use_feature_injection, float injection_strength, float similarity_threshold,
     int cache_interval, int max_cached_frames)
 {
-  // Last line of defence for the two values that are not merely wrong but fatal: cache_interval is
-  // the divisor of `frame_id % cache_interval` in img2img_impl (0 -> SIGFPE, uncatchable), and
-  // cache_maxframes is compared against a size_t (negative -> SIZE_MAX -> the deque never evicts and
-  // VRAM grows by one latent per frame). The C API rejects both; refuse here too so no internal
-  // caller can install them.
+  // cache_interval is the divisor of `frame_id % cache_interval` in img2img_impl (0 -> SIGFPE), and
+  // max_cached_frames is compared against a size_t (negative -> SIZE_MAX -> the deque never evicts).
   if(cache_interval < 1)
     throw std::invalid_argument("enableTemporalCoherence: cache_interval must be >= 1");
   if(max_cached_frames < 1)
     throw std::invalid_argument("enableTemporalCoherence: max_cached_frames must be >= 1");
 
-  // L-15's shape, in the corner L-15 did not cover: on an engine that is neither a kvo nor a legacy
-  // attention_* StreamV2V UNet this returned SUCCESS, printed a line to stderr, and rendered frames
-  // byte-identical to plain img2img. A feature the bundle cannot honour is an error.
+  // A feature the bundle cannot honour is an error, not a stderr line followed by plain img2img.
   if(!unet_ || !(unet_->hasV2VKvo() || unet_->hasV2VOutputs()))
     throw std::runtime_error(
         "enableTemporalCoherence: the UNet engine '" + config_.unet_engine_path

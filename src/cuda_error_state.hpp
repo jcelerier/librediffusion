@@ -1,15 +1,9 @@
 // Pending-CUDA-error bookkeeping, shared by every C-API translation unit.
 //
-// CUDA errors come in two kinds and F-03 turned on telling them apart.
-//
-// A PER-CALL failure (cudaErrorMemoryAllocation and friends) is left pending until somebody reads
-// it, and reading it clears it. Left unread it is reported by the NEXT entry point — which did
-// nothing wrong — so a rejected create made the following, entirely valid, create return -4 and the
-// host saw a working bundle refuse to load.
-//
-// A CONTEXT-LEVEL failure (an illegal address, a launch failure, ECC) cannot be cleared at all: the
-// context is dead and every subsequent CUDA call in the process returns it forever. Nothing here can
-// recover from that, so it is reported for what it is rather than retried.
+// A per-call failure (cudaErrorMemoryAllocation and friends) stays pending until somebody reads it,
+// and reading it clears it; unread, it is reported by the next entry point instead. A context-level
+// failure (illegal address, launch failure, ECC) cannot be cleared at all — every subsequent CUDA
+// call in the process returns it forever.
 #pragma once
 
 #include <cuda_runtime.h>

@@ -97,8 +97,7 @@ struct LibreDiffusionConfig
   int ipadapter_num_tokens = 4;       // image tokens appended to the 77 text tokens (4 base / 16 plus)
   float ipadapter_scale = 1.0f;       // uniform per-layer scale (overridable per-layer via the C-API)
   // Did the HOST ask for IP-Adapter? The two fields above have usable defaults, so they cannot tell
-  // us. Set by librediffusion_config_set_ipadapter. When true and the UNet engine turns out not to
-  // be an IP variant, init_engines() reports it instead of silently rendering plain frames (L-15).
+  // us. Set by librediffusion_config_set_ipadapter; init_engines() rejects a non-IP UNet when set.
   bool ipadapter_requested = false;
   // On-device IP-Adapter image encoder (optional). When BOTH paths are set, the pipeline loads a
   // CLIPImageEncoderWrapper so the host can feed a RAW style image (set_ipadapter_image) instead of
@@ -233,14 +232,10 @@ public:
       std::span<float> c_out              // [num_timesteps] - output scaling
   );
 
-  // Is the pipeline in a state where txt2img()/img2img() can legally run?
-  //
-  // The constructor brings up CUDA, the engines and the buffers, and then reports success — but it
-  // does NOT bring up the conditioning (prepare_embeds) or the scheduler coefficients
-  // (prepare_scheduler). Those arrive later, from the host, and nothing used to record that they had
-  // not arrived: an inference call at that moment dereferenced a null unique_ptr and indexed an
-  // empty std::vector. Returns nullptr when ready, otherwise a static string naming what is missing
-  // (the C API turns that into LIBREDIFFUSION_ERROR_NOT_INITIALIZED).
+  // Is the pipeline in a state where txt2img()/img2img() can legally run? The constructor brings up
+  // CUDA, the engines and the buffers but NOT the conditioning or the scheduler coefficients, which
+  // arrive later from the host. Returns nullptr when ready, else a static string naming what is
+  // missing (the C API turns that into LIBREDIFFUSION_ERROR_NOT_INITIALIZED).
   const char* inference_readiness() const;
 
   /// Number of timestep entries the UNet paths copy out of sub_timesteps_ per forward.
@@ -250,22 +245,16 @@ public:
            + (config_.denoising_steps - 1) * config_.frame_buffer_size;
   }
 
-  // Number of denoise iterations that are actually backed by scheduler coefficients.
-  //
-  // config_.denoising_steps and the length of the five coefficient vectors are two independent
-  // pieces of state; the denoise loops iterated the former and indexed the latter, so a schedule
-  // shorter than the declared step count read past the end of a std::vector on every frame and
-  // rendered a plausible-looking frame with SUCCESS. prepare_scheduler() now refuses a length that
-  // disagrees with config_.denoising_steps, so these are equal in practice — taking the min keeps
-  // every loop in bounds even if some future path lets them drift apart again.
+  // Denoise iterations actually backed by scheduler coefficients. config_.denoising_steps and the
+  // coefficient-vector length are independent state; prepare_scheduler() refuses a disagreement, so
+  // the min is a belt-and-braces bound for the loops that index both.
   int denoise_steps() const
   {
     const int n = (int)alpha_prod_t_sqrt_host_.size();
     return config_.denoising_steps < n ? config_.denoising_steps : n;
   }
 
-  // Bounds-checked scheduler coefficients. These were raw std::vector operator[]: for i >= size()
-  // an unchecked read past the end, and for an EMPTY vector a null dereference (data() == nullptr).
+  // Bounds-checked scheduler coefficients (throw rather than index past the end).
   float alpha_at(int i) const;
   float beta_at(int i) const;
   float c_skip_at(int i) const;

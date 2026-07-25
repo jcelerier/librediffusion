@@ -61,8 +61,7 @@ public:
       const unsigned char* in_rgba, const void* ehs_dev_fp16, unsigned char* out_rgba,
       cudaStream_t stream);
 
-  // The geometry the engines were built for. Callers of the host-bytes entry points need this to
-  // size their buffers (and the C API needs it to VALIDATE the sizes they declare).
+  // The geometry the engines were built for: callers of the host-bytes entry points size against it.
   int frameWidth() const { return W_; }
   int frameHeight() const { return H_; }
   // Elements the ehs buffer must contain: 1 * 77 * 1024 floats (SD2.1 cross-attention width).
