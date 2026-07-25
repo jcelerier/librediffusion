@@ -62,9 +62,12 @@ public:
       cudaStream_t stream);
 
   // The geometry the engines were built for: callers of the host-bytes entry points size against it.
+  // Read out of the loaded engines by discoverGeometry(); the constants below are only the fallback
+  // for an engine that declares a dynamic or unrecognised shape.
   int frameWidth() const { return W_; }
   int frameHeight() const { return H_; }
-  // Elements the ehs buffer must contain: 1 * 77 * 1024 floats (SD2.1 cross-attention width).
+  // Elements the ehs buffer must contain: the UNet's "ehs" input volume (1 * 77 * 1024 for SD2.1).
+  int ehsElements() const { return ehs_elements_; }
   static constexpr int kEhsElements = 77 * 1024;
 
   // sd-turbo scheduler alphas_cumprod[999] (the 1-step constant). Override if a model differs.
@@ -82,6 +85,8 @@ private:
 
   float acp_ = 0.00466009508818388f; // sd-turbo alphas_cumprod[999]
   int H_ = 512, W_ = 512, lh_ = 64, lw_ = 64;
+  int ehs_seq_ = 77, ehs_dim_ = 1024, ehs_elements_ = kEhsElements;
+  void discoverGeometry();
   void alloc();
   // shared body of forward_rgba / forward_rgba_dev (image upload+convert, forward, out download);
   // assumes ehs_ is already populated.

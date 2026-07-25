@@ -72,12 +72,12 @@ librediffusion_error_t librediffusion_img2img_turbo_forward(
 namespace
 {
 // The unsized _frame entry points copy H_*W_*4 bytes out of `in_rgba`, H_*W_*4 bytes INTO `out_rgba`
-// and 77*1024 floats out of `ehs` — none of which the caller ever declared.
+// and ehsElements() floats out of `ehs` — none of which the caller ever declared.
 librediffusion_error_t check_frame_sizes(
     librediffusion_img2img_turbo_handle h, size_t in_bytes, size_t ehs_elements, size_t out_bytes)
 {
   const size_t need = (size_t)h->pipe->frameHeight() * h->pipe->frameWidth() * 4;
-  const size_t need_ehs = (size_t)librediffusion::Img2ImgTurboPipeline::kEhsElements;
+  const size_t need_ehs = (size_t)h->pipe->ehsElements();
   // Capacity, not equality (same contract as rife's check_out_capacity): the entry points read
   // `need` bytes and write `need` bytes, so a caller who over-allocated is safe and must not be
   // refused. Only a SHORT buffer is a bug.
@@ -94,8 +94,7 @@ librediffusion_error_t check_frame_sizes(
   {
     fprintf(
         stderr,
-        "img2img_turbo: embedding too small — the model reads %zu floats [1,77,1024], caller "
-        "declared %zu\n",
+        "img2img_turbo: embedding too small — the model reads %zu floats, caller declared %zu\n",
         need_ehs, ehs_elements);
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
   }
@@ -136,7 +135,7 @@ librediffusion_error_t librediffusion_img2img_turbo_frame_dev_sized(
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   // ehs is a DEVICE buffer here; its length is the engine's and is not the caller's to get wrong.
   if(librediffusion_error_t e = check_frame_sizes(
-         h, in_bytes, (size_t)librediffusion::Img2ImgTurboPipeline::kEhsElements, out_bytes);
+         h, in_bytes, (size_t)h->pipe->ehsElements(), out_bytes);
      e != LIBREDIFFUSION_SUCCESS)
     return e;
   try
@@ -162,7 +161,7 @@ int librediffusion_img2img_turbo_ehs_elements(librediffusion_img2img_turbo_handl
 {
   if(!h || !h->pipe)
     return 0;
-  return librediffusion::Img2ImgTurboPipeline::kEhsElements;
+  return h->pipe->ehsElements();
 }
 
 /* DEPRECATED: these declare no sizes, so the caller's buffers cannot be checked. Prefer _sized. */
@@ -174,7 +173,7 @@ librediffusion_error_t librediffusion_img2img_turbo_frame(
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   const size_t n = (size_t)h->pipe->frameHeight() * h->pipe->frameWidth() * 4;
   return librediffusion_img2img_turbo_frame_sized(
-      h, in_rgba, n, ehs, (size_t)librediffusion::Img2ImgTurboPipeline::kEhsElements, out_rgba, n);
+      h, in_rgba, n, ehs, (size_t)h->pipe->ehsElements(), out_rgba, n);
 }
 
 librediffusion_error_t librediffusion_img2img_turbo_frame_dev(

@@ -43,6 +43,23 @@ void bindOut(nvinfer1::IExecutionContext* c, const char* name, void* ptr)
   if(!c->setTensorAddress(name, ptr))
     throw std::runtime_error(std::string("img2img-turbo: setTensorAddress(out) failed: ") + name);
 }
+
+// getTensorShape() on a name the engine does not declare logs a TensorRT error and yields
+// nbDims < 0; look the name up first.
+nvinfer1::Dims io_shape(const nvinfer1::ICudaEngine* eng, const char* name)
+{
+  nvinfer1::Dims none{};
+  none.nbDims = -1;
+  if(!eng)
+    return none;
+  for(int i = 0; i < eng->getNbIOTensors(); i++)
+  {
+    const char* n = eng->getIOTensorName(i);
+    if(n && std::string(n) == name)
+      return eng->getTensorShape(name);
+  }
+  return none;
+}
 } // namespace
 
 Img2ImgTurboPipeline::Img2ImgTurboPipeline(const Img2ImgTurboEngines& p)
@@ -50,7 +67,37 @@ Img2ImgTurboPipeline::Img2ImgTurboPipeline(const Img2ImgTurboEngines& p)
   c_enc_ = makeContext(e_enc_, p.vae_encoder);
   c_unet_ = makeContext(e_unet_, p.unet);
   c_dec_ = makeContext(e_dec_, p.vae_decoder);
+  discoverGeometry();
   alloc();
+}
+
+// The buffer sizes the C-API publishes (frame_bytes / ehs_elements) must describe the ENGINES that
+// were actually loaded, not the 512x512 sd-turbo export this was first written against. Both come
+// out of statically-shaped inputs; anything dynamic or unrecognised keeps the historical default.
+void Img2ImgTurboPipeline::discoverGeometry()
+{
+  const nvinfer1::Dims img = io_shape(e_enc_->getEngine(), "image");
+  if(img.nbDims == 4 && img.d[2] > 0 && img.d[3] > 0)
+  {
+    // Every skip activation is H/1, H/2, H/4, H/8; a size the VAE cannot halve three times is not
+    // one this pipeline can drive.
+    if((img.d[2] % 8) != 0 || (img.d[3] % 8) != 0)
+      throw std::runtime_error(
+          "img2img-turbo: VAE encoder 'image' is " + std::to_string(img.d[2]) + "x"
+          + std::to_string(img.d[3]) + ", which is not a multiple of 8");
+    H_ = (int)img.d[2];
+    W_ = (int)img.d[3];
+    lh_ = H_ / 8;
+    lw_ = W_ / 8;
+  }
+
+  const nvinfer1::Dims ehs = io_shape(e_unet_->getEngine(), "ehs");
+  if(ehs.nbDims == 3 && ehs.d[1] > 0 && ehs.d[2] > 0)
+  {
+    ehs_seq_ = (int)ehs.d[1];
+    ehs_dim_ = (int)ehs.d[2];
+    ehs_elements_ = ehs_seq_ * ehs_dim_;
+  }
 }
 
 Img2ImgTurboPipeline::~Img2ImgTurboPipeline() = default;
@@ -68,7 +115,7 @@ void Img2ImgTurboPipeline::alloc()
   rgba_in_ = std::make_unique<CUDATensor<unsigned char>>((size_t)H_ * W_ * 4);
   rgba_out_ = std::make_unique<CUDATensor<unsigned char>>((size_t)H_ * W_ * 4);
   image_ = std::make_unique<CUDATensor<float>>((size_t)1 * 3 * H_ * W_);
-  ehs_ = std::make_unique<CUDATensor<float>>((size_t)1 * 77 * 1024);
+  ehs_ = std::make_unique<CUDATensor<float>>((size_t)ehs_elements_);
   out_ = std::make_unique<CUDATensor<float>>((size_t)1 * 3 * H_ * W_);
 }
 
@@ -91,7 +138,7 @@ void Img2ImgTurboPipeline::forward(const float* image, const float* ehs, float* 
   {
     auto* c = c_unet_.get();
     bindIn(c, "latent", latent_->data(), dims4(1, 4, lh_, lw_));
-    bindIn(c, "ehs", ehs, dims3(1, 77, 1024));
+    bindIn(c, "ehs", ehs, dims3(1, ehs_seq_, ehs_dim_));
     bindOut(c, "model_pred", model_pred_->data());
     if(!c->enqueueV3(stream))
       throw std::runtime_error("img2img-turbo: unet enqueueV3 failed");
@@ -134,7 +181,8 @@ void Img2ImgTurboPipeline::forward_rgba(
     const unsigned char* in_rgba, const float* ehs_host, unsigned char* out_rgba, cudaStream_t stream)
 {
   cudaMemcpyAsync(
-      ehs_->data(), ehs_host, (size_t)1 * 77 * 1024 * sizeof(float), cudaMemcpyHostToDevice, stream);
+      ehs_->data(), ehs_host, (size_t)ehs_elements_ * sizeof(float), cudaMemcpyHostToDevice,
+      stream);
   run_rgba(in_rgba, out_rgba, stream);
 }
 
@@ -142,7 +190,7 @@ void Img2ImgTurboPipeline::forward_rgba_dev(
     const unsigned char* in_rgba, const void* ehs_dev_fp16, unsigned char* out_rgba,
     cudaStream_t stream)
 {
-  launch_fp16_to_fp32(ehs_dev_fp16, ehs_->data(), 77 * 1024, stream);
+  launch_fp16_to_fp32(ehs_dev_fp16, ehs_->data(), ehs_elements_, stream);
   run_rgba(in_rgba, out_rgba, stream);
 }
 

@@ -1325,8 +1325,9 @@ librediffusion_img2img_turbo_forward(
     librediffusion_img2img_turbo_handle h, const void* image_dev, const void* ehs_dev, void* out_dev,
     librediffusion_stream_t stream);
 
-/* Exact buffer requirements of the _frame entry points below, for the loaded engines.
- * frame_bytes = H*W*4 (each of in_rgba and out_rgba); ehs_elements = 77*1024 floats.
+/* Exact buffer requirements of the _frame entry points below, read out of the LOADED engines:
+ * frame_bytes = H*W*4 (each of in_rgba and out_rgba) from the VAE encoder's "image" input;
+ * ehs_elements = seq*dim from the UNet's "ehs" input (77*1024 on the SD2.1-derived exports).
  * Both return 0 on a null handle, and are absent from older .so builds (assume 512x512 / 77x1024). */
 LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
 librediffusion_img2img_turbo_frame_bytes(librediffusion_img2img_turbo_handle h);
@@ -1336,7 +1337,8 @@ librediffusion_img2img_turbo_ehs_elements(librediffusion_img2img_turbo_handle h)
 
 /* HOST-bytes convenience (mirrors flux2_stream_frame): RGBA8 [H,W,4] in + host ehs[1,77,1024]
  * -> RGBA8 [H,W,4] out. Does all host<->device copies + RGBA<->CHW conversion internally, so callers
- * with no CUDA (e.g. the score node) only pass plain byte/float buffers. Model is static 512x512.
+ * with no CUDA (e.g. the score node) only pass plain byte/float buffers. The geometry is the
+ * engines' own -- ask librediffusion_img2img_turbo_frame_bytes(), do not assume 512x512.
  *
  * PREFERRED FORM. The caller declares the CAPACITY of every buffer the call touches, so a short
  * buffer is LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS instead of a silent overflow: the
