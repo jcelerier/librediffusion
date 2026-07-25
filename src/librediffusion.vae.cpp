@@ -45,24 +45,11 @@ void LibreDiffusionPipeline::encode_image(
     launch_scalar_mul_inplace_fp16(latent_out, vae_scaling_factor, latent_elements, stream);
   }
 
-  // Initialize the img2img latent at timestep 0. do_add_noise gates ALL stochastic noise in the
-  // pipeline — this encode-time noise@t0 AND the multi-step inter-step noise (see predict_x0_batch) —
-  // so the "Add noise" setting is consumed identically at 1 step and N steps (previously it only
-  // affected the multi-step inter-step buffer, silently no-op at 1 step).
-  //   do_add_noise=true  (default): x_t = alpha0*latent + beta0*noise  — matches every StreamDiffusion
-  //                                 reference (upstream cumulo-autumn, the bundled fork, daydream), so
-  //                                 the validated goldens (run at the default) are unchanged.
-  //   do_add_noise=false:          x_t = alpha0*latent  (scaled clean latent, beta0*noise dropped) —
-  //                                 the reference's no-noise branch; makes the toggle meaningful even
-  //                                 for a 1-step pipeline, where there is no inter-step noise to gate.
-  // Guard on scheduler init (prepare() must have run to populate alpha/beta).
+  // x_t = alpha0*latent + beta0*init_noise[0], unconditionally: pipeline.py encode_image() does not
+  // consult do_add_noise, which gates only the inter-step seams (see predict_x0_batch). Guarded on
+  // prepare() having populated alpha/beta.
   if(init_noise_ && !alpha_prod_t_sqrt_host_.empty())
-  {
-    if(config_.do_add_noise)
-      add_noise_direct(latent_out, init_noise_->data(), /*t_index=*/0, latent_elements, stream);
-    else
-      launch_scalar_mul_inplace_fp16(latent_out, alpha_at(0), latent_elements, stream);
-  }
+    add_noise_direct(latent_out, init_noise_->data(), /*t_index=*/0, latent_elements, stream);
 }
 
 void LibreDiffusionPipeline::encode_image(
@@ -80,16 +67,9 @@ void LibreDiffusionPipeline::encode_image(
 
   const int latent_elements
       = config_.batch_size * 4 * config_.latent_height * config_.latent_width;
-  // do_add_noise gates all pipeline noise (encode-time @t0 + inter-step); consumed identically at 1 and
-  // N steps. true (default): alpha0*latent + beta0*noise (reference-faithful). false: alpha0*latent
-  // (scaled clean latent). See the __half overload above for the full rationale.
+  // Unconditional, as in the __half overload above.
   if(init_noise_ && !alpha_prod_t_sqrt_host_.empty())
-  {
-    if(config_.do_add_noise)
-      add_noise_direct(latent_out, init_noise_->data(), /*t_index=*/0, latent_elements, stream);
-    else
-      launch_scalar_mul_inplace_fp16(latent_out, alpha_at(0), latent_elements, stream);
-  }
+    add_noise_direct(latent_out, init_noise_->data(), /*t_index=*/0, latent_elements, stream);
 }
 
 void LibreDiffusionPipeline::decode_latent(
