@@ -1,6 +1,7 @@
 /** FLUX.2-klein-4B C-API implementation (with streaming). */
 #include "librediffusion.flux2.hpp"
 #include "librediffusion_c.h"
+#include "cuda_error_state.hpp"
 #include "kernels.hpp"
 #include "qwen_tokenizer_c.h"
 
@@ -55,6 +56,7 @@ librediffusion_flux2_handle librediffusion_flux2_create(
   }
   catch(const std::exception& e)
   {
+    librediffusion::drain_cuda_error();
     fprintf(stderr, "flux2_create failed: %s\n", e.what());
     return nullptr;
   }
@@ -79,6 +81,7 @@ librediffusion_error_t librediffusion_flux2_encode_text(
   }
   catch(const std::exception& e)
   {
+    librediffusion::drain_cuda_error();
     fprintf(stderr, "flux2_encode_text failed: %s\n", e.what());
     return LIBREDIFFUSION_ERROR_INTERNAL;
   }
@@ -131,6 +134,7 @@ librediffusion_error_t librediffusion_flux2_txt2img(
   }
   catch(const std::exception& e)
   {
+    librediffusion::drain_cuda_error();
     fprintf(stderr, "flux2_txt2img failed: %s\n", e.what());
     return LIBREDIFFUSION_ERROR_INTERNAL;
   }
@@ -181,6 +185,7 @@ librediffusion_error_t librediffusion_flux2_txt2img_ref(
   }
   catch(const std::exception& e)
   {
+    librediffusion::drain_cuda_error();
     fprintf(stderr, "flux2_txt2img_ref failed: %s\n", e.what());
     return LIBREDIFFUSION_ERROR_INTERNAL;
   }
@@ -279,6 +284,7 @@ librediffusion_flux2_stream_handle librediffusion_flux2_stream_create(
   }
   catch(const std::exception& e)
   {
+    librediffusion::drain_cuda_error();
     fprintf(stderr, "flux2_stream_create failed: %s\n", e.what());
     return nullptr;
   }
@@ -383,6 +389,7 @@ int librediffusion_flux2_stream_set_prompt(librediffusion_flux2_stream_handle s,
   }
   catch(const std::exception& e)
   {
+    librediffusion::drain_cuda_error();
     fprintf(stderr, "stream_set_prompt failed: %s\n", e.what());
     return -1;
   }
@@ -413,6 +420,7 @@ librediffusion_error_t librediffusion_flux2_stream_set_reference(
   }
   catch(const std::exception& e)
   {
+    librediffusion::drain_cuda_error();
     fprintf(stderr, "stream_set_reference failed: %s\n", e.what());
     return LIBREDIFFUSION_ERROR_INTERNAL;
   }
@@ -444,6 +452,7 @@ librediffusion_error_t librediffusion_flux2_stream_frame_cached(
   }
   catch(const std::exception& e)
   {
+    librediffusion::drain_cuda_error();
     fprintf(stderr, "stream_frame_cached failed: %s\n", e.what());
     return LIBREDIFFUSION_ERROR_INTERNAL;
   }
@@ -481,6 +490,7 @@ librediffusion_error_t librediffusion_flux2_stream_frame(
   }
   catch(const std::exception& e)
   {
+    librediffusion::drain_cuda_error();
     fprintf(stderr, "stream_frame failed: %s\n", e.what());
     return LIBREDIFFUSION_ERROR_INTERNAL;
   }

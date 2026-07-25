@@ -78,6 +78,10 @@ typedef enum librediffusion_error_t
   LIBREDIFFUSION_ERROR_NOT_INITIALIZED = -6,
   LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS = -7,
   LIBREDIFFUSION_ERROR_FILE_NOT_FOUND = -8,
+  /* The CUDA context is dead (illegal address, launch failure, ECC, ...). Unlike
+   * LIBREDIFFUSION_ERROR_CUDA_ERROR this cannot be cleared: every later call in this process will
+   * return it too, and only a restart recovers. */
+  LIBREDIFFUSION_ERROR_CUDA_CONTEXT_LOST = -9,
   LIBREDIFFUSION_ERROR_INTERNAL = -99
 } librediffusion_error_t;
 
