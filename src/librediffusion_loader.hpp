@@ -214,6 +214,11 @@ public:
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, img2img_turbo_forward);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, img2img_turbo_frame);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, img2img_turbo_frame_dev);
+  // Size-declaring forms (preferred; absent from older .so builds, hence OPT below).
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, img2img_turbo_frame_sized);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, img2img_turbo_frame_dev_sized);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, img2img_turbo_frame_bytes);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, img2img_turbo_ehs_elements);
 
   /*=========================================================================*/
   /* Utility Functions                                                       */
@@ -499,6 +504,10 @@ private:
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_forward);
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_frame);
     LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_frame_dev);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_frame_sized);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_frame_dev_sized);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_frame_bytes);
+    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_ehs_elements);
 
     /*=====================================================================*/
     /* Utility Functions                                                   */

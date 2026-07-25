@@ -1286,16 +1286,48 @@ librediffusion_img2img_turbo_forward(
     librediffusion_img2img_turbo_handle h, const void* image_dev, const void* ehs_dev, void* out_dev,
     librediffusion_stream_t stream);
 
+/* Exact buffer requirements of the _frame entry points below, for the loaded engines.
+ * frame_bytes = H*W*4 (each of in_rgba and out_rgba); ehs_elements = 77*1024 floats.
+ * Both return 0 on a null handle. ADDED alongside the _sized entry points; a caller that cannot
+ * resolve them is running an older .so and must assume the historical static 512x512 / 77x1024. */
+LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+librediffusion_img2img_turbo_frame_bytes(librediffusion_img2img_turbo_handle h);
+
+LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+librediffusion_img2img_turbo_ehs_elements(librediffusion_img2img_turbo_handle h);
+
 /* HOST-bytes convenience (mirrors flux2_stream_frame): RGBA8 [H,W,4] in + host ehs[1,77,1024]
  * -> RGBA8 [H,W,4] out. Does all host<->device copies + RGBA<->CHW conversion internally, so callers
- * with no CUDA (e.g. the score node) only pass plain byte/float buffers. Model is static 512x512. */
+ * with no CUDA (e.g. the score node) only pass plain byte/float buffers. Model is static 512x512.
+ *
+ * PREFERRED FORM. The caller declares the length of every buffer the call touches, so a mismatch is
+ * LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS instead of a silent overflow: the implementation copies
+ * H*W*4 bytes out of in_rgba, H*W*4 bytes into out_rgba and 77*1024 floats out of ehs, all sized
+ * from the ENGINE rather than from anything the caller said.
+ *   in_bytes / out_bytes  = librediffusion_img2img_turbo_frame_bytes(h)
+ *   ehs_elements          = librediffusion_img2img_turbo_ehs_elements(h) */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_img2img_turbo_frame_sized(
+    librediffusion_img2img_turbo_handle h, const unsigned char* in_rgba, size_t in_bytes,
+    const float* ehs, size_t ehs_elements, unsigned char* out_rgba, size_t out_bytes);
+
+/* Like _frame_sized but ehs is a DEVICE fp16 [1,77,1024] (e.g. straight from
+ * clip_compute_embeddings), whose length is the engine's rather than the caller's. Image is still
+ * HOST RGBA8 [H,W,4] in/out and IS declared. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_img2img_turbo_frame_dev_sized(
+    librediffusion_img2img_turbo_handle h, const unsigned char* in_rgba, size_t in_bytes,
+    const librediffusion_half_t* ehs_dev, unsigned char* out_rgba, size_t out_bytes);
+
+/* DEPRECATED (kept for ABI compatibility with existing callers). Identical behaviour to
+ * _frame_sized called with the model's own sizes — which means it CANNOT detect a caller whose
+ * buffers are smaller than that, because it is never told how big they are. Migrate to
+ * _frame_sized / _frame_dev_sized. */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_img2img_turbo_frame(
     librediffusion_img2img_turbo_handle h, const unsigned char* in_rgba, const float* ehs,
     unsigned char* out_rgba);
 
-/* Like _frame but ehs is a DEVICE fp16 [1,77,1024] (e.g. straight from clip_compute_embeddings);
- * converted to fp32 internally. Image is still HOST RGBA8 [H,W,4] in/out. */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_img2img_turbo_frame_dev(
     librediffusion_img2img_turbo_handle h, const unsigned char* in_rgba,
