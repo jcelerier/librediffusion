@@ -257,13 +257,9 @@ void LibreDiffusionPipeline::img2img(
     const uint8_t* cpu_rgba_input, uint8_t* cpu_rgba_output, int iw, int ih)
 {
   int batch_size = config_.batch_size;
-  // The HOST buffers hold ONE frame: the caller passes iw*ih*4 bytes, and only one frame crosses the
-  // boundary in either direction (img_preprocess replicates it to the batch extent). Sizing the
-  // host<->device copies by batch_size read `batch_size-1` extra frames past the end of the caller's
-  // input and wrote that much past the end of its output — a plain heap overflow of a buffer this
-  // library does not own, which is why batch 2 surfaced as glibc corruption or a SIGSEGV in cudaFree
-  // at teardown, long after the frame had been returned. The DEVICE staging buffers keep the batch
-  // extent because the VAE really does run batch_size rows.
+  // The HOST buffers hold ONE frame: the caller passes iw*ih*4 bytes and only one frame crosses the
+  // boundary in either direction (img_preprocess replicates it to the batch extent). The DEVICE
+  // staging buffers keep the batch extent because the VAE really does run batch_size rows.
   size_t rgba_frame_size = (size_t)ih * iw * 4;
   size_t rgba_input_size = (size_t)batch_size * ih * iw * 4;
   size_t rgba_vae_size = (size_t)batch_size * this->config_.height * this->config_.width * 4;
@@ -312,23 +308,17 @@ void LibreDiffusionPipeline::img2img(
       cpu_rgba_output, device_rgba_output_correct_size, rgba_frame_size,
       cudaMemcpyDeviceToHost, stream_);
 
-  // Wait for all operations to complete. This must NOT be optional: the copy above targets the
-  // CALLER's host buffer, so returning while it is still in flight lets that buffer (or the whole
-  // pipeline, if the host destroys it) go away underneath an active DMA. txt2img() below has always
-  // synchronized; this one was commented out.
+  // The copy above targets the CALLER's host buffer: returning while it is in flight lets that
+  // buffer (or the whole pipeline) go away underneath an active DMA.
   cudaStreamSynchronize(stream_);
 }
 
 void LibreDiffusionPipeline::txt2img(uint8_t* cpu_rgba_output, int iw, int ih)
 {
   int batch_size = config_.batch_size;
-  // The HOST buffers hold ONE frame: the caller passes iw*ih*4 bytes, and only one frame crosses the
-  // boundary in either direction (img_preprocess replicates it to the batch extent). Sizing the
-  // host<->device copies by batch_size read `batch_size-1` extra frames past the end of the caller's
-  // input and wrote that much past the end of its output — a plain heap overflow of a buffer this
-  // library does not own, which is why batch 2 surfaced as glibc corruption or a SIGSEGV in cudaFree
-  // at teardown, long after the frame had been returned. The DEVICE staging buffers keep the batch
-  // extent because the VAE really does run batch_size rows.
+  // The HOST buffers hold ONE frame: the caller passes iw*ih*4 bytes and only one frame crosses the
+  // boundary in either direction (img_preprocess replicates it to the batch extent). The DEVICE
+  // staging buffers keep the batch extent because the VAE really does run batch_size rows.
   size_t rgba_frame_size = (size_t)ih * iw * 4;
   size_t rgba_input_size = (size_t)batch_size * ih * iw * 4;
   size_t rgba_vae_size = (size_t)batch_size * this->config_.height * this->config_.width * 4;

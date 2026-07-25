@@ -19,19 +19,14 @@ public:
   {
   }
 
-  // Checked allocation. `data_` used to be missing from the member-init list entirely and the
-  // cudaMalloc result was discarded, so a failed allocation (an overflowed size, genuine VRAM
-  // exhaustion) left the object holding an INDETERMINATE pointer that every later kernel and
-  // memcpy dereferenced. Follows the pattern RifeInterpolator::ensureScratch already uses: throw,
-  // so the C boundary turns it into an error code instead of a device fault.
+  // Throws on failure so the C boundary turns it into an error code instead of a device fault.
   explicit CUDATensor(size_t size)
       : data_(nullptr)
       , size_(size)
       , owns_memory_(true)
   {
     const size_t bytes = size * sizeof(T);
-    // size * sizeof(T) must not have wrapped: a caller computing an element count in `int` can hand
-    // us something absurd, and the allocator would happily be asked for a nonsense length.
+    // A caller computing an element count in `int` can wrap size * sizeof(T).
     if(size != 0 && bytes / sizeof(T) != size)
       throw std::runtime_error("CUDATensor: requested element count overflows size_t");
     if(bytes == 0)

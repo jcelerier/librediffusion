@@ -52,7 +52,7 @@ void TensorRTLogger::log(Severity severity, const char* msg) noexcept
 }
 
 // ============================================================================
-// Optimization-profile checks (S-02)
+// Optimization-profile checks
 // ============================================================================
 namespace
 {

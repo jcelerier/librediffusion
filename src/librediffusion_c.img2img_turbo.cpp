@@ -71,10 +71,8 @@ librediffusion_error_t librediffusion_img2img_turbo_forward(
 
 namespace
 {
-// L-03: the unsized _frame entry points copy H_*W_*4 bytes out of `in_rgba`, H_*W_*4 bytes INTO
-// `out_rgba` and 77*1024 floats out of `ehs` — none of which the caller ever declared. The _sized
-// variants below carry those declarations so the library can refuse a mismatch instead of walking
-// off the end of three host buffers.
+// The unsized _frame entry points copy H_*W_*4 bytes out of `in_rgba`, H_*W_*4 bytes INTO `out_rgba`
+// and 77*1024 floats out of `ehs` — none of which the caller ever declared.
 librediffusion_error_t check_frame_sizes(
     librediffusion_img2img_turbo_handle h, size_t in_bytes, size_t ehs_elements, size_t out_bytes)
 {
@@ -164,8 +162,7 @@ int librediffusion_img2img_turbo_ehs_elements(librediffusion_img2img_turbo_handl
   return librediffusion::Img2ImgTurboPipeline::kEhsElements;
 }
 
-/* DEPRECATED, kept for ABI compatibility: these declare no sizes, so the library CANNOT check that
- * the caller's buffers are big enough for what it copies. Prefer the _sized variants above. */
+/* DEPRECATED: these declare no sizes, so the caller's buffers cannot be checked. Prefer _sized. */
 librediffusion_error_t librediffusion_img2img_turbo_frame(
     librediffusion_img2img_turbo_handle h, const unsigned char* in_rgba, const float* ehs,
     unsigned char* out_rgba)

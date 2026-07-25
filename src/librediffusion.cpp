@@ -37,10 +37,8 @@ LibreDiffusionPipeline::LibreDiffusionPipeline(const LibreDiffusionConfig& confi
 
 LibreDiffusionPipeline::~LibreDiffusionPipeline()
 {
-  // Drain the stream FIRST. Every buffer below (and every TensorRT context the members own) may
-  // still be referenced by work this stream has not run yet — img2img in particular ends with an
-  // async D2H into the CALLER's host buffer. Destroying while that is in flight is a use-after-free
-  // in both directions; a destroy racing an in-flight frame is exactly how a host tears a node down.
+  // Drain the stream first: the buffers and TensorRT contexts below may still be referenced by
+  // queued work, and img2img ends with an async D2H into the CALLER's host buffer.
   if(stream_)
     cudaStreamSynchronize(stream_);
 
@@ -100,9 +98,6 @@ void LibreDiffusionPipeline::set_delta(float g)
 
 namespace
 {
-// One place for the bounds check so every coefficient read reports the same way: a clear exception
-// naming the array and both indices, which the C API turns into an error code, instead of an
-// unchecked read past the end of a std::vector.
 inline float coeff_at(const std::vector<float>& v, int i, const char* name)
 {
   if(i < 0 || (size_t)i >= v.size())
@@ -137,9 +132,8 @@ const char* LibreDiffusionPipeline::inference_readiness() const
   if(!prompt_embeds_)
     return "prompt embeddings not prepared (call librediffusion_prepare_embeds first)";
 
-  // Scheduler: sub_timesteps_ is the device timestep buffer every forward binds, and the four
-  // coefficient vectors are indexed host-side ([0] on the 1-step turbo path, [i] on the multi-step
-  // one). An empty vector's data() is nullptr, so [0] is a null read, not merely a wrong number.
+  // Scheduler: sub_timesteps_ is the device buffer every forward binds; the coefficient vectors are
+  // indexed host-side, and an empty vector's data() is nullptr, so [0] is a null read.
   if(!sub_timesteps_ || alpha_prod_t_sqrt_host_.empty() || beta_prod_t_sqrt_host_.empty()
      || c_skip_host_.empty() || c_out_host_.empty())
     return "scheduler not prepared (call librediffusion_prepare_scheduler first)";
@@ -184,13 +178,9 @@ void LibreDiffusionPipeline::prepare_scheduler(
     throw std::runtime_error("prepare_scheduler: coefficient spans must all match timesteps.size()");
   if(n == 0)
     throw std::runtime_error("prepare_scheduler: an empty schedule is not a schedule");
-  // ...and they must also match config_.denoising_steps, which is what the denoise loops iterate and
-  // what init_buffers()/reinit_buffers() sized every batch buffer from. The equal-span guard above
-  // only compares the five arrays to EACH OTHER; a schedule shorter than the declared step count used
-  // to render silently (denoising_steps=2 against a 1-entry schedule returned SUCCESS and a plausible
-  // frame while reading alpha_prod_t_sqrt_host_[1] past the end of a 1-element vector). A genuine
-  // step-count change goes through reinit_buffers FIRST — which sets denoising_steps and reallocates —
-  // and only then pushes the matching schedule, so this never fires on a legitimate live update.
+  // ...and they must match config_.denoising_steps, which is what the denoise loops iterate and what
+  // init_buffers()/reinit_buffers() sized every batch buffer from. A step-count change goes through
+  // reinit_buffers first, so this never fires on a legitimate live update.
   if((int)n != config_.denoising_steps)
     throw std::runtime_error(
         "prepare_scheduler: schedule has " + std::to_string(n)
@@ -198,14 +188,10 @@ void LibreDiffusionPipeline::prepare_scheduler(
         + std::to_string(config_.denoising_steps)
         + " denoising steps (reinit_buffers with the new step count first)");
 
-  // Values, not just counts. NaN and inf propagate through the whole latent in one multiply and the
-  // frame comes back pure white (mean 255, std 0) with LIBREDIFFUSION_SUCCESS; alpha == 0 is a
-  // DIVISOR on the turbo path (x_0_pred /= alpha) and yields mean 249 / std 35. A host automating a
-  // coefficient through a bad value was told nothing at all. Timestep VALUES stay unconstrained
-  // beyond finiteness — -999 and 1e30 both produce ordinary frames, so they are not our business.
+  // NaN/inf propagate through the whole latent in one multiply; alpha == 0 is a divisor on the
+  // 1-step turbo path. Timestep VALUES stay unconstrained beyond finiteness.
   // NOTE: the library is compiled with -ffast-math, so std::isfinite() and `x == 0.f` are NOT
-  // reliable here — the compiler is allowed to assume no NaN/inf exists, which is precisely the
-  // assumption these inputs violate. Inspect the IEEE-754 bits instead.
+  // usable here — the compiler may assume no NaN/inf exists. Inspect the IEEE-754 bits instead.
   auto bits = [](float f) {
     unsigned int u = 0;
     std::memcpy(&u, &f, sizeof(u));
@@ -237,10 +223,9 @@ void LibreDiffusionPipeline::prepare_scheduler(
   reuse(c_out_, n);
 
   // sub_timesteps_ is the one buffer the UNet paths read by BATCH extent, not by step index: every
-  // forward copies `total_batch` (or batch_size) floats out of it. Those extents equal `n` only when
-  // batch_size == denoising_steps and frame_buffer_size == 1; anywhere else the copy ran past the end
-  // of the allocation. Hold the schedule cycled to the extent the forwards actually read, so `n` rows
-  // stay bit-identical and the surplus rows repeat the schedule instead of reading whatever followed.
+  // forward copies `total_batch` (or batch_size) floats out of it, which equals `n` only when
+  // batch_size == denoising_steps and frame_buffer_size == 1. Hold the schedule cycled to the extent
+  // the forwards actually read, so the first `n` rows stay bit-identical.
   const size_t extent = std::max(n, (size_t)timestep_extent());
   reuse(sub_timesteps_, extent);
   std::vector<float> cycled(extent);
@@ -401,9 +386,7 @@ int LibreDiffusionPipeline::num_runtime_loras() const
 
 void LibreDiffusionPipeline::set_lora_scale(int idx, float scale)
 {
-  // UNetWrapper::setLoraScale bounds-checks and returns silently, so a host that asked for a slot the
-  // engine does not have was told the scale had been applied. An engine with no runtime LoRA at all
-  // has zero slots, and every set on it was a no-op reported as success.
+  // UNetWrapper::setLoraScale bounds-checks and returns silently, so refuse the slot here instead.
   const int slots = num_runtime_loras();
   if(idx < 0 || idx >= slots)
     throw std::out_of_range(
