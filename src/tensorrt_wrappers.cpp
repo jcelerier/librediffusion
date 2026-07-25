@@ -2265,6 +2265,25 @@ void* checked_malloc(size_t bytes, const char* what)
         + std::to_string(bytes) + " bytes) failed: " + cudaGetErrorString(e));
   return p;
 }
+
+// checked_malloc throws, and so does anything below it that touches TensorRT. Every device
+// allocation made before that point has to be released or the caller leaks VRAM on a path it
+// cannot see; the wrappers' own destructors do not own these.
+struct DeviceFreeGuard
+{
+  void* p{};
+  ~DeviceFreeGuard()
+  {
+    if(p)
+      cudaFree(p);
+  }
+  void* release()
+  {
+    void* q = p;
+    p = nullptr;
+    return q;
+  }
+};
 } // namespace
 
 SDXLPromptEmbeddings computeClipEmbeddings_SDXL(
@@ -2286,45 +2305,44 @@ SDXLPromptEmbeddings computeClipEmbeddings_SDXL(
         "computeClipEmbeddings_SDXL: the second engine has no pooled output — it is not an "
         "SDXL CLIP2 (text_embeddings must be 2-D)");
 
-  SDXLPromptEmbeddings ret;
-
   // CLIP encoder 1: EOS padding (49407)
-  __half* d_embeds1 = clip.computeEmbeddings(prompt, clip_stream, 49407);
+  DeviceFreeGuard g_embeds1{clip.computeEmbeddings(prompt, clip_stream, 49407)};
 
   // CLIP encoder 2: pooled output, PAD padding (0)
   __half* d_pooled_row = nullptr;
-  __half* d_embeds2
-      = clip2.computeEmbeddingsWithPooled(prompt, clip_stream, 0, &d_pooled_row);
+  DeviceFreeGuard g_embeds2{
+      clip2.computeEmbeddingsWithPooled(prompt, clip_stream, 0, &d_pooled_row)};
+  DeviceFreeGuard g_pooled_row{d_pooled_row};
+
+  __half* const d_embeds1 = (__half*)g_embeds1.p;
+  __half* const d_embeds2 = (__half*)g_embeds2.p;
 
   // Both encoders run one prompt, so each source holds exactly ONE [77, h] row. Every batch element
   // shares that prompt: broadcast row 0 rather than indexing the source by b.
   const int hidden = h1 + h2;
-  ret.embeddings
-      = (__half*)checked_malloc((size_t)batch_size * 77 * hidden * sizeof(__half), "embeddings");
+  DeviceFreeGuard g_embeds{
+      checked_malloc((size_t)batch_size * 77 * hidden * sizeof(__half), "embeddings")};
+  __half* const d_out = (__half*)g_embeds.p;
 
   for(int b = 0; b < batch_size; ++b)
   {
     for(int s = 0; s < 77; ++s)
     {
       cudaMemcpy(
-          ret.embeddings + ((size_t)b * 77 + s) * hidden, d_embeds1 + (size_t)s * h1,
+          d_out + ((size_t)b * 77 + s) * hidden, d_embeds1 + (size_t)s * h1,
           h1 * sizeof(__half), cudaMemcpyDeviceToDevice);
       cudaMemcpy(
-          ret.embeddings + ((size_t)b * 77 + s) * hidden + h1, d_embeds2 + (size_t)s * h2,
+          d_out + ((size_t)b * 77 + s) * hidden + h1, d_embeds2 + (size_t)s * h2,
           h2 * sizeof(__half), cudaMemcpyDeviceToDevice);
     }
   }
 
-  ret.pooled_embeds
-      = (__half*)checked_malloc((size_t)batch_size * pooled_dim * sizeof(__half), "pooled_embeds");
+  DeviceFreeGuard g_pooled{
+      checked_malloc((size_t)batch_size * pooled_dim * sizeof(__half), "pooled_embeds")};
   for(int b = 0; b < batch_size; ++b)
     cudaMemcpy(
-        ret.pooled_embeds + (size_t)b * pooled_dim, d_pooled_row,
+        (__half*)g_pooled.p + (size_t)b * pooled_dim, d_pooled_row,
         pooled_dim * sizeof(__half), cudaMemcpyDeviceToDevice);
-
-  cudaFree(d_embeds1);
-  cudaFree(d_embeds2);
-  cudaFree(d_pooled_row);
 
   // Prepare time_ids: [original_height, original_width, crop_top, crop_left, target_height, target_width]
   std::vector<__half> time_ids_host(batch_size * 6);
@@ -2338,12 +2356,17 @@ SDXLPromptEmbeddings computeClipEmbeddings_SDXL(
     time_ids_host[i * 6 + 5] = __half(static_cast<float>(width));  // target_width
   }
 
-  ret.time_ids
-      = (__half*)checked_malloc((size_t)batch_size * 6 * sizeof(__half), "time_ids");
+  DeviceFreeGuard g_time_ids{
+      checked_malloc((size_t)batch_size * 6 * sizeof(__half), "time_ids")};
   cudaMemcpy(
-      ret.time_ids, time_ids_host.data(), batch_size * 6 * sizeof(__half),
+      g_time_ids.p, time_ids_host.data(), batch_size * 6 * sizeof(__half),
       cudaMemcpyHostToDevice);
 
+  // Nothing below here can throw: hand ownership to the caller.
+  SDXLPromptEmbeddings ret;
+  ret.embeddings = (__half*)g_embeds.release();
+  ret.pooled_embeds = (__half*)g_pooled.release();
+  ret.time_ids = (__half*)g_time_ids.release();
   return ret;
 }
 
