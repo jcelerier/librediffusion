@@ -237,6 +237,12 @@ librediffusion_flux2_stream_handle librediffusion_flux2_stream_create(
 {
   try
   {
+    // A grid with no tokens produced a valid handle reporting 0x0 dims, zero-byte allocations, and a
+    // context nothing else in the process could use afterwards.
+    if(Th <= 0 || Tw <= 0)
+      throw std::runtime_error(
+          "klein token grid must be positive (got Th=" + std::to_string(Th) + ", Tw="
+          + std::to_string(Tw) + ")");
     if(!vae_encoder_engine || !vae_encoder_engine[0])
       throw std::runtime_error("stream needs a vae_encoder engine (reference path)");
     if(!tokenizer_json || qwen_tokenizer_load(tokenizer_json) != 0)
