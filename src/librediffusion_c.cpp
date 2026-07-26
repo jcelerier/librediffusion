@@ -5,6 +5,7 @@
  * Compile this file with NVCC or a C++23 compiler that supports CUDA.
  */
 
+#include "device_guard.hpp"
 #include "librediffusion_c.h"
 #include "librediffusion.hpp"
 #include "tensorrt_wrappers.hpp"
@@ -41,6 +42,7 @@ struct librediffusion_config_t
 struct librediffusion_pipeline_t
 {
   std::unique_ptr<librediffusion::LibreDiffusionPipeline> cpp_pipeline;
+  int device{0};
 };
 
 namespace
@@ -129,6 +131,18 @@ librediffusion_error_t check_cuda_error()
     return LIBREDIFFUSION_SUCCESS;
   return cuda_error_is_context_fatal(err) ? LIBREDIFFUSION_ERROR_CUDA_CONTEXT_LOST
                                           : LIBREDIFFUSION_ERROR_CUDA_ERROR;
+}
+
+template <typename Func>
+librediffusion_error_t try_catch_wrapper(Func&& func);
+
+// Runs func with the current CUDA device scoped to the handle's. cudaSetDevice is thread state, so
+// without this a handle built on one thread and driven from another lands on that thread's default.
+template <typename Func>
+librediffusion_error_t try_catch_wrapper(int device, Func&& func)
+{
+  librediffusion::DeviceGuard guard{device};
+  return try_catch_wrapper(std::forward<Func>(func));
 }
 
 template <typename Func>
@@ -682,8 +696,13 @@ librediffusion_pipeline_create(
   // does not carry an uninitialised local into every later call.
   *pipeline = nullptr;
 
-  return try_catch_wrapper([&]() {
+  const int dev = librediffusion::resolve_device(config->cpp_config.device);
+  if (dev < 0)
+    return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+
+  return try_catch_wrapper(dev, [&]() {
     auto p = std::make_unique<librediffusion_pipeline_t>();
+    p->device = dev;
     p->cpp_pipeline = std::make_unique<librediffusion::LibreDiffusionPipeline>(
         config->cpp_config);
     register_handle(p.get());
@@ -744,7 +763,7 @@ librediffusion_pipeline_init_cuda(librediffusion_pipeline_handle pipeline)
   if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->init_cuda();
   });
 }
@@ -755,7 +774,7 @@ librediffusion_pipeline_init_npp(librediffusion_pipeline_handle pipeline)
   if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->init_npp();
   });
 }
@@ -766,7 +785,7 @@ librediffusion_pipeline_init_engines(librediffusion_pipeline_handle pipeline)
   if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->init_engines();
   });
 }
@@ -777,7 +796,7 @@ librediffusion_pipeline_init_buffers(librediffusion_pipeline_handle pipeline)
   if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->init_buffers();
   });
 }
@@ -814,7 +833,7 @@ librediffusion_pipeline_reinit_buffers(
 
   // reinit_buffers runs geometry_rejection itself and throws invalid_dimensions_error, which
   // try_catch_wrapper turns into LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS.
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->reinit_buffers(config->cpp_config);
   });
 }
@@ -838,7 +857,7 @@ librediffusion_prepare_embeds(
       e != LIBREDIFFUSION_SUCCESS)
     return e;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->prepare_embeds(
         to_half_ptr(prompt_embeds), seq_len, hidden_dim);
   });
@@ -859,7 +878,7 @@ librediffusion_prepare_null_embeds(
       e != LIBREDIFFUSION_SUCCESS)
     return e;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->prepare_null_embeds(
         to_half_ptr(null_embeds), seq_len, hidden_dim);
   });
@@ -880,7 +899,7 @@ librediffusion_prepare_negative_embeds(
       e != LIBREDIFFUSION_SUCCESS)
     return e;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->prepare_negative_embeds(
         to_half_ptr(negative_embeds), seq_len, hidden_dim);
   });
@@ -902,7 +921,7 @@ librediffusion_blend_embeds(
       e != LIBREDIFFUSION_SUCCESS)
     return e;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     // Convert librediffusion_half_t* const* to __half* const*
     std::vector<const __half*> embed_ptrs(num_embeddings);
     for(int i = 0; i < num_embeddings; i++)
@@ -938,7 +957,7 @@ librediffusion_prepare_sdxl_conditioning(
     }
   }
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->prepare_sdxl_conditioning(
         to_half_ptr(text_embeds), to_half_ptr(time_ids));
   });
@@ -957,7 +976,7 @@ librediffusion_prepare_scheduler(
   if (num_timesteps == 0)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     std::span<float> ts_span(const_cast<float*>(timesteps), num_timesteps);
     std::span<float> alpha_span(const_cast<float*>(alpha_prod_t_sqrt), num_timesteps);
     std::span<float> beta_span(const_cast<float*>(beta_prod_t_sqrt), num_timesteps);
@@ -978,7 +997,7 @@ librediffusion_set_init_noise(
   if (!noise)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->set_init_noise(to_half_ptr(noise));
   });
 }
@@ -992,7 +1011,7 @@ librediffusion_set_controlnet_cond(
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!cond)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->set_controlnet_cond(index, to_half_ptr(cond), img_height, img_width);
   });
 }
@@ -1006,7 +1025,7 @@ librediffusion_set_controlnet_cond_rgba(
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!cpu_rgba)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->set_controlnet_cond_rgba(index, cpu_rgba, img_height, img_width);
   });
 }
@@ -1017,7 +1036,7 @@ librediffusion_set_controlnet_scale(
 {
   if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->set_controlnet_scale(index, scale);
   });
 }
@@ -1060,7 +1079,7 @@ librediffusion_set_ipadapter_image(
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!cpu_rgba)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->set_ipadapter_image(cpu_rgba, img_height, img_width);
   });
 }
@@ -1087,7 +1106,7 @@ librediffusion_set_ipadapter_tokens(
         dim, pipeline->cpp_pipeline->config().text_hidden_dim);
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
   }
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->set_ipadapter_tokens(
         to_half_ptr(pos_tokens), to_half_ptr(neg_tokens), num_tokens, dim);
   });
@@ -1098,7 +1117,7 @@ librediffusion_set_ipadapter_scale(librediffusion_pipeline_handle pipeline, floa
 {
   if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
-  return try_catch_wrapper([&]() { pipeline->cpp_pipeline->set_ipadapter_scale(scale); });
+  return try_catch_wrapper(pipeline->device, [&]() { pipeline->cpp_pipeline->set_ipadapter_scale(scale); });
 }
 
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
@@ -1109,7 +1128,7 @@ librediffusion_set_ipadapter_scale_vector(
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!per_layer)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->set_ipadapter_scale_vector(per_layer, num_ip_layers);
   });
 }
@@ -1127,7 +1146,7 @@ librediffusion_set_lora_scale(librediffusion_pipeline_handle pipeline, int idx, 
 {
   if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
-  return try_catch_wrapper([&]() { pipeline->cpp_pipeline->set_lora_scale(idx, scale); });
+  return try_catch_wrapper(pipeline->device, [&]() { pipeline->cpp_pipeline->set_lora_scale(idx, scale); });
 }
 
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
@@ -1138,7 +1157,7 @@ librediffusion_set_lora_scale_vector(
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
   if (!scales)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
-  return try_catch_wrapper([&]() { pipeline->cpp_pipeline->set_lora_scale_vector(scales, n); });
+  return try_catch_wrapper(pipeline->device, [&]() { pipeline->cpp_pipeline->set_lora_scale_vector(scales, n); });
 }
 
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
@@ -1147,7 +1166,7 @@ librediffusion_reseed(librediffusion_pipeline_handle pipeline, int64_t seed)
   if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->reseed(seed);
   });
 }
@@ -1159,7 +1178,7 @@ librediffusion_set_guidance_scale(
   if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->set_guidance_scale(guidance);
   });
 }
@@ -1170,7 +1189,7 @@ librediffusion_set_delta(librediffusion_pipeline_handle pipeline, float delta)
   if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->set_delta(delta);
   });
 }
@@ -1193,7 +1212,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL librediffusion_img
   if (librediffusion_error_t e = check_inference_ready(pipeline); e != LIBREDIFFUSION_SUCCESS)
     return e;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->img2img(cpu_rgba_input, cpu_rgba_output, width, height);
   });
 }
@@ -1212,7 +1231,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL librediffusion_txt
   if (librediffusion_error_t e = check_inference_ready(pipeline); e != LIBREDIFFUSION_SUCCESS)
     return e;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->txt2img(cpu_rgba_output, width, height);
   });
 }
@@ -1234,7 +1253,7 @@ librediffusion_img2img_gpu_half(
   if (librediffusion_error_t e = check_inference_ready(pipeline); e != LIBREDIFFUSION_SUCCESS)
     return e;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->img2img_impl(
         to_half_ptr(image_in),
         to_half_ptr(image_out),
@@ -1255,7 +1274,7 @@ librediffusion_img2img_gpu_float(
   if (librediffusion_error_t e = check_inference_ready(pipeline); e != LIBREDIFFUSION_SUCCESS)
     return e;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->img2img_impl(
         image_in,
         to_half_ptr(image_out),
@@ -1275,7 +1294,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL librediffusion_txt
   if (librediffusion_error_t e = check_inference_ready(pipeline); e != LIBREDIFFUSION_SUCCESS)
     return e;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->txt2img_impl(
         to_half_ptr(image_out),
         to_cuda_stream(stream));
@@ -1295,7 +1314,7 @@ librediffusion_txt2img_sd_turbo_gpu(
   if (librediffusion_error_t e = check_inference_ready(pipeline); e != LIBREDIFFUSION_SUCCESS)
     return e;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->txt2img_sd_turbo_impl(
         to_half_ptr(image_out), to_cuda_stream(stream));
   });
@@ -1318,7 +1337,7 @@ librediffusion_encode_image_half(
       e != LIBREDIFFUSION_SUCCESS)
     return e;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->encode_image(
         to_half_ptr(image),
         to_half_ptr(latent_out),
@@ -1339,7 +1358,7 @@ librediffusion_encode_image_float(
       e != LIBREDIFFUSION_SUCCESS)
     return e;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->encode_image(
         image,
         to_half_ptr(latent_out),
@@ -1360,7 +1379,7 @@ librediffusion_decode_latent(
       e != LIBREDIFFUSION_SUCCESS)
     return e;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->decode_latent(
         to_half_ptr(latent),
         to_half_ptr(image_out),
@@ -1385,7 +1404,7 @@ librediffusion_predict_x0_batch(
   if (librediffusion_error_t e = check_inference_ready(pipeline); e != LIBREDIFFUSION_SUCCESS)
     return e;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->predict_x0_batch(
         to_half_ptr(x_t_latent_in),
         to_half_ptr(x_0_pred_out),
@@ -1409,7 +1428,7 @@ librediffusion_rgba_nhwc_to_nchw_float(
   if (width <= 0 || height <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->rgba_nhwc_to_nchw_gpu(
         rgba_nhwc_in, rgb_nchw_out, width, height, to_cuda_stream(stream));
   });
@@ -1428,7 +1447,7 @@ librediffusion_rgba_nhwc_to_nchw_half(
   if (width <= 0 || height <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->rgba_nhwc_to_nchw_gpu(
         rgba_nhwc_in, to_half_ptr(rgb_nchw_out), width, height, to_cuda_stream(stream));
   });
@@ -1446,7 +1465,7 @@ librediffusion_nchw_half_to_rgba_nhwc(
   if (width <= 0 || height <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->nchw_to_rgba_nhwc_gpu(
         to_half_ptr(rgb_nchw_in), rgba_nhwc_out, width, height, to_cuda_stream(stream));
   });
@@ -1464,7 +1483,7 @@ librediffusion_nchw_float_to_rgba_nhwc(
   if (width <= 0 || height <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->nchw_to_rgba_nhwc_gpu(
         rgb_nchw_in, rgba_nhwc_out, width, height, to_cuda_stream(stream));
   });
@@ -1481,7 +1500,7 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL librediffusion_rgb
   if (in_width <= 0 || in_height <= 0 || out_width <= 0 || out_height <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->rgba_resize(
         rgba_input, in_width, in_height,
         rgba_output, out_width, out_height);
@@ -1504,7 +1523,7 @@ librediffusion_enable_temporal_coherence(
   if (cache_interval < 1 || max_cached_frames < 1)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->enableTemporalCoherence(
         use_feature_injection != 0,
         injection_strength,
@@ -1520,7 +1539,7 @@ librediffusion_disable_temporal_coherence(librediffusion_pipeline_handle pipelin
   if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->disableTemporalCoherence();
   });
 }
@@ -1531,7 +1550,7 @@ librediffusion_reset_temporal_state(librediffusion_pipeline_handle pipeline)
   if (!valid(pipeline))
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(pipeline->device, [&]() {
     pipeline->cpp_pipeline->resetTemporalState();
   });
 }
@@ -1552,16 +1571,24 @@ librediffusion_get_current_frame_id(librediffusion_pipeline_handle pipeline)
 struct librediffusion_clip_t
 {
   std::unique_ptr<librediffusion::CLIPWrapper> cpp_clip;
+  int device{0};
 };
 
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
-librediffusion_clip_create(const char* engine_path, librediffusion_clip_handle* clip)
+librediffusion_clip_create(
+    const char* engine_path, int device, librediffusion_clip_handle* clip)
 {
   if (!engine_path || !clip)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
+  *clip = nullptr;
 
-  return try_catch_wrapper([&]() {
+  const int dev = librediffusion::resolve_device(device);
+  if (dev < 0)
+    return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+
+  return try_catch_wrapper(dev, [&]() {
     auto c = new librediffusion_clip_t{};
+    c->device = dev;
     c->cpp_clip = std::make_unique<librediffusion::CLIPWrapper>(engine_path);
     *clip = c;
   });
@@ -1583,7 +1610,7 @@ librediffusion_clip_compute_embeddings(
   if (!prompt || !embeddings)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(clip->device, [&]() {
     __half* result = clip->cpp_clip->computeEmbeddings(
         prompt, to_cuda_stream(stream), pad_token);
     *embeddings = reinterpret_cast<librediffusion_half_t*>(result);
@@ -1602,7 +1629,7 @@ librediffusion_clip_compute_embeddings_sdxl(
   if (!prompt || !embeddings || !pooled_embeds || !time_ids)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
 
-  return try_catch_wrapper([&]() {
+  return try_catch_wrapper(clip1->device, [&]() {
     auto result = librediffusion::computeClipEmbeddings_SDXL(
         *clip1->cpp_clip, *clip2->cpp_clip,
         prompt, batch_size, height, width,

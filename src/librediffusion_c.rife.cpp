@@ -1,5 +1,6 @@
 /** RIFE frame-interpolation C-API implementation (shared/model-agnostic). */
 #include "librediffusion.rife.hpp"
+#include "device_guard.hpp"
 #include "librediffusion_c.h"
 
 #include <cstdio>
@@ -12,15 +13,24 @@ struct librediffusion_rife
   std::unique_ptr<RifeInterpolator> interp;
   bool enabled{false};
   int exp{1};
+  int device{0};
 };
 
 extern "C" {
 
-librediffusion_rife_handle librediffusion_rife_create(const char* engine_path)
+librediffusion_rife_handle librediffusion_rife_create(const char* engine_path, int device)
 {
+  const int dev = resolve_device(device);
+  if(dev < 0)
+  {
+    fprintf(stderr, "rife_create: device %d is not a valid CUDA device ordinal\n", device);
+    return nullptr;
+  }
   try
   {
+    DeviceGuard guard{dev};
     auto* h = new librediffusion_rife;
+    h->device = dev;
     h->interp = std::make_unique<RifeInterpolator>(engine_path ? engine_path : "");
     return h;
   }
@@ -33,6 +43,9 @@ librediffusion_rife_handle librediffusion_rife_create(const char* engine_path)
 
 void librediffusion_rife_destroy(librediffusion_rife_handle h)
 {
+  if(!h)
+    return;
+  DeviceGuard guard{h->device};
   delete h;
 }
 
@@ -100,6 +113,7 @@ librediffusion_error_t librediffusion_rife_interpolate_sized(
 {
   if(!h || !h->interp || !prev_rgba || !cur_rgba || !out_frames)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  DeviceGuard guard{h->device};
   if(H <= 0 || W <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
   if(librediffusion_error_t e = check_out_capacity(h, H, W, out_capacity_bytes);
@@ -115,6 +129,7 @@ librediffusion_error_t librediffusion_rife_interpolate_gpu_sized(
 {
   if(!h || !h->interp || !prev_rgba_dev || !cur_rgba_dev || !out_frames_dev)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  DeviceGuard guard{h->device};
   if(H <= 0 || W <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
   if(librediffusion_error_t e = check_out_capacity(h, H, W, out_capacity_bytes);
@@ -131,6 +146,7 @@ librediffusion_error_t librediffusion_rife_interpolate(
 {
   if(!h || !h->interp || !prev_rgba || !cur_rgba || !out_frames)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  DeviceGuard guard{h->device};
   try
   {
     int eff_exp = h->enabled ? h->exp : 0;
@@ -152,6 +168,7 @@ librediffusion_error_t librediffusion_rife_interpolate_gpu(
 {
   if(!h || !h->interp || !prev_rgba_dev || !cur_rgba_dev || !out_frames_dev)
     return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  DeviceGuard guard{h->device};
   try
   {
     int eff_exp = h->enabled ? h->exp : 0;
