@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include <cassert>
 #include <chrono>
@@ -152,6 +153,27 @@ void LibreDiffusionPipeline::init_engines()
 
 void LibreDiffusionPipeline::init_buffers()
 {
+  // Every element count below is computed in int. width/height are bounded at the C API, but the
+  // batch counters are not bounded against the LATENT extent, and the products cross INT_MAX well
+  // before the counters look unreasonable: batch 128 at the maximum resolution already wraps.
+  // Signed overflow is UB and a wrapped count silently mis-sizes every buffer, so check the
+  // products themselves rather than guessing a bound for each factor.
+  {
+    const int64_t plane = (int64_t)4 * config_.latent_height * config_.latent_width;
+    const int64_t total_batch
+        = (int64_t)config_.batch_size
+          + (int64_t)(config_.denoising_steps - 1) * config_.frame_buffer_size;
+    const int64_t steps_batch
+        = (int64_t)config_.denoising_steps * config_.frame_buffer_size;
+    const int64_t worst = std::max({(int64_t)config_.batch_size, total_batch, steps_batch}) * plane;
+    if(worst > (int64_t)std::numeric_limits<int>::max())
+      throw invalid_dimensions_error(
+          "init_buffers: batch_size " + std::to_string(config_.batch_size) + " x "
+          + std::to_string(config_.denoising_steps) + " steps at "
+          + std::to_string(config_.latent_width) + "x" + std::to_string(config_.latent_height)
+          + " latent needs " + std::to_string(worst) + " elements, which does not fit in int");
+  }
+
   // Calculate sizes
   int latent_size
       = config_.batch_size * 4 * config_.latent_height * config_.latent_width;
@@ -340,9 +362,14 @@ std::string
 LibreDiffusionPipeline::geometry_rejection(const LibreDiffusionConfig& cfg) const
 {
   // The UNet is driven at unet_batch_size(); cfg-full doubles that, so this is the loosest bound and
-  // cannot refuse a geometry that would have worked.
-  const int unet_batch
-      = cfg.batch_size + (cfg.denoising_steps - 1) * cfg.frame_buffer_size;
+  // cannot refuse a geometry that would have worked. Widened: the guard's own arithmetic must not
+  // wrap on the values it exists to reject.
+  const int64_t unet_batch64
+      = (int64_t)cfg.batch_size + (int64_t)(cfg.denoising_steps - 1) * cfg.frame_buffer_size;
+  if(unet_batch64 > (int64_t)std::numeric_limits<int>::max())
+    return "batch_size " + std::to_string(cfg.batch_size) + " with "
+           + std::to_string(cfg.denoising_steps) + " denoising steps overflows the UNet batch";
+  const int unet_batch = (int)unet_batch64;
 
   if(vae_encoder_)
     if(auto why = vae_encoder_->rejectGeometry(cfg.batch_size, cfg.height, cfg.width);
