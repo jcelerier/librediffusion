@@ -8,25 +8,37 @@
 #include <memory>
 #include <stdexcept>
 
+#include "device_guard.hpp"
+
 using namespace librediffusion;
 
 struct librediffusion_img2img_turbo
 {
   std::unique_ptr<Img2ImgTurboPipeline> pipe;
+  int device{0};
 };
 
 extern "C" {
 
 librediffusion_img2img_turbo_handle librediffusion_img2img_turbo_create(
-    const char* unet_engine, const char* vae_encoder_engine, const char* vae_decoder_engine)
+    const char* unet_engine, const char* vae_encoder_engine, const char* vae_decoder_engine,
+    int device)
 {
+  const int dev = resolve_device(device);
+  if(dev < 0)
+  {
+    fprintf(stderr, "img2img_turbo_create: device %d is not a valid CUDA device ordinal\n", device);
+    return nullptr;
+  }
   try
   {
+    DeviceGuard guard{dev};
     Img2ImgTurboEngines p;
     p.unet = unet_engine ? unet_engine : "";
     p.vae_encoder = vae_encoder_engine ? vae_encoder_engine : "";
     p.vae_decoder = vae_decoder_engine ? vae_decoder_engine : "";
     auto h = std::make_unique<librediffusion_img2img_turbo>();
+    h->device = dev;
     h->pipe = std::make_unique<Img2ImgTurboPipeline>(p);  // may throw (engine load) -> h freed by RAII
     return h.release();
   }
@@ -39,6 +51,9 @@ librediffusion_img2img_turbo_handle librediffusion_img2img_turbo_create(
 
 void librediffusion_img2img_turbo_destroy(librediffusion_img2img_turbo_handle h)
 {
+  if(!h)
+    return;
+  DeviceGuard guard{h->device};
   delete h;
 }
 
@@ -48,6 +63,7 @@ librediffusion_error_t librediffusion_img2img_turbo_forward(
 {
   if(!h || !h->pipe)
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  DeviceGuard guard{h->device};
   if(!image_dev || !ehs_dev || !out_dev)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   try
@@ -108,6 +124,7 @@ librediffusion_error_t librediffusion_img2img_turbo_frame_sized(
 {
   if(!h || !h->pipe)
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  DeviceGuard guard{h->device};
   if(!in_rgba || !ehs || !out_rgba)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if(librediffusion_error_t e = check_frame_sizes(h, in_bytes, ehs_elements, out_bytes);
@@ -131,6 +148,7 @@ librediffusion_error_t librediffusion_img2img_turbo_frame_dev_sized(
 {
   if(!h || !h->pipe)
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  DeviceGuard guard{h->device};
   if(!in_rgba || !ehs_dev || !out_rgba)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   // ehs is a DEVICE buffer here; its length is the engine's and is not the caller's to get wrong.
@@ -169,6 +187,7 @@ librediffusion_error_t librediffusion_img2img_turbo_frame_size(
 {
   if(!h || !h->pipe)
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  DeviceGuard guard{h->device};
   if(!out_width || !out_height)
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   *out_width = h->pipe->frameWidth();
@@ -183,6 +202,7 @@ librediffusion_error_t librediffusion_img2img_turbo_frame(
 {
   if(!h || !h->pipe)
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  DeviceGuard guard{h->device};
   const size_t n = (size_t)h->pipe->frameHeight() * h->pipe->frameWidth() * 4;
   return librediffusion_img2img_turbo_frame_sized(
       h, in_rgba, n, ehs, (size_t)h->pipe->ehsElements(), out_rgba, n);
@@ -194,6 +214,7 @@ librediffusion_error_t librediffusion_img2img_turbo_frame_dev(
 {
   if(!h || !h->pipe)
     return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  DeviceGuard guard{h->device};
   const size_t n = (size_t)h->pipe->frameHeight() * h->pipe->frameWidth() * 4;
   return librediffusion_img2img_turbo_frame_dev_sized(h, in_rgba, n, ehs_dev, out_rgba, n);
 }

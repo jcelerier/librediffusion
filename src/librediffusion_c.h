@@ -899,7 +899,8 @@ typedef struct librediffusion_clip_t* librediffusion_clip_handle;
  * @return LIBREDIFFUSION_SUCCESS or error code
  */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
-librediffusion_clip_create(const char* engine_path, librediffusion_clip_handle* clip);
+librediffusion_clip_create(
+    const char* engine_path, int device, librediffusion_clip_handle* clip);
 
 /**
  * Destroy a CLIP encoder and free resources.
@@ -1094,7 +1095,7 @@ typedef struct librediffusion_flux2* librediffusion_flux2_handle;
 LIBREDIFFUSION_API librediffusion_flux2_handle LIBREDIFFUSION_CALL
 librediffusion_flux2_create(
     const char* transformer_engine, const char* qwen_engine, const char* vae_decoder_engine,
-    const char* vae_encoder_engine);
+    const char* vae_encoder_engine, int device);
 
 LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
 librediffusion_flux2_destroy(librediffusion_flux2_handle h);
@@ -1157,7 +1158,7 @@ LIBREDIFFUSION_API librediffusion_flux2_stream_handle LIBREDIFFUSION_CALL
 librediffusion_flux2_stream_create(
     const char* transformer_engine, const char* qwen_engine, const char* vae_decoder_engine,
     const char* vae_encoder_engine, const char* tokenizer_json, int Th, int Tw,
-    unsigned long long seed);
+    unsigned long long seed, int device);
 
 LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
 librediffusion_flux2_stream_destroy(librediffusion_flux2_stream_handle s);
@@ -1242,7 +1243,7 @@ typedef struct librediffusion_rife* librediffusion_rife_handle;
 
 /* Create a RIFE interpolator from the IFNet fp16 engine path. Returns NULL on failure. */
 LIBREDIFFUSION_API librediffusion_rife_handle LIBREDIFFUSION_CALL
-librediffusion_rife_create(const char* engine_path);
+librediffusion_rife_create(const char* engine_path, int device);
 
 LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
 librediffusion_rife_destroy(librediffusion_rife_handle h);
@@ -1314,7 +1315,8 @@ typedef struct librediffusion_img2img_turbo* librediffusion_img2img_turbo_handle
 
 LIBREDIFFUSION_API librediffusion_img2img_turbo_handle LIBREDIFFUSION_CALL
 librediffusion_img2img_turbo_create(
-    const char* unet_engine, const char* vae_encoder_engine, const char* vae_decoder_engine);
+    const char* unet_engine, const char* vae_encoder_engine, const char* vae_decoder_engine,
+    int device);
 
 LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
 librediffusion_img2img_turbo_destroy(librediffusion_img2img_turbo_handle h);

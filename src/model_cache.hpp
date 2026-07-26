@@ -728,8 +728,13 @@ loadEngineFromFile(const std::string& engine_path, nvinfer1::ILogger& logger)
 inline std::shared_ptr<CachedTensorRTEngine>
 getCachedEngine(const std::string& engine_path)
 {
-  return GlobalEngineCache::instance().engines().get_or_load(
-      engine_path, [&engine_path]() {
+  // An ICudaEngine belongs to the device it was deserialized on, so the same file on two devices is
+  // two entries. Callers reach here inside a DeviceGuard, so the current device IS the owner's.
+  int device = 0;
+  cudaGetDevice(&device);
+  const std::string key = engine_path + '\x1f' + std::to_string(device);
+
+  return GlobalEngineCache::instance().engines().get_or_load(key, [&engine_path]() {
     return loadEngineFromFile(engine_path, GlobalEngineCache::instance().logger());
   });
 }

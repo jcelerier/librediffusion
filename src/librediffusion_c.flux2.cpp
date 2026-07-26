@@ -1,5 +1,6 @@
 /** FLUX.2-klein-4B C-API implementation (with streaming). */
 #include "librediffusion.flux2.hpp"
+#include "device_guard.hpp"
 #include "librediffusion_c.h"
 #include "cuda_error_state.hpp"
 #include "kernels.hpp"
@@ -35,22 +36,31 @@ struct CudaFreeGuard
 struct librediffusion_flux2
 {
   std::unique_ptr<Flux2Pipeline> pipe;
+  int device{0};
 };
 
 extern "C" {
 
 librediffusion_flux2_handle librediffusion_flux2_create(
     const char* transformer_engine, const char* qwen_engine, const char* vae_decoder_engine,
-    const char* vae_encoder_engine)
+    const char* vae_encoder_engine, int device)
 {
+  const int dev = resolve_device(device);
+  if(dev < 0)
+  {
+    fprintf(stderr, "flux2_create: device %d is not a valid CUDA device ordinal\n", device);
+    return nullptr;
+  }
   try
   {
+    DeviceGuard guard{dev};
     Flux2EnginePaths p;
     p.transformer = transformer_engine ? transformer_engine : "";
     p.qwen = qwen_engine ? qwen_engine : "";
     p.vae_decoder = vae_decoder_engine ? vae_decoder_engine : "";
     p.vae_encoder = vae_encoder_engine ? vae_encoder_engine : "";
     auto* h = new librediffusion_flux2;
+    h->device = dev;
     h->pipe = std::make_unique<Flux2Pipeline>(p);
     return h;
   }
@@ -64,6 +74,9 @@ librediffusion_flux2_handle librediffusion_flux2_create(
 
 void librediffusion_flux2_destroy(librediffusion_flux2_handle h)
 {
+  if(!h)
+    return;
+  DeviceGuard guard{h->device};
   delete h;
 }
 
@@ -72,6 +85,7 @@ librediffusion_error_t librediffusion_flux2_encode_text(
     int Lt)
 {
   if(!h || !h->pipe) return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  DeviceGuard guard{h->device};
   try
   {
     h->pipe->encode_text(
@@ -93,6 +107,7 @@ librediffusion_error_t librediffusion_flux2_txt2img(
     unsigned char* rgba_host, float* out_final_latent_host)
 {
   if(!h || !h->pipe) return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  DeviceGuard guard{h->device};
   try
   {
     const int Lp = Th * Tw;
@@ -146,6 +161,7 @@ librediffusion_error_t librediffusion_flux2_txt2img_ref(
     int num_steps, unsigned char* rgba_host, float* out_final_latent_host)
 {
   if(!h || !h->pipe) return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  DeviceGuard guard{h->device};
   try
   {
     const int Lp = Th * Tw;
@@ -226,6 +242,7 @@ struct librediffusion_flux2_stream
   std::vector<float> schedule;  // explicit FlowMatch sigma list (native scale). empty -> num_steps+strength.
   float* mask_dev = nullptr;    // inpaint mask, device [Lp] (1=regenerate, 0=keep)
   bool have_mask = false;       // mask_dev holds a valid inpaint mask
+  int device = 0;
 };
 
 extern "C" {
@@ -233,10 +250,17 @@ extern "C" {
 librediffusion_flux2_stream_handle librediffusion_flux2_stream_create(
     const char* transformer_engine, const char* qwen_engine, const char* vae_decoder_engine,
     const char* vae_encoder_engine, const char* tokenizer_json, int Th, int Tw,
-    unsigned long long seed)
+    unsigned long long seed, int device)
 {
+  const int dev = resolve_device(device);
+  if(dev < 0)
+  {
+    fprintf(stderr, "flux2_stream_create: device %d is not a valid CUDA device ordinal\n", device);
+    return nullptr;
+  }
   try
   {
+    DeviceGuard guard{dev};
     if(Th <= 0 || Tw <= 0)
       throw std::runtime_error(
           "klein token grid must be positive (got Th=" + std::to_string(Th) + ", Tw="
@@ -253,6 +277,7 @@ librediffusion_flux2_stream_handle librediffusion_flux2_stream_create(
     p.vae_encoder = vae_encoder_engine;
 
     auto* s = new librediffusion_flux2_stream;
+    s->device = dev;
     s->pipe = std::make_unique<Flux2Pipeline>(p);
     s->Th = Th; s->Tw = Tw; s->seed = seed;
     // LOW-priority non-blocking stream: background diffusion yields GPU scheduling to the render
@@ -296,6 +321,9 @@ librediffusion_flux2_stream_handle librediffusion_flux2_stream_create(
 
 void librediffusion_flux2_stream_destroy(librediffusion_flux2_stream_handle s)
 {
+  if(!s)
+    return;
+  DeviceGuard guard{s->device};
   if(!s) return;
   cudaFree(s->bn_mean); cudaFree(s->bn_std); cudaFree(s->img_ids); cudaFree(s->txt_ids);
   cudaFree(s->init_noise); cudaFree(s->ehs); cudaFree(s->ref_tokens); cudaFree(s->ref_ids);
@@ -369,6 +397,7 @@ librediffusion_flux2_stream_set_bn(
     librediffusion_flux2_stream_handle s, const float* bn_mean_host, const float* bn_std_host)
 {
   if(!s || !bn_mean_host || !bn_std_host) return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  DeviceGuard guard{s->device};
   cudaMemcpy(s->bn_mean, bn_mean_host, 128 * sizeof(float), cudaMemcpyHostToDevice);
   cudaMemcpy(s->bn_std, bn_std_host, 128 * sizeof(float), cudaMemcpyHostToDevice);
   return LIBREDIFFUSION_SUCCESS;
@@ -412,6 +441,7 @@ librediffusion_error_t librediffusion_flux2_stream_set_reference(
     librediffusion_flux2_stream_handle s, const unsigned char* input_rgba)
 {
   if(!s || !input_rgba) return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  DeviceGuard guard{s->device};
   try
   {
     const int Th = s->Th, Tw = s->Tw;
@@ -441,6 +471,7 @@ librediffusion_error_t librediffusion_flux2_stream_frame_cached(
     librediffusion_flux2_stream_handle s, unsigned char* output_rgba)
 {
   if(!s || !output_rgba) return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  DeviceGuard guard{s->device};
   if(!s->have_prompt || !s->have_reference) return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
   try
   {
@@ -473,6 +504,7 @@ librediffusion_error_t librediffusion_flux2_stream_frame(
     unsigned char* output_rgba)
 {
   if(!s || !input_rgba || !output_rgba) return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+  DeviceGuard guard{s->device};
   if(!s->have_prompt) return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
   try
   {
