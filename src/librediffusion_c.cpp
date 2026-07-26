@@ -359,8 +359,9 @@ librediffusion_config_set_dimensions(
     return LIBREDIFFUSION_ERROR_NULL_POINTER;
   if (width <= 0 || height <= 0 || latent_width <= 0 || latent_height <= 0)
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
-  // Every kernel indexes the pixel grid and the engine the latent one, so they must agree; and
-  // 16384 keeps every width*height*4 and batch*4*lh*lw product (computed in int) from overflowing.
+  // Every kernel indexes the pixel grid and the engine the latent one, so they must agree; 16384
+  // keeps width*height*4 inside an int. It does NOT bound batch*4*lh*lw — that depends on the batch
+  // counters, which are checked against the latent extent in init_buffers().
   constexpr int kMaxDim = 16384;
   if (width > kMaxDim || height > kMaxDim)
     return LIBREDIFFUSION_ERROR_INVALID_DIMENSIONS;
