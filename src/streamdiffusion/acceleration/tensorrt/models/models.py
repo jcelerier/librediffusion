@@ -763,9 +763,12 @@ class UNet(BaseModel):
             ],
         }
         if self.use_ipadapter:
-            # scalar per-layer vector, length fixed to num_ip_layers
+            # Per-layer scale vector: its length is fixed by the engine, so pin min=opt=max.
+            # A dynamic 1..N range advertises a shape the runtime never feeds and only widens
+            # the builder's tactic search (the same needless dynamism that made the ControlNet
+            # profile pick a NaN-producing fp16 tactic).
             profile["ipadapter_scale"] = [
-                (1,),
+                (self.num_ip_layers,),
                 (self.num_ip_layers,),
                 (self.num_ip_layers,),
             ]

@@ -26,6 +26,7 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -49,6 +50,8 @@ from streamdiffusion.acceleration.tensorrt.export_wrappers.unet_controlnet_expor
     ControlNetUNetExportWrapper,
 )
 from streamdiffusion.acceleration.tensorrt.models.controlnet_models import create_controlnet_model
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools"))
 from streamdiffusion.acceleration.tensorrt.models.models import (
     CLIP, CLIPSDXLPooled, VAE, UNet, VAEEncoder, SDXLUNet, SDXLUNetWrapper, SDXLUNetControlWrapper,
     SDXLUNetIPAdapterWrapper,
@@ -870,6 +873,26 @@ def main():
         compile_controlnet(controlnet, cn_model, o, oo, f"{args.output}/controlnet.engine",
                            opt_batch_size=args.opt_batch, engine_build_options=build_opts)
 
+    # IP-Adapter image side. Baking the cross-attn into unet.engine is only half a usable bundle:
+    # without these two engines the node cannot turn the Control/Style texture into IP tokens and
+    # silently falls back to externally-fed ones, so the style image appears to do nothing. Built
+    # here (rather than in a separate tools/ invocation) so --ipadapter yields a COMPLETE bundle.
+    if args.ipadapter:
+        print("\n=== IP-Adapter image path (clip_image_encoder + ip_image_proj) ===")
+        from export_ipadapter_image_encoder import (
+            export_clip_image_encoder, export_ip_image_proj,
+            build_engine as build_ip_engine, CLIP_EMBED_DIM)
+        enc_onnx = export_clip_image_encoder(Path(onnx_dir), enc)
+        proj_onnx, ip_proj_tokens = export_ip_image_proj(Path(onnx_dir), args.ipadapter, embedding_dim)
+        mb = max(1, args.max_batch)
+        build_ip_engine(enc_onnx, Path(args.output) / "clip_image_encoder.engine",
+                        {"pixel_values": [(1, 3, 224, 224), (1, 3, 224, 224), (mb, 3, 224, 224)]})
+        build_ip_engine(proj_onnx, Path(args.output) / "ip_image_proj.engine",
+                        {"image_embeds": [(1, CLIP_EMBED_DIM), (1, CLIP_EMBED_DIM), (mb, CLIP_EMBED_DIM)]})
+        if ip_proj_tokens != ip_num_tokens:
+            print(f"[W] ip_image_proj emits {ip_proj_tokens} tokens but the UNet was baked for "
+                  f"{ip_num_tokens}; the bundle is inconsistent")
+
     # introspection sidecar (zero-GPU preview of what the bundle contains)
     write_manifest(args.output, {
         "model_type": args.type,                       # sd15 | sdxl
@@ -890,6 +913,9 @@ def main():
         },
         "controlnet_repo": args.controlnet,
         "ipadapter_ckpt": args.ipadapter,
+        "ipadapter_encoder": enc if args.ipadapter else None,
+        "ipadapter_num_tokens": ip_num_tokens if args.ipadapter else 0,
+        "ipadapter_num_layers": ip_num_layers if args.ipadapter else 0,
         # runtime LoRA: the UNet engine declares a lora_scale[N] input; slot i = the i-th PATH:runtime
         # LoRA in CLI order. The node exposes one scale knob per slot. 0 = none.
         "num_runtime_loras": len(runtime_adapter_names),

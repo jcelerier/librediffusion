@@ -63,29 +63,21 @@ class ControlNetTRT(BaseModel):
     
     def get_input_profile(self, batch_size, image_height, image_width, 
                          static_batch, static_shape):
-        """Generate TensorRT input profiles for ControlNet with dynamic 384-1024 range"""
-        min_batch = batch_size if static_batch else self.min_batch
-        max_batch = batch_size if static_batch else self.max_batch
-        
-        # Force dynamic shapes for universal engines (384-1024 range)
-        min_ctrl_h = 384  # Changed from 256 to 512 to match min resolution
-        max_ctrl_h = 1024
-        min_ctrl_w = 384  # Changed from 256 to 512 to match min resolution
-        max_ctrl_w = 1024
-        
-        # Use a flexible optimal resolution that's in the middle of the range
-        # This allows the engine to handle both smaller and larger resolutions
-        opt_ctrl_h = 704  # Middle of 512-1024 range
-        opt_ctrl_w = 704  # Middle of 512-1024 range
-        
-        # Calculate latent dimensions
-        min_latent_h = min_ctrl_h // 8  # 64
-        max_latent_h = max_ctrl_h // 8  # 128
-        min_latent_w = min_ctrl_w // 8  # 64
-        max_latent_w = max_ctrl_w // 8  # 128
-        opt_latent_h = opt_ctrl_h // 8  # 96
-        opt_latent_w = opt_ctrl_w // 8  # 96
-        
+        """TensorRT input profile for ControlNet, following the bundle's own geometry."""
+        # Use the shared bounds helper like every other model, so --min/--max-resolution,
+        # the non-square W/H flags and the batch flags all reach the ControlNet engine.
+        # This used to hardcode a 384..1024 / opt-704 "universal" profile and ignore its
+        # static_shape/image_height/image_width arguments entirely, which on TRT 11.2 + Blackwell
+        # made the builder pick an fp16 tactic returning NaN from the 1280-channel blocks
+        # (down_block_07+, mid_block) -> black frames. A profile that matches the bundle's own
+        # geometry is also ~10-13% faster at batch 1.
+        (min_batch, max_batch,
+         min_ctrl_h, max_ctrl_h, min_ctrl_w, max_ctrl_w,
+         min_latent_h, max_latent_h, min_latent_w, max_latent_w) = self.get_minmax_dims(
+            batch_size, image_height, image_width, static_batch, static_shape)
+        opt_latent_h, opt_latent_w = image_height // 8, image_width // 8
+        opt_ctrl_h, opt_ctrl_w = image_height, image_width
+
         profile = {
             "sample": [
                 (min_batch, self.unet_dim, min_latent_h, min_latent_w),
@@ -265,9 +257,10 @@ class ControlNetSDXLTRT(ControlNetTRT):
         profile = super().get_input_profile(batch_size, image_height, image_width, 
                                            static_batch, static_shape)
         
-        # Add SDXL-specific input profiles with dynamic batch dimension
-        min_batch = batch_size if static_batch else self.min_batch
-        max_batch = batch_size if static_batch else self.max_batch
+        # Take the batch bounds from the same helper the base profile used, or these tensors
+        # would advertise a different batch range than "sample" does under static_batch.
+        min_batch, max_batch = self.get_minmax_dims(
+            batch_size, image_height, image_width, static_batch, static_shape)[:2]
         
         # conditioning_scale is a scalar (empty shape)
         profile["conditioning_scale"] = [

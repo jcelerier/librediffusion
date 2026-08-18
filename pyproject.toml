@@ -37,7 +37,7 @@ dependencies = [
     # CUDA-13 wheel package `tensorrt-cu13` (the meta `tensorrt` package pulls a CUDA-12 runtime). The whole
     # engine-build/validation matrix is certified against exactly this build — do NOT let resolution slide to
     # TRT 10 (different builder semantics: FP16 builder flag, CUBLAS/CUDNN tactic sources, etc.).
-    "tensorrt-cu13==11.0.0.114",
+    "tensorrt-cu13==11.2.1.2",
     # nvidia-modelopt: FP8 calibration for the klein transformer (export_klein_fp8_calib.py). 0.44 pins
     # torch>=2.8 (no upper bound), compatible with torch 2.12.
     "nvidia-modelopt>=0.44",
