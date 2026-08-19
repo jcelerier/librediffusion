@@ -1381,6 +1381,72 @@ librediffusion_img2img_turbo_frame_dev(
     librediffusion_img2img_turbo_handle h, const unsigned char* in_rgba,
     const librediffusion_half_t* ehs_dev, unsigned char* out_rgba);
 
+/*===========================================================================*/
+/* SANA-Streaming V2V (GDN DiT)                                               */
+/*===========================================================================*/
+/* In-tree port of SANA-Streaming's DiT (GDN linear-attention recurrence +
+ * softmax/cross attention + GLU-MBConv FFN), fp32, validated to ~3.1% rel-L2
+ * vs the bf16 PyTorch golden. create() loads weights (fp32 .bin dir from
+ * dit-block-test/export_model.py) resident; dit_forward() runs one denoise
+ * step; selftest() runs the full model on the golden input and reports rel-L2.
+ * run_v2v/encode_prompt are the documented surface (TRT VAE/gemma + streaming
+ * scheduler wiring deferred). */
+typedef struct librediffusion_sana* librediffusion_sana_handle;
+
+LIBREDIFFUSION_API librediffusion_sana_handle LIBREDIFFUSION_CALL
+librediffusion_sana_create(const char* weights_dir);
+
+LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
+librediffusion_sana_free(librediffusion_sana_handle h);
+
+/* Full-model self-test on the resident golden input; *out_rel_l2 = rel-L2 vs
+ * gold_model_out.bin (-1 if absent). The in-tree no-regression gate. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_sana_selftest(librediffusion_sana_handle h, float* out_rel_l2);
+
+/* One DiT denoise forward: x_embed_dev [N*C fp32 device] -> noise_out_dev [N*128 fp32 device]. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_sana_dit_forward(
+    librediffusion_sana_handle h, const float* x_embed_dev, float* noise_out_dev);
+
+/* Full 5-chunk streaming rollout (cache carry + FlowMatchEuler) over per-chunk data in
+ * `data_dir` (roll_c0..roll_c4); *out_rel_l2 = full 16-frame latent rel-L2 vs Python gen. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_sana_rollout_selftest(
+    librediffusion_sana_handle h, const char* data_dir, float* out_rel_l2);
+
+/* Self-contained variant: the rollout PRODUCES its own cross-chunk caches (no captured
+ * cache files) via a t=0 update pass per chunk. *out_rel_l2 = full 16-frame latent rel-L2
+ * vs Python gen (~6.5%; the honest self-contained number, bf16 error accumulates). */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_sana_rollout_selftest_sc(
+    librediffusion_sana_handle h, const char* data_dir, float* out_rel_l2);
+
+/* Set TRT engine dir (vae/*.plan, gemma/*.plan) + v2v data dir (latents_mean/std.bin,
+ * init_noise.bin). Required before encode_prompt_ids / run_v2v. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_sana_set_engines(librediffusion_sana_handle h, const char* trt_dir, const char* data_dir);
+
+/* Tokenized gemma prompt (int64 ids + attention_mask, length 300) -> stored text embeds. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_sana_encode_prompt_ids(
+    librediffusion_sana_handle h, const long long* ids, const long long* mask);
+
+/* Directly set (300,2304) gemma text embeds (host) — reproduces a reference prompt exactly. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_sana_set_text_embeds(librediffusion_sana_handle h, const float* embeds);
+
+/* Text prompt — not in-tree (no tokenizer); use encode_prompt_ids. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_sana_encode_prompt(librediffusion_sana_handle h, const char* text);
+
+/* Full V2V: preprocess -> VAE-encode -> self-contained 5-chunk rollout -> VAE-decode.
+ * in_frames/out_frames RGB8 (121*480*832*3); sets *n_out=121. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_sana_run_v2v(
+    librediffusion_sana_handle h, const unsigned char* in_frames, int n_in,
+    unsigned char* out_frames, int* n_out);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

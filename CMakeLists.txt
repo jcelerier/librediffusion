@@ -132,6 +132,7 @@ add_library(librediffusion_cuda STATIC
     src/kernels_klein.cu
     src/kernels_rife.cu
     src/nchw.cu
+    src/librediffusion.sana.cu
 )
 target_compile_options(librediffusion_cuda PRIVATE  -allow-unsupported-compiler)
 target_include_directories(librediffusion_cuda PUBLIC
@@ -168,6 +169,12 @@ add_library(librediffusion SHARED
     src/librediffusion.img2img_turbo.cpp
     src/librediffusion.img2img_turbo.hpp
     src/librediffusion_c.img2img_turbo.cpp
+    src/librediffusion.sana.hpp
+    src/librediffusion.sana.cpp
+    src/librediffusion.sana_kernels.hpp
+    src/librediffusion.sana_trt.hpp
+    src/librediffusion.sana_trt.cpp
+    src/librediffusion_c.sana.cpp
     src/cuda_tensor.hpp
     src/cuda_tensor.cpp
     src/pcg.hpp
@@ -194,6 +201,7 @@ target_link_libraries(librediffusion PUBLIC
     ${CUDA_CUDART_LIBRARY}
     CUDA::nppig
     CUDA::curand
+    CUDA::cublas
     clip_tokenizer_c
     librediffusion_cuda
 )
