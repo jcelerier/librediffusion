@@ -26,10 +26,12 @@ void LibreDiffusionPipeline::init_cuda()
   cudaGetDeviceCount(&deviceCount);
   if(deviceCount == 0)
     throw std::runtime_error("CUDA not available");
-  else if(deviceCount == 1)
-    this->config_.device = 0;
-  else
-    this->config_.device = std::clamp(this->config_.device, 0, deviceCount - 1);
+  // Reject rather than clamp: the caller keys its caches on the device it asked for, and the
+  // other handles (clip / rife / flux2 / img2img-turbo) already refuse an out-of-range ordinal.
+  if(this->config_.device < 0 || this->config_.device >= deviceCount)
+    throw std::runtime_error(
+        "CUDA device " + std::to_string(this->config_.device) + " does not exist ("
+        + std::to_string(deviceCount) + " device(s))");
 
   cudaSetDevice(this->config_.device);
   cudaError_t err = cudaStreamCreate(&stream_);

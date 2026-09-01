@@ -261,17 +261,6 @@ private:
   } while(0)
 
 /**
- * @brief Initialize a function pointer (optional - doesn't fail if missing)
- */
-#define LIBREDIFFUSION_SYMBOL_INIT_OPT(prefix, name)                                    \
-  do                                                                                    \
-  {                                                                                     \
-    name                                                                                \
-        = m_library.symbol<decltype(&::LIBREDIFFUSION_SYMBOL_FULL_NAME(prefix, name))>( \
-            LIBREDIFFUSION_SYMBOL_NAME_STR(prefix, name));                              \
-  } while(0)
-
-/**
  * @brief Declare with custom member name (for C++ keywords)
  * @param prefix Symbol prefix
  * @param name Actual symbol name suffix  
