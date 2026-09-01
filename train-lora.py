@@ -309,6 +309,10 @@ def parse_args():
     # (the C++ node loads it like any unet.engine). SDXL is the intended target; works for SD too.
     p.add_argument("--fp8", action="store_true",
                    help="FP8-quantize the UNet compute (modelopt e4m3, diffusion recipe). SDXL/SD only.")
+    # RIFE is model-agnostic (it interpolates decoded RGB frames), so any bundle can carry the engine
+    # the node's "Interpolation exp" control needs. Always on for klein, opt-in elsewhere.
+    p.add_argument("--rife", action="store_true",
+                   help="also build rife_ifnet_fp16.plan (frame interpolation) into --output")
     a = p.parse_args()
     # librediffusion fork: square --min/--max-resolution act as shortcuts that set both
     # axes when the per-axis flags aren't given.
@@ -469,14 +473,8 @@ def export_klein(args):
         cp(f, [calib_dir, eng_dir, ASSETS, REF])
     # RIFE: use a prebuilt .plan if present (eng_dir/legacy ref), else BUILD it from the vendored ONNX so
     # the bundle is self-contained and the engine matches this GPU + --hw-compat.
-    rife_plan_out = os.path.join(out, "rife_ifnet_fp16.plan")
     if not cp("rife_ifnet_fp16.plan", [eng_dir, RIFE_REF, REF]):
-        rife_onnx = os.path.join(ASSETS, "rife_ifnet_fp16.onnx")
-        if not os.path.exists(rife_onnx):
-            raise SystemExit(f"[klein] no rife .plan and no vendored ONNX at {rife_onnx}")
-        print("[klein] building rife_ifnet_fp16.plan from vendored ONNX ...")
-        # build_rife.py: single 'frames'[B,6,H,W] input, profile B[1-7] H/W[64-1024], honors KLEIN_HW_COMPAT.
-        run("build_rife.py", rife_onnx, rife_plan_out)
+        build_rife(args, out)
     # Fail here rather than at load time in the node: a bundle missing one engine looks fine on disk.
     required = engines + ["bn_mean.bin", "bn_std.bin", "tokenizer.json", "rife_ifnet_fp16.plan"]
     missing = [f for f in required if not os.path.exists(os.path.join(out, f))]
@@ -498,6 +496,21 @@ def export_klein(args):
     for f in sorted(os.listdir(out)):
         print(f"[klein]   {f}  {os.path.getsize(os.path.join(out, f))/1e6:.1f} MB")
     print(f"[klein] DONE -> bundle at {out}")
+
+
+def build_rife(args, out_dir):
+    """Build <out_dir>/rife_ifnet_fp16.plan from the vendored ONNX with build_rife.py (single
+    'frames'[B,6,H,W] input, profile B[1-7] H/W[64-1024]); honors --hw-compat like the klein builders."""
+    import subprocess
+    rife_onnx = os.path.join(args.klein_scripts_dir, "assets", "rife_ifnet_fp16.onnx")
+    if not os.path.exists(rife_onnx):
+        raise SystemExit(f"[rife] vendored ONNX missing at {rife_onnx}")
+    plan = os.path.join(out_dir, "rife_ifnet_fp16.plan")
+    print(f"[rife] building {plan} from {rife_onnx} ...")
+    cmd = [sys.executable, os.path.join(args.klein_scripts_dir, "build_rife.py"), rife_onnx, plan]
+    r = subprocess.run(cmd, env=dict(os.environ, KLEIN_HW_COMPAT=args.hw_compat))
+    if r.returncode != 0:
+        raise SystemExit(f"[rife] build_rife.py failed (exit {r.returncode})")
 
 
 def write_manifest(out_dir, meta, list_engines_dir=None):
@@ -579,6 +592,9 @@ def export_img2img_turbo(args):
                  opt_batch_size=1, engine_build_options=clip_build_opts,
                  output_hidden_states=False, penultimate=False)
 
+    if args.rife:
+        build_rife(args, out)
+
     write_manifest(out, {
         "model_type": "img2img-turbo",
         "model_family": "sd",
@@ -588,7 +604,7 @@ def export_img2img_turbo(args):
         "resolution": {"width": res, "height": res},
         "denoising_steps": 1,
         "precision": "fp16",
-        "features": {"controlnet": False, "ipadapter": False, "v2v": False, "rife": False,
+        "features": {"controlnet": False, "ipadapter": False, "v2v": False, "rife": args.rife,
                      "skip_vae": True},
     })
     print(f"\n[img2img-turbo] DONE. Bundle at {out}:")
@@ -975,6 +991,9 @@ def main():
             print(f"[W] ip_image_proj emits {ip_proj_tokens} tokens but the UNet was baked for "
                   f"{ip_num_tokens}; the bundle is inconsistent")
 
+    if args.rife:
+        build_rife(args, args.output)
+
     # introspection sidecar (zero-GPU preview of what the bundle contains)
     write_manifest(args.output, {
         "model_type": args.type,                       # sd15 | sdxl
@@ -990,7 +1009,7 @@ def main():
             "controlnet": bool(args.controlnet),
             "ipadapter": bool(args.ipadapter),
             "v2v": bool(args.v2v),                     # kvo extended-self-attention UNet (--v2v)
-            "rife": False,
+            "rife": args.rife,
             "runtime_lora": bool(runtime_adapter_names),
         },
         "controlnet_repo": args.controlnet,
