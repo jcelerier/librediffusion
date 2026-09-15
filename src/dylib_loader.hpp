@@ -23,9 +23,39 @@
 
 #include <cassert>
 #include <cstdio>
+#include <string>
 
 namespace sd
 {
+
+// Directory of the shared library containing this code, which for a Max /
+// TouchDesigner plugin is the plugin's folder rather than the host executable's.
+// Empty if the code is not in a shared library (fully static link).
+inline std::string module_folder()
+{
+  std::string path;
+#if defined(LIBREDIFFUSION_LOADER_WINDOWS)
+  HMODULE hm = nullptr;
+  if (GetModuleHandleExA(
+          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+              | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          reinterpret_cast<LPCSTR>(&module_folder), &hm)
+      != 0)
+  {
+    char buf[32768];
+    DWORD n = GetModuleFileNameA(hm, buf, sizeof(buf));
+    path.assign(buf, n);
+  }
+  const char sep = '\\';
+#elif defined(LIBREDIFFUSION_LOADER_POSIX)
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<const void*>(&module_folder), &info) && info.dli_fname)
+    path = info.dli_fname;
+  const char sep = '/';
+#endif
+  const auto slash = path.find_last_of(sep);
+  return slash == std::string::npos ? std::string{} : path.substr(0, slash);
+}
 
 /**
  * @brief Cross-platform dynamic library loader
@@ -39,14 +69,7 @@ public:
    * @brief Load a dynamic library
    * @param name Library name (e.g., "librediffusion.dll" or "liblibrediffusion.so")
    */
-  explicit dylib_loader(const char* const name)
-  {
-#if defined(LIBREDIFFUSION_LOADER_WINDOWS)
-    m_handle = LoadLibraryA(name);
-#elif defined(LIBREDIFFUSION_LOADER_POSIX)
-    m_handle = dlopen(name, RTLD_LAZY | RTLD_LOCAL);
-#endif
-  }
+  explicit dylib_loader(const char* const name) { m_handle = raw_load(name); }
 
   /**
    * @brief Try loading from multiple possible library names
@@ -54,15 +77,32 @@ public:
    */
   explicit dylib_loader(const char* const* names)
   {
+    // Plain name first: resolves a system install, LD_LIBRARY_PATH, and the AppImage
+    // AppRun, which prepends every <root>/support/* holding shared libs.
     for (const char* const* p = names; *p != nullptr; ++p)
-    {
+      if ((m_handle = raw_load(*p)))
+        return;
+
+    // A plugin folder is never on the OS search path, so a runtime shipped inside the
+    // package is only reachable relative to the module. "support/librediffusion"
+    // matches the release bundle layout.
+    const auto dir = module_folder();
+    if (dir.empty())
+      return;
+
 #if defined(LIBREDIFFUSION_LOADER_WINDOWS)
-      m_handle = LoadLibraryA(*p);
-#elif defined(LIBREDIFFUSION_LOADER_POSIX)
-      m_handle = dlopen(*p, RTLD_LAZY | RTLD_LOCAL);
+    const char* const sep = "\\";
+#else
+    const char* const sep = "/";
 #endif
-      if (m_handle)
-        break;
+    for (const char* const sub : {"", "support/librediffusion"})
+    {
+      std::string base = dir + sep;
+      if (*sub)
+        base += std::string{sub} + sep;
+      for (const char* const* p = names; *p != nullptr; ++p)
+        if ((m_handle = raw_load((base + *p).c_str())))
+          return;
     }
   }
 
@@ -87,6 +127,18 @@ public:
   }
 
   ~dylib_loader() { close(); }
+
+private:
+  static void* raw_load(const char* const path)
+  {
+#if defined(LIBREDIFFUSION_LOADER_WINDOWS)
+    return LoadLibraryA(path);
+#elif defined(LIBREDIFFUSION_LOADER_POSIX)
+    return dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+#endif
+  }
+
+public:
 
   /**
    * @brief Load a symbol from the library
