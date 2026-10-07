@@ -55,6 +55,11 @@ uv run     --cache-dir D:\tmp\uvcache python train-lora.py --type sd15 --model s
 `set UV_CACHE_DIR=D:\tmp\uvcache` does the same thing for a whole shell session. The HF snapshot has
 its own cache: `set HF_HOME=D:\tmp\hf` (or `hf download --cache-dir D:\tmp\hf\hub`).
 
+Koaia's packaged builder already passes `--cache-dir c:\uv` on Windows for both the sync and the
+build (`qml/koaia/Views/ModelView.qml`), so engines built through the app land on the same cache; a
+short root-level path also stays clear of `MAX_PATH` on machines without long paths enabled. Match
+it if you want to share one cache between the app and a command-line build.
+
 ### Base models
 
 ```bash
