@@ -55,10 +55,11 @@ uv run     --cache-dir D:\tmp\uvcache python train-lora.py --type sd15 --model s
 `set UV_CACHE_DIR=D:\tmp\uvcache` does the same thing for a whole shell session. The HF snapshot has
 its own cache: `set HF_HOME=D:\tmp\hf` (or `hf download --cache-dir D:\tmp\hf\hub`).
 
-Koaia's packaged builder already passes `--cache-dir c:\uv` on Windows for both the sync and the
-build (`qml/koaia/Views/ModelView.qml`), so engines built through the app land on the same cache; a
-short root-level path also stays clear of `MAX_PATH` on machines without long paths enabled. Match
-it if you want to share one cache between the app and a command-line build.
+Koaia's packaged builder passes `--cache-dir c:\uv` on Windows for both the sync and the build
+(`qml/koaia/Views/ModelView.qml`) — a short root-level path, which also stays clear of `MAX_PATH` on
+machines without long paths enabled. That cache is on `C:`, so it only avoids the copy for a venv
+that is also on `C:`; if you build on another volume, use a cache on that volume rather than sharing
+koaia's.
 
 ### Base models
 
@@ -104,7 +105,9 @@ Expect ~18 GB of engines (the bf16 transformer alone is 7.8 GB) plus the ONNX in
 long build — the transformer and Qwen engines dominate. Steps are idempotent enough to resume: a
 rerun reuses an existing calibration directory.
 
-- `--klein-quality speed` builds only the FP8 transformer, `quality` only bf16, `both` (default) both.
+- `--klein-quality` picks which transformer the bundle gets: `speed` the FP8 one, `quality` the bf16
+  one, `both` (default) both. Only staging is selective — the bf16 transformer is built either way,
+  so `speed` costs the same as `both` minus the FP8 calibration.
   **FP8 needs an Ada (SM 8.9) or newer GPU** — TensorRT refuses to build FP8 Q/DQ engines on Ampere
   and earlier (a 3090 is SM 8.6, a 4090 is 8.9). On such a card the default quietly drops to the bf16
   transformer; pass `--klein-quality quality` to say so explicitly, or `speed`/`both` to make the

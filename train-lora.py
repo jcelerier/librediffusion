@@ -359,10 +359,8 @@ def export_klein(args):
     lp = (height // 16) * (width // 16)
     print(f"[klein] {width}x{height} (Lp={lp}) model={model_dir}")
 
-    # FP8 Q/DQ engines need Ada (SM 8.9) or newer. TensorRT only says so when it builds the engine --
-    # the LAST step -- so on an Ampere card the default --klein-quality both died after the whole ONNX
-    # export and all four bf16 engines were already done ("Error Code 9: Networks with FP8 Q/DQ layers
-    # require hardware with FP8 support"). Decide it here instead, before any work.
+    # FP8 Q/DQ engines need Ada (SM 8.9) or newer, and TensorRT only reports that when it builds
+    # the engine -- the last step. Decide it here, before the export and the bf16 builds.
     quality = args.klein_quality
     if quality in ("speed", "both"):
         cc = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None
@@ -377,6 +375,11 @@ def export_klein(args):
                KLEIN_CALIB_DIR=calib_dir,
                KLEIN_WIDTH=str(width), KLEIN_HEIGHT=str(height),
                KLEIN_HW_COMPAT=args.hw_compat)  # portable-engine flag honored by build_klein_engines/build_one_fp8
+    # A KLEIN_FP8_GOLD left in the caller's environment would silently redirect the FP8 calibration
+    # at someone else's activation dump, which is the whole failure mode this path exists to remove.
+    # Standalone export_klein_fp8_calib.py still honours it; a build driven from here does not.
+    if env.pop("KLEIN_FP8_GOLD", None) is not None:
+        print("[klein] ignoring KLEIN_FP8_GOLD from the environment; calibrating from the model")
     py = sys.executable
 
     def run(script, *a):
@@ -387,13 +390,27 @@ def export_klein(args):
             raise SystemExit(f"[klein] {script} failed (exit {r.returncode})")
 
     # 0. Calibration activations + the VAE/tokenizer side files, from one reference pipeline run.
-    #    First because it is the cheapest step that touches the weights: if the model or the venv is
-    #    wrong we find out in minutes instead of after the multi-hour ONNX export. It also writes a
-    #    reference PNG to compare the finished bundle's output against. Idempotent, so a resumed run
-    #    does not redo it.
-    if os.path.exists(os.path.join(calib_dir, "calib.json")):
-        print(f"[klein] reusing calibration in {calib_dir}")
-    else:
+    #    First because it is the cheapest step that touches the weights. Writes the reference PNG
+    #    the finished bundle is checked against. Idempotent.
+    calib_meta = os.path.join(calib_dir, "calib.json")
+    reuse = False
+    if os.path.exists(calib_meta):
+        import json as _json
+        try:
+            prev = _json.loads(open(calib_meta).read())
+        except Exception:
+            prev = {}
+        # The tensors are geometry-specific, so reusing a calibration built at another resolution
+        # would calibrate FP8 on activations the engine will never see.
+        same = (prev.get("width"), prev.get("height"), prev.get("Lt")) == (width, height, 512)
+        if same and prev.get("model_dir") == model_dir:
+            print(f"[klein] reusing calibration in {calib_dir}")
+            reuse = True
+        else:
+            print(f"[klein] calibration in {calib_dir} is for "
+                  f"{prev.get('width')}x{prev.get('height')} / {prev.get('model_dir')}; "
+                  f"regenerating for {width}x{height}")
+    if not reuse:
         run("make_klein_calib.py")
 
     # 1. ONNX export (transformer bf16 + vae + qwen)
@@ -402,11 +419,9 @@ def export_klein(args):
     #     as COMPLEX128, which TRT rejects. fix_qwen_complex.py rewrites model.onnx -> model_fixed.onnx
     #     (which build_klein_engines.py's build_qwen consumes). REQUIRED before step 2.
     run("fix_qwen_complex.py")
-    # 1c. fix the transformer ONNX: torch.onnx tracing bakes the concatenated seq len (Lp+Lt) as 50
-    #     inline Constant RoPE-reshape literals -> TRT pins Lp STATIC (can't run the 2*Lp-token
-    #     ref-edit streaming path). fix_klein_dynamic_seq.py rewrites that literal to 0 ->
-    #     transformer_dynseq/, which build_klein_engines.py's build_transformer consumes. REQUIRED, or
-    #     the bf16 engine comes out single-image only.
+    # 1c. fix the transformer ONNX: tracing bakes the concatenated seq len (Lp+Lt) into 50 inline
+    #     Constant RoPE-reshape literals, which pins Lp static. fix_klein_dynamic_seq.py rewrites
+    #     it to 0; without this the bf16 engine comes out single-image only.
     run("fix_klein_dynamic_seq.py")
     # 2. bf16 TRT engines (transformer/qwen/vae_decoder/vae_encoder)
     run("build_klein_engines.py", "--which", "all")
