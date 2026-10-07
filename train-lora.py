@@ -377,6 +377,11 @@ def export_klein(args):
                KLEIN_CALIB_DIR=calib_dir,
                KLEIN_WIDTH=str(width), KLEIN_HEIGHT=str(height),
                KLEIN_HW_COMPAT=args.hw_compat)  # portable-engine flag honored by build_klein_engines/build_one_fp8
+    # A KLEIN_FP8_GOLD left in the caller's environment would silently redirect the FP8 calibration
+    # at someone else's activation dump, which is the whole failure mode this path exists to remove.
+    # Standalone export_klein_fp8_calib.py still honours it; a build driven from here does not.
+    if env.pop("KLEIN_FP8_GOLD", None) is not None:
+        print("[klein] ignoring KLEIN_FP8_GOLD from the environment; calibrating from the model")
     py = sys.executable
 
     def run(script, *a):
@@ -391,9 +396,25 @@ def export_klein(args):
     #    wrong we find out in minutes instead of after the multi-hour ONNX export. It also writes a
     #    reference PNG to compare the finished bundle's output against. Idempotent, so a resumed run
     #    does not redo it.
-    if os.path.exists(os.path.join(calib_dir, "calib.json")):
-        print(f"[klein] reusing calibration in {calib_dir}")
-    else:
+    calib_meta = os.path.join(calib_dir, "calib.json")
+    reuse = False
+    if os.path.exists(calib_meta):
+        import json as _json
+        try:
+            prev = _json.loads(open(calib_meta).read())
+        except Exception:
+            prev = {}
+        # The tensors are geometry-specific, so reusing a calibration built at another resolution
+        # would calibrate FP8 on activations the engine will never see.
+        same = (prev.get("width"), prev.get("height"), prev.get("Lt")) == (width, height, 512)
+        if same and prev.get("model_dir") == model_dir:
+            print(f"[klein] reusing calibration in {calib_dir}")
+            reuse = True
+        else:
+            print(f"[klein] calibration in {calib_dir} is for "
+                  f"{prev.get('width')}x{prev.get('height')} / {prev.get('model_dir')}; "
+                  f"regenerating for {width}x{height}")
+    if not reuse:
         run("make_klein_calib.py")
 
     # 1. ONNX export (transformer bf16 + vae + qwen)

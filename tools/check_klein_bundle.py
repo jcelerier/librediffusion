@@ -31,6 +31,11 @@ import torch
 # at cos < 0.3). FP8 is quantised on purpose, so it gets a looser bar.
 COS_MIN = {"qwen": 0.999, "transformer_bf16": 0.995, "transformer_fp8": 0.95}
 PSNR_MIN = 25.0
+# RIFE: above ~40 dB the output is effectively one of its inputs rather than an interpolation, and a
+# true midpoint between A and a shifted A lands at a similar distance from each. Measured on a
+# correct engine: 15.4 / 15.2 dB (gap 0.2). An engine echoing frame A: 54.2 / 7.6 dB (gap 46.6).
+RIFE_COPY_MAX_DB = 40.0
+RIFE_GAP_MAX_DB = 6.0
 
 # getattr rather than attribute access: the enum spelling has moved between TensorRT majors and a
 # missing name must not take the whole tool down at import time.
@@ -119,10 +124,12 @@ def main() -> int:
 
     results, failures, skipped = [], [], []
 
-    def record(name, metric, value, threshold, ok):
+    def record(name, metric, value, threshold, ok, **extra):
         results.append({"check": name, "metric": metric, "value": value, "threshold": threshold,
-                        "pass": bool(ok)})
-        print(f"  {'PASS' if ok else 'FAIL'}  {name:28s} {metric}={value:.6g} (need {threshold})")
+                        "pass": bool(ok), **extra})
+        detail = "".join(f" {k}={v}" for k, v in extra.items())
+        print(f"  {'PASS' if ok else 'FAIL'}  {name:28s} {metric}={value:.6g} "
+              f"(need {threshold}){detail}")
         if not ok:
             failures.append(name)
 
@@ -149,31 +156,46 @@ def main() -> int:
         skip("qwen3_encoder", "engine or reference missing", fatal=True)
 
     # --- transformer (bf16 and fp8) ------------------------------------------------------------
+    # Which variants exist is the builder's choice: --klein-quality speed ships only the FP8 plan,
+    # quality only the bf16 one, both ships both. So neither file is individually required -- what is
+    # required is that the bundle carries at least one transformer and that it verifies.
     img_ids, txt_ids = ref("031_ids__img_ids"), ref("030_ids__txt_ids")
     sigmas = ref("032_ids__timesteps_per_step")
+    transformers_checked = 0
     for plan, key in (("transformer_bf16.plan", "transformer_bf16"),
                       ("transformer_fp8_calib.plan", "transformer_fp8")):
         p = bundle / plan
         if not p.exists():
-            # The fp8 transformer is genuinely optional (--klein-quality, and it needs SM 8.9+);
-            # a missing bf16 transformer means the bundle is broken.
-            skip(key, f"no {plan}", fatal=(key != "transformer_fp8"))
+            skip(key, f"no {plan}", fatal=False)
             continue
         if ehs is None or img_ids is None or txt_ids is None or sigmas is None:
             skip(key, "reference missing", fatal=True)
             continue
+        if len(sigmas) == 0:
+            skip(key, "reference has no timesteps", fatal=True)
+            continue
+        missing = [s for s in range(len(sigmas))
+                   if ref(f"11{s}_transformer__in_hidden_step{s}") is None
+                   or ref(f"10{s}_transformer__velocity_step{s}") is None]
+        if missing:
+            # Skipping the steps individually and keeping the running minimum at its 1.0 seed would
+            # report a perfect score for an engine that was never executed.
+            skip(key, f"reference missing for step(s) {missing}", fatal=True)
+            continue
         eng = Engine(p, logger)
         worst = 1.0
         for step in range(len(sigmas)):
-            hs = ref(f"11{step}_transformer__in_hidden_step{step}")
-            exp = ref(f"10{step}_transformer__velocity_step{step}")
-            if hs is None or exp is None:
-                continue
-            got = eng.run({"hidden_states": hs, "encoder_hidden_states": ehs,
+            got = eng.run({"hidden_states": ref(f"11{step}_transformer__in_hidden_step{step}"),
+                           "encoder_hidden_states": ehs,
                            "timestep": np.asarray([sigmas[step]], dtype=np.float32),
                            "img_ids": img_ids, "txt_ids": txt_ids})
-            worst = min(worst, cosine(next(iter(got.values())), exp))
-        record(key, "min_cos_over_steps", worst, COS_MIN[key], worst >= COS_MIN[key])
+            worst = min(worst, cosine(next(iter(got.values())),
+                                      ref(f"10{step}_transformer__velocity_step{step}")))
+        transformers_checked += 1
+        record(key, "min_cos_over_steps", worst, COS_MIN[key], worst >= COS_MIN[key],
+               steps=len(sigmas))
+    if transformers_checked == 0:
+        skip("transformer", "the bundle carries no transformer that could be verified", fatal=True)
 
     # --- vae decoder: the image to look at -----------------------------------------------------
     dec_in = ref("200_vae__decoder_in_latent")
@@ -184,19 +206,27 @@ def main() -> int:
         img = to_u8_image(next(iter(got.values())))
         try:
             from PIL import Image
+        except ImportError:
+            Image = None
+        if Image is None:
+            np.save(out / "trt_vae_decode.npy", img)
+            # std alone cannot tell a correct decode from structured noise, so without the
+            # comparison this check has not established anything.
+            skip("vae_decoder_vs_reference", "PIL missing, cannot compare against the frame",
+                 fatal=True)
+        else:
             Image.fromarray(img).save(out / "trt_vae_decode.png")
             print(f"  wrote {out / 'trt_vae_decode.png'} {img.shape}")
-            if refpng.exists():
+            if not refpng.exists():
+                skip("vae_decoder_vs_reference", f"no reference frame at {refpng}", fatal=True)
+            else:
                 r = np.asarray(Image.open(refpng).convert("RGB"))
-                if r.shape == img.shape:
-                    v = psnr(img, r)
-                    record("vae_decoder_vs_reference", "psnr_db", v, PSNR_MIN, v >= PSNR_MIN)
-                else:
+                if r.shape != img.shape:
                     skip("vae_decoder_vs_reference",
                          f"shape {img.shape} vs reference {r.shape}", fatal=True)
-        except ImportError:
-            np.save(out / "trt_vae_decode.npy", img)
-            print("  (no PIL; wrote .npy instead of .png)")
+                else:
+                    v = psnr(img, r)
+                    record("vae_decoder_vs_reference", "psnr_db", v, PSNR_MIN, v >= PSNR_MIN)
         # Independent of the reference: a decode that collapsed would be flat or non-finite.
         record("vae_decoder_signal", "std", float(img.std()), 10.0, float(img.std()) >= 10.0)
     else:
@@ -236,10 +266,16 @@ def main() -> int:
             finite = bool(np.isfinite(o).all())
             record("rife_finite", "all_finite", 1.0 if finite else 0.0, 1.0, finite)
             record("rife_signal", "std", float(mid.std()), 10.0, float(mid.std()) >= 10.0)
-            # It must sit between the two inputs, not equal one of them.
+            # Finite and non-flat is also true of an engine that hands back one of its inputs, which
+            # is the realistic way RIFE goes wrong. A frame halfway between A and a shifted A sits
+            # at a similar distance from both, so require that: neither input may be reproduced
+            # (PSNR below RIFE_COPY_MAX_DB), and the two distances must be close to each other.
             da = psnr(mid, (a_f * 255).astype(np.uint8))
             db = psnr(mid, (b_f * 255).astype(np.uint8))
-            print(f"  rife psnr vs A={da:.1f} dB, vs B={db:.1f} dB (both finite and unequal = blended)")
+            record("rife_not_a_copy", "max_psnr_vs_input_db", max(da, db), RIFE_COPY_MAX_DB,
+                   max(da, db) < RIFE_COPY_MAX_DB, psnr_vs_A=round(da, 1), psnr_vs_B=round(db, 1))
+            record("rife_balanced", "abs_psnr_gap_db", abs(da - db), RIFE_GAP_MAX_DB,
+                   abs(da - db) < RIFE_GAP_MAX_DB)
         else:
             skip("rife", "no decoded frame to interpolate", fatal=True)
     else:
