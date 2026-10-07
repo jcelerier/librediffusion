@@ -32,12 +32,12 @@ import torch
 COS_MIN = {"qwen": 0.999, "transformer_bf16": 0.995, "transformer_fp8": 0.95}
 PSNR_MIN = 25.0
 
-_TRT2TORCH = {
-    trt.DataType.FLOAT: torch.float32, trt.DataType.HALF: torch.float16,
-    trt.DataType.BF16: torch.bfloat16, trt.DataType.INT32: torch.int32,
-    trt.DataType.INT64: torch.int64, trt.DataType.INT8: torch.int8,
-    trt.DataType.BOOL: torch.bool,
-}
+# getattr rather than attribute access: the enum spelling has moved between TensorRT majors and a
+# missing name must not take the whole tool down at import time.
+_TRT2TORCH = {getattr(trt.DataType, n): t for n, t in (
+    ("FLOAT", torch.float32), ("HALF", torch.float16), ("BF16", torch.bfloat16),
+    ("INT32", torch.int32), ("INT64", torch.int64), ("INT8", torch.int8), ("BOOL", torch.bool),
+) if hasattr(trt.DataType, n)}
 
 
 class Engine:
