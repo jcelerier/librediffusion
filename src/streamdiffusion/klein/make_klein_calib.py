@@ -200,6 +200,16 @@ def main() -> int:
     if "dec_in" in cap:
         save("200_vae__decoder_in_latent", cap["dec_in"])
 
+    # The txt2img run never encodes, but the img2img / reference-edit path does, so give the encoder
+    # engine a reference too: round-trip the frame we just generated through the real VAE encoder.
+    vae_dev = next(pipe.vae.parameters()).device
+    enc_in = (torch.from_numpy(np.asarray(image).astype(np.float32) / 255.0 * 2.0 - 1.0)
+              .permute(2, 0, 1)[None])
+    with torch.no_grad():
+        enc_out = pipe.vae.encode(enc_in.to(vae_dev, pipe.vae.dtype)).latent_dist.mode()
+    save("210_vae__encoder_in_image", enc_in)
+    save("211_vae__encoder_out_latent", enc_out.detach().to(torch.float32).cpu().numpy())
+
     # The pipeline's own output: a free end-to-end check that the weights and the venv are sane before
     # hours of engine building, and the reference to compare the finished bundle's frames against.
     image.save(out / "calib_reference.png")
