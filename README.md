@@ -105,6 +105,10 @@ long build — the transformer and Qwen engines dominate. Steps are idempotent e
 rerun reuses an existing calibration directory.
 
 - `--klein-quality speed` builds only the FP8 transformer, `quality` only bf16, `both` (default) both.
+  **FP8 needs an Ada (SM 8.9) or newer GPU** — TensorRT refuses to build FP8 Q/DQ engines on Ampere
+  and earlier (a 3090 is SM 8.6, a 4090 is 8.9). On such a card the default quietly drops to the bf16
+  transformer; pass `--klein-quality quality` to say so explicitly, or `speed`/`both` to make the
+  mismatch an error instead.
 - Resolution defaults to klein's native 320x576. `--opt-width/--opt-height` (multiples of 16) build
   another geometry; cost scales with `(W/16)*(H/16)` tokens, so 1024x1024 is ~5.7x the 320x576 work.
 - `--hw-compat ampere_plus` makes the engines portable across SM 8.0+ instead of locked to the

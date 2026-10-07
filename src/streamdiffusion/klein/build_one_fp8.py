@@ -43,6 +43,21 @@ for n, (mn, op, mx) in profiles.items():
 cfg.add_optimization_profile(prof)
 print("building", eng_path, "...")
 ser = builder.build_serialized_network(net, cfg)
-assert ser is not None, "build returned None"
+if ser is None:
+    # The usual cause is building on a pre-Ada card: TRT reports "Error Code 9: Networks with FP8
+    # Q/DQ layers require hardware with FP8 support" to the logger and returns None, which on its own
+    # says nothing. train-lora.py checks the capability up front; this covers standalone use.
+    hint = ""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            cc = torch.cuda.get_device_capability(0)
+            if cc < (8, 9):
+                hint = (f"\n{torch.cuda.get_device_name(0)} is SM {cc[0]}.{cc[1]}; FP8 engines need "
+                        "SM 8.9 (Ada) or newer. Build the bf16 transformer instead "
+                        "(train-lora.py --type klein --klein-quality quality).")
+    except Exception:
+        pass
+    raise SystemExit(f"FP8 engine build failed; see the TensorRT errors above.{hint}")
 open(eng_path, "wb").write(ser)
 print("WROTE", eng_path, f"{os.path.getsize(eng_path)/1e6:.0f} MB")
