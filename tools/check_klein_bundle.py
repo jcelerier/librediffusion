@@ -191,6 +191,17 @@ def main() -> int:
     else:
         print("  SKIP  vae_decoder (engine or reference missing)")
 
+    # --- vae encoder (the img2img / reference-edit path) ---------------------------------------
+    enc_in, enc_out = ref("210_vae__encoder_in_image"), ref("211_vae__encoder_out_latent")
+    p = bundle / "vae_encoder_bf16.plan"
+    if p.exists() and enc_in is not None and enc_out is not None:
+        got = Engine(p, logger).run({"image": enc_in})
+        v = next(iter(got.values()))
+        c = cosine(v, enc_out)
+        record("vae_encoder", "cos", c, COS_MIN["qwen"], c >= COS_MIN["qwen"])
+    else:
+        print("  SKIP  vae_encoder (engine or reference missing)")
+
     # --- rife: interpolate between two real frames ---------------------------------------------
     p = bundle / "rife_ifnet_fp16.plan"
     if p.exists() and dec_in is not None:
