@@ -95,8 +95,21 @@ def main() -> int:
     else:
         print(f"[calib] WARNING no tokenizer.json at {tok_src} (bundle falls back to the vendored copy)")
 
-    cap: dict = {"in_hidden": [], "timesteps": []}
+    # Two hooks, both on the modules the ONNX export traces, so what we record is by construction the
+    # engines' own I/O contract: the text encoder's (input_ids, attention_mask) and the transformer's
+    # five inputs plus its velocity. check_klein_bundle.py replays these through the built engines.
+    cap: dict = {"in_hidden": [], "timesteps": [], "velocity": [], "latents": []}
     real_fwd = pipe.transformer.forward
+    real_te = pipe.text_encoder.forward
+
+    def te_hook(*args, **kwargs):
+        ids = kwargs.get("input_ids", args[0] if args else None)
+        mask = kwargs.get("attention_mask")
+        if ids is not None:
+            cap.setdefault("input_ids", ids.detach().to(torch.int32).cpu().numpy())
+        if mask is not None:
+            cap.setdefault("attention_mask", mask.detach().to(torch.int32).cpu().numpy())
+        return real_te(*args, **kwargs)
 
     def fwd_hook(*args, **kwargs):
         hs = kwargs.get("hidden_states", args[0] if args else None)
@@ -111,9 +124,31 @@ def main() -> int:
         cap.setdefault("txt_ids", kwargs["txt_ids"].detach().to(torch.float32).cpu().numpy())
         cap["in_hidden"].append(hs.detach().to(torch.float32).cpu().numpy())
         cap["timesteps"].append(float(kwargs["timestep"].flatten()[0].item()))
-        return real_fwd(*args, **kwargs)
+        out = real_fwd(*args, **kwargs)
+        vel = out[0] if isinstance(out, tuple) else out.sample
+        cap["velocity"].append(vel.detach().to(torch.float32).cpu().numpy())
+        return out
 
+    def step_cb(p_, step, t, cbk):
+        lat = cbk.get("latents")
+        if lat is not None:
+            cap["latents"].append(lat.detach().to(torch.float32).cpu().numpy())
+        return cbk
+
+    # The decoder's input as the pipeline hands it over, i.e. already unpacked and denormalised. Captured
+    # rather than reconstructed so the check exercises the engine instead of a second implementation of
+    # the pack/bn math.
+    real_dec = pipe.vae.decode
+
+    def dec_hook(*args, **kwargs):
+        lat = kwargs.get("z", args[0] if args else None)
+        if lat is not None:
+            cap.setdefault("dec_in", lat.detach().to(torch.float32).cpu().numpy())
+        return real_dec(*args, **kwargs)
+
+    pipe.vae.decode = dec_hook
     pipe.transformer.forward = fwd_hook
+    pipe.text_encoder.forward = te_hook
     try:
         # CPU generator so the noise is the same whatever the offload placement does.
         gen = torch.Generator("cpu").manual_seed(SEED)
@@ -128,9 +163,13 @@ def main() -> int:
             max_sequence_length=text_len,
             text_encoder_out_layers=HIDDEN_LAYERS,
             output_type="pil",
+            callback_on_step_end=step_cb,
+            callback_on_step_end_tensor_inputs=["latents"],
         ).images[0]
     finally:
         pipe.transformer.forward = real_fwd
+        pipe.text_encoder.forward = real_te
+        pipe.vae.decode = real_dec
 
     if len(cap["in_hidden"]) != STEPS:
         raise RuntimeError(f"expected {STEPS} transformer calls, captured {len(cap['in_hidden'])}")
@@ -146,6 +185,20 @@ def main() -> int:
     save("032_ids__timesteps_per_step", np.asarray(cap["timesteps"], dtype=np.float32))
     for i, h in enumerate(cap["in_hidden"]):
         save(f"11{i}_transformer__in_hidden_step{i}", h)
+
+    # Expected outputs, for check_klein_bundle.py to compare the engines against. int32 on disk because
+    # npy keeps the dtype and the engines take int64/int32 depending on the trace; the checker casts.
+    for key, name in (("input_ids", "000_textencode__input_ids"),
+                      ("attention_mask", "001_textencode__attention_mask")):
+        if key in cap:
+            np.save(out / f"{name}.npy", np.ascontiguousarray(cap[key]))
+            print(f"[calib] {name}.npy {list(cap[key].shape)} {cap[key].dtype}")
+    for i, v in enumerate(cap["velocity"]):
+        save(f"10{i}_transformer__velocity_step{i}", v)
+    for i, s in enumerate(cap["latents"]):
+        save(f"12{i}_scheduler__latent_after_step{i}", s)
+    if "dec_in" in cap:
+        save("200_vae__decoder_in_latent", cap["dec_in"])
 
     # The pipeline's own output: a free end-to-end check that the weights and the venv are sane before
     # hours of engine building, and the reference to compare the finished bundle's frames against.
