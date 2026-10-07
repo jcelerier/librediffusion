@@ -14,7 +14,9 @@ lets us pin the exact C++ I/O contract):
 The transformer is exported in bf16 (TRT will quantize to FP8 in a later build step via modelopt, OR
 we build bf16 first for the correctness gate). VAE in bf16. Qwen in bf16.
 
-Run under the flux venv with PYTHONPATH=klein-pydeps (git diffusers 0.39).
+Driven by train-lora.py --type klein, which sets the KLEIN_* paths and geometry. Standalone use
+needs nothing but the project venv (`uv run python ...`): the diffusers fork that carries Flux2 is
+a pinned dependency, not a side-loaded checkout.
 """
 from __future__ import annotations
 
