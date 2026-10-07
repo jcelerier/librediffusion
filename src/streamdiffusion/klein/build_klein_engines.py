@@ -5,7 +5,7 @@ validates. Dynamic shape profiles: batch 1, Lp in [LP, 2*LP] (single latent .. +
 Lt fixed. The wide Lp range gives the variable-query-length the spatial-KV-cache needs.
 Geometry comes from KLEIN_WIDTH/KLEIN_HEIGHT/KLEIN_TEXT_LEN (default 320x576, Lt 512).
 
-Run under the flux venv env (klein_env.sh sourced).
+Driven by train-lora.py --type klein; standalone use needs only the project venv.
 """
 from __future__ import annotations
 
@@ -80,10 +80,8 @@ def build(onnx_path, engine_path, profiles, bf16=True, fp8=False, workspace_gb=1
 
 def build_transformer():
     # Lp: LP (single img) .. 2*LP (latent + 1 ref token block). Lt fixed.
-    # opt=2*LP tunes the engine for the STREAMING ref-edit path (latent + ref), which is the
-    # real-time use-case; single-image (LP) still works (it's within min..max). The previously
-    # DEPLOYED transformer_bf16.plan was static-720 (built by an earlier path) and could NOT run the
-    # 1440-token ref path -> bf16-quality streaming was blocked. This rebuild fixes that.
+    # opt=2*LP tunes the engine for the streaming ref-edit path (latent + ref); single-image
+    # (LP) still works, being within min..max. A static-720 plan cannot run the 1440-token path.
     profiles = {
         "hidden_states": ((1, LP, 128), (1, 2 * LP, 128), (1, 2 * LP, 128)),
         "encoder_hidden_states": ((1, LT, 7680), (1, LT, 7680), (1, LT, 7680)),
