@@ -202,7 +202,11 @@ def main() -> int:
 
     # The txt2img run never encodes, but the img2img / reference-edit path does, so give the encoder
     # engine a reference too: round-trip the frame we just generated through the real VAE encoder.
-    vae_dev = next(pipe.vae.parameters()).device
+    # The execution device, NOT next(parameters()).device: under cpu offload the VAE's parameters sit
+    # on the CPU between calls and accelerate's pre-hook moves them to the GPU on forward, so reading
+    # the parameter device sends the input to the CPU and the conv then gets mismatched operands.
+    vae_dev = getattr(pipe, "_execution_device", None) or (
+        torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
     enc_in = (torch.from_numpy(np.asarray(image).astype(np.float32) / 255.0 * 2.0 - 1.0)
               .permute(2, 0, 1)[None])
     with torch.no_grad():
