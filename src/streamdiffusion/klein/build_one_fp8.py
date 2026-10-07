@@ -24,13 +24,19 @@ if _hc in ("ampere_plus", "ampere"):
 elif _hc in ("same_cc", "same"):
     cfg.hardware_compatibility_level = trt.HardwareCompatibilityLevel.SAME_COMPUTE_CAPABILITY
     print(f"[I] klein FP8 hw compat: {_hc} (PORTABLE)")
+# Geometry: same env contract as export_klein.py / build_klein_engines.py.
+_W = int(os.environ.get("KLEIN_WIDTH", "320"))
+_H = int(os.environ.get("KLEIN_HEIGHT", "576"))
+LT = int(os.environ.get("KLEIN_TEXT_LEN", "512"))
+LP = (_H // 16) * (_W // 16)
+
 prof = builder.create_optimization_profile()
 profiles = {
-    "hidden_states": ((1, 720, 128), (1, 720, 128), (1, 1440, 128)),
-    "encoder_hidden_states": ((1, 512, 7680), (1, 512, 7680), (1, 512, 7680)),
+    "hidden_states": ((1, LP, 128), (1, LP, 128), (1, 2 * LP, 128)),
+    "encoder_hidden_states": ((1, LT, 7680), (1, LT, 7680), (1, LT, 7680)),
     "timestep": ((1,), (1,), (1,)),
-    "img_ids": ((1, 720, 4), (1, 720, 4), (1, 1440, 4)),
-    "txt_ids": ((1, 512, 4), (1, 512, 4), (1, 512, 4)),
+    "img_ids": ((1, LP, 4), (1, LP, 4), (1, 2 * LP, 4)),
+    "txt_ids": ((1, LT, 4), (1, LT, 4), (1, LT, 4)),
 }
 for n, (mn, op, mx) in profiles.items():
     prof.set_shape(n, mn, op, mx)
