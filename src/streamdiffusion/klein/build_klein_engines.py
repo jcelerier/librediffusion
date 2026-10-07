@@ -5,7 +5,7 @@ validates. Dynamic shape profiles: batch 1, Lp in [LP, 2*LP] (single latent .. +
 Lt fixed. The wide Lp range gives the variable-query-length the spatial-KV-cache needs.
 Geometry comes from KLEIN_WIDTH/KLEIN_HEIGHT/KLEIN_TEXT_LEN (default 320x576, Lt 512).
 
-Run under the flux venv env (klein_env.sh sourced).
+Driven by train-lora.py --type klein; standalone use needs only the project venv.
 """
 from __future__ import annotations
 
