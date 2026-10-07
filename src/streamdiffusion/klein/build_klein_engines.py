@@ -1,8 +1,9 @@
 """Build FLUX.2-klein-4B TRT engines from the exported ONNX.
 
 bf16 engines for the correctness gate; the transformer also gets an FP8 build path (--fp8) once bf16
-validates. Dynamic shape profiles: batch 1, Lp in [720, 1440] (single latent .. +ref tokens),
-Lt fixed 512. The wide Lp range gives the variable-query-length the spatial-KV-cache needs.
+validates. Dynamic shape profiles: batch 1, Lp in [LP, 2*LP] (single latent .. +ref tokens),
+Lt fixed. The wide Lp range gives the variable-query-length the spatial-KV-cache needs.
+Geometry comes from KLEIN_WIDTH/KLEIN_HEIGHT/KLEIN_TEXT_LEN (default 320x576, Lt 512).
 
 Run under the flux venv env (klein_env.sh sourced).
 """
@@ -18,6 +19,13 @@ import tensorrt as trt
 ONNX = Path(os.environ.get("KLEIN_ONNX_DIR", "./onnx-klein"))
 ENG = Path(os.environ.get("KLEIN_ENGINE_DIR", "./engine-klein"))
 ENG.mkdir(parents=True, exist_ok=True)
+
+# Geometry: same env contract as export_klein.py, so the profiles always match the traced graph.
+W = int(os.environ.get("KLEIN_WIDTH", "320"))
+H = int(os.environ.get("KLEIN_HEIGHT", "576"))
+LT = int(os.environ.get("KLEIN_TEXT_LEN", "512"))
+LAT_H, LAT_W = H // 8, W // 8
+LP = (LAT_H // 2) * (LAT_W // 2)
 
 LOG = trt.Logger(trt.Logger.INFO)
 
@@ -71,17 +79,17 @@ def build(onnx_path, engine_path, profiles, bf16=True, fp8=False, workspace_gb=1
 
 
 def build_transformer():
-    # Lp: 720 (single img) .. 1440 (latent + 1 ref token block). Lt fixed 512.
-    # opt=1440 tunes the engine for the STREAMING ref-edit path (latent 720 + ref 720), which is the
-    # real-time use-case; single-image (720) still works (it's within min..max). The previously
+    # Lp: LP (single img) .. 2*LP (latent + 1 ref token block). Lt fixed.
+    # opt=2*LP tunes the engine for the STREAMING ref-edit path (latent + ref), which is the
+    # real-time use-case; single-image (LP) still works (it's within min..max). The previously
     # DEPLOYED transformer_bf16.plan was static-720 (built by an earlier path) and could NOT run the
     # 1440-token ref path -> bf16-quality streaming was blocked. This rebuild fixes that.
     profiles = {
-        "hidden_states": ((1, 720, 128), (1, 1440, 128), (1, 1440, 128)),
-        "encoder_hidden_states": ((1, 512, 7680), (1, 512, 7680), (1, 512, 7680)),
+        "hidden_states": ((1, LP, 128), (1, 2 * LP, 128), (1, 2 * LP, 128)),
+        "encoder_hidden_states": ((1, LT, 7680), (1, LT, 7680), (1, LT, 7680)),
         "timestep": ((1,), (1,), (1,)),
-        "img_ids": ((1, 720, 4), (1, 1440, 4), (1, 1440, 4)),
-        "txt_ids": ((1, 512, 4), (1, 512, 4), (1, 512, 4)),
+        "img_ids": ((1, LP, 4), (1, 2 * LP, 4), (1, 2 * LP, 4)),
+        "txt_ids": ((1, LT, 4), (1, LT, 4), (1, LT, 4)),
     }
     # Build from the dynamic-seq-FIXED ONNX (fix_klein_dynamic_seq.py rewrote the 50 baked Constant(1232)
     # RoPE-reshape literals -> 0). Without this the engine comes out static-720 despite this profile,
@@ -91,19 +99,19 @@ def build_transformer():
 
 def build_qwen():
     profiles = {
-        "input_ids": ((1, 512), (1, 512), (1, 512)),
-        "attention_mask": ((1, 512), (1, 512), (1, 512)),
+        "input_ids": ((1, LT), (1, LT), (1, LT)),
+        "attention_mask": ((1, LT), (1, LT), (1, LT)),
     }
     build(ONNX / "qwen3_encoder/model_fixed.onnx", ENG / "qwen3_encoder_bf16.plan", profiles, workspace_gb=10)
 
 
 def build_vae_decoder():
-    profiles = {"latent": ((1, 32, 72, 40), (1, 32, 72, 40), (1, 32, 72, 40))}
+    profiles = {"latent": ((1, 32, LAT_H, LAT_W),) * 3}
     build(ONNX / "vae_decoder/model.onnx", ENG / "vae_decoder_bf16.plan", profiles, workspace_gb=8)
 
 
 def build_vae_encoder():
-    profiles = {"image": ((1, 3, 576, 320), (1, 3, 576, 320), (1, 3, 576, 320))}
+    profiles = {"image": ((1, 3, H, W),) * 3}
     build(ONNX / "vae_encoder/model.onnx", ENG / "vae_encoder_bf16.plan", profiles, workspace_gb=8)
 
 

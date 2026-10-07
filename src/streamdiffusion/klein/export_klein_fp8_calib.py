@@ -7,7 +7,8 @@ high precision (SD_FP8_BF16_DEFAULT_CONFIG + filter_func_no_proj_out + quant_lev
 heavy attention/FF/single-block compute linears, and tags trt_high_precision_dtype="BFloat16".
 
 This script:
-  - Calibrates amax over real golden activations (step0+step1) + a few random timesteps (range widening).
+  - Calibrates amax over real pipeline activations (step0+step1, from make_klein_calib.py) + a few
+    random timesteps (range widening).
     (The amax pass is correct regardless of the CUDA ext: modelopt falls back to fp8_eager which is an
      exact torch.float8_e4m3fn fake-quant; the "simulated" warning is about speed, not correctness.)
   - Uses SD_FP8_BF16_DEFAULT_CONFIG (trt_high_precision_dtype BFloat16, weight/input quantizers).
@@ -64,8 +65,12 @@ def _resolve_klein_model_dir():
 
 
 KLEIN = _resolve_klein_model_dir()
-# Calibration goldens dir (npy tensors). Required for this script; set KLEIN_FP8_GOLD to point at it.
-GOLD = _os0.environ.get("KLEIN_FP8_GOLD", "")
+# Calibration activations (npy tensors), written by make_klein_calib.py from one reference pipeline
+# run. KLEIN_FP8_GOLD overrides the location, e.g. to reuse a validation golden dump instead.
+_CALIB_DEFAULT = _os0.path.join(
+    _os0.path.dirname(_os0.environ.get("KLEIN_ONNX_DIR", "./onnx-klein").rstrip("/\\")) or ".",
+    "calib-klein")
+GOLD = _os0.environ.get("KLEIN_FP8_GOLD") or _os0.environ.get("KLEIN_CALIB_DIR") or _CALIB_DEFAULT
 _SUF = _os0.environ.get("KLEIN_FP8_LEVEL", "all")
 _SUF = "" if _SUF == "all" else "_" + _SUF
 # honor KLEIN_ONNX_DIR (train-lora --type klein); standalone unchanged.
@@ -74,7 +79,6 @@ OUT = Path(f"{_ONNX_BASE}/transformer_fp8_calib{_SUF}")
 OUT.mkdir(parents=True, exist_ok=True)
 DEV = "cuda"
 DT = torch.bfloat16
-LP, LT = 720, 512
 
 # Sensitive layers that must stay high-precision (bf16) in the engine.
 # Matches klein module names dumped from the model (no diffusers Attention bmm quantizers here:
@@ -134,9 +138,12 @@ def main():
     from diffusers import Flux2Transformer2DModel
 
     def gnp(n):
-        if not GOLD:
-            raise RuntimeError("FP8 calibration goldens required; set KLEIN_FP8_GOLD to the goldens dir.")
-        return np.load(f"{GOLD}/{n}.npy")
+        p = Path(GOLD) / f"{n}.npy"
+        if not p.exists():
+            raise RuntimeError(
+                f"missing calibration tensor {p}. Run make_klein_calib.py (train-lora.py --type klein "
+                "does this for you), or point KLEIN_FP8_GOLD at an existing dump.")
+        return np.load(p)
 
     print("loading transformer...")
     m = Flux2Transformer2DModel.from_pretrained(KLEIN, subfolder="transformer", torch_dtype=DT).to(DEV).eval()

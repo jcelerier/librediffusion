@@ -68,12 +68,18 @@ KLEIN = _resolve_klein_model_dir()
 OUT = Path(_os.environ.get("KLEIN_ONNX_DIR", "./onnx-klein"))
 OUT.mkdir(parents=True, exist_ok=True)
 
-# 320x576 target: latent 36x20 = 720 tokens (H/16, W/16). VAE latent 32ch at 72x40 (H/8,W/8).
-W, H = 320, 576
-LAT_H, LAT_W = H // 8, W // 8        # 72, 40  (vae latent spatial, 32ch)
-TOK_H, TOK_W = LAT_H // 2, LAT_W // 2  # 36, 20 (after 2x2 patchify)
-LP = TOK_H * TOK_W                    # 720
-LT = 512                             # qwen seq
+# Default 320x576: latent 36x20 = 720 tokens (H/16, W/16). VAE latent 32ch at 72x40 (H/8,W/8).
+# KLEIN_WIDTH/KLEIN_HEIGHT/KLEIN_TEXT_LEN keep this in step with build_klein_engines.py,
+# fix_klein_dynamic_seq.py and make_klein_calib.py, which all have to agree on Lp and Lt.
+W = int(_os.environ.get("KLEIN_WIDTH", "320"))
+H = int(_os.environ.get("KLEIN_HEIGHT", "576"))
+if W % 16 or H % 16:
+    raise SystemExit(f"klein resolution must be a multiple of 16 (got {W}x{H})")
+LAT_H, LAT_W = H // 8, W // 8        # vae latent spatial, 32ch
+TOK_H, TOK_W = LAT_H // 2, LAT_W // 2  # after 2x2 patchify
+LP = TOK_H * TOK_W
+LT = int(_os.environ.get("KLEIN_TEXT_LEN", "512"))  # qwen seq
+print(f"[klein] export geometry {W}x{H} -> latent {LAT_W}x{LAT_H}, Lp={LP}, Lt={LT}")
 DEV = "cuda"
 DT = torch.bfloat16
 

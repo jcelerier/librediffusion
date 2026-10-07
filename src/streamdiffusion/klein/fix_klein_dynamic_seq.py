@@ -34,8 +34,14 @@ DST_DIR = _BASE / _DST_SUB
 SRC = SRC_DIR / "model.onnx"
 DST = DST_DIR / "model.onnx"
 
-# The literal baked into the RoPE reshapes = Lp + Lt. Defaults: Lp=720 (320x576), Lt=512.
-BAKED = int(_os.environ.get("KLEIN_BAKED_SEQ", "1232"))
+# The literal baked into the RoPE reshapes = Lp + Lt, so it follows the export geometry rather than
+# being a constant to remember (320x576 -> 720 + 512 = 1232). KLEIN_BAKED_SEQ still overrides.
+_W = int(_os.environ.get("KLEIN_WIDTH", "320"))
+_H = int(_os.environ.get("KLEIN_HEIGHT", "576"))
+_LT = int(_os.environ.get("KLEIN_TEXT_LEN", "512"))
+BAKED = int(_os.environ.get("KLEIN_BAKED_SEQ") or (_H // 16) * (_W // 16) + _LT)
+# 50 = 5 double blocks x2 + 20 single blocks x2: a property of the architecture, not of the
+# resolution, so it stays fixed when the geometry changes.
 EXPECT = int(_os.environ.get("KLEIN_BAKED_COUNT", "50"))
 
 DST_DIR.mkdir(parents=True, exist_ok=True)

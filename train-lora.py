@@ -319,24 +319,46 @@ def parse_args():
     a.opt_height = a.opt_height or a.max_height
     a.opt_width = a.opt_width or a.max_width
     a.lora_specs = [LoraSpec.parse(x) for x in a.loras]
+    # klein has its own native geometry (320x576) and the sd15/sdxl resolution defaults are meaningless
+    # for it -- silently building a 1024x1024 klein would quadruple Lp and the engine with it. So the
+    # klein path only takes a resolution the caller actually asked for.
+    _res_flags = ("--min-resolution", "--max-resolution", "--min-width", "--max-width",
+                  "--min-height", "--max-height", "--opt-width", "--opt-height")
+    a.resolution_explicit = any(arg == f or arg.startswith(f + "=")
+                                for arg in sys.argv[1:] for f in _res_flags)
     return a
 
 
 def export_klein(args):
-    """FLUX.2-klein-4B export: dispatch to the klein scripts (export ONNX -> build TRT -> FP8 calib ->
-    stage a node-ready bundle). Runs in THIS interpreter's venv (the unified venv has diffusers Flux2 +
-    nvidia-modelopt), driving the scripts' paths via env-var overrides. --output is the final bundle dir
-    (gets the *.plan + tokenizer.json + bn_*.bin + rife the score node loads)."""
+    """FLUX.2-klein-4B export: dispatch to the klein scripts (reference run for the calibration and the
+    VAE constants -> export ONNX -> build TRT -> FP8 calib -> stage a node-ready bundle). Runs in THIS
+    interpreter's venv (the unified venv has diffusers Flux2 + nvidia-modelopt), driving the scripts'
+    paths via env-var overrides. --output is the final bundle dir (gets the *.plan + tokenizer.json +
+    bn_*.bin + rife the score node loads). Everything comes from the model and this repo: no external
+    activation dumps, no prebuilt-engine reference dir."""
     import subprocess, shutil, glob as _glob
     sd = args.klein_scripts_dir
     out = os.path.abspath(args.output)
     onnx_dir = out + "_onnx-klein"
     eng_dir = out + "_engine-klein"
+    calib_dir = out + "_calib-klein"
     os.makedirs(out, exist_ok=True)
     _hf_hub = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
     model_dir = args.model if os.path.isdir(args.model) else (
         _glob.glob(os.path.join(_hf_hub, "models--black-forest-labs--FLUX.2-klein-4B", "snapshots", "*")) or [""])[0]
+    if not model_dir or not os.path.isdir(model_dir):
+        raise SystemExit(
+            "[klein] FLUX.2-klein-4B not found. Pass --model with a local snapshot dir, or download it "
+            "first:\n  hf download black-forest-labs/FLUX.2-klein-4B "
+            "--exclude flux-2-klein-4b.safetensors\n(the single-file .safetensors is not used by this "
+            "export; excluding it saves 7.3 GB)")
+    width = args.opt_width if args.resolution_explicit else 320
+    height = args.opt_height if args.resolution_explicit else 576
+    lp = (height // 16) * (width // 16)
+    print(f"[klein] {width}x{height} (Lp={lp}) model={model_dir}")
     env = dict(os.environ, KLEIN_MODEL_DIR=model_dir, KLEIN_ONNX_DIR=onnx_dir, KLEIN_ENGINE_DIR=eng_dir,
+               KLEIN_CALIB_DIR=calib_dir,
+               KLEIN_WIDTH=str(width), KLEIN_HEIGHT=str(height),
                KLEIN_HW_COMPAT=args.hw_compat)  # portable-engine flag honored by build_klein_engines/build_one_fp8
     py = sys.executable
 
@@ -347,16 +369,27 @@ def export_klein(args):
         if r.returncode != 0:
             raise SystemExit(f"[klein] {script} failed (exit {r.returncode})")
 
+    # 0. Calibration activations + the VAE/tokenizer side files, from one reference pipeline run.
+    #    First because it is the cheapest step that touches the weights: if the model or the venv is
+    #    wrong we find out in minutes instead of after the multi-hour ONNX export. It also writes a
+    #    reference PNG to compare the finished bundle's output against. Idempotent, so a resumed run
+    #    does not redo it.
+    if os.path.exists(os.path.join(calib_dir, "calib.json")):
+        print(f"[klein] reusing calibration in {calib_dir}")
+    else:
+        run("make_klein_calib.py")
+
     # 1. ONNX export (transformer bf16 + vae + qwen)
     run("export_klein.py", "--which", "all")
     # 1b. fix the qwen ONNX: the legacy TorchScript exporter mis-types the attention sqrt->cast->mul chain
     #     as COMPLEX128, which TRT rejects. fix_qwen_complex.py rewrites model.onnx -> model_fixed.onnx
     #     (which build_klein_engines.py's build_qwen consumes). REQUIRED before step 2.
     run("fix_qwen_complex.py")
-    # 1c. fix the transformer ONNX: torch.onnx tracing bakes the concatenated seq len (Lp+Lt=1232) as
-    #     50 inline Constant RoPE-reshape literals -> TRT pins Lp=720 STATIC (can't run the 1440-token
-    #     ref-edit streaming path). fix_klein_dynamic_seq.py rewrites 1232->0 -> transformer_dynseq/,
-    #     which build_klein_engines.py's build_transformer now consumes. REQUIRED or bf16 is static-720.
+    # 1c. fix the transformer ONNX: torch.onnx tracing bakes the concatenated seq len (Lp+Lt) as 50
+    #     inline Constant RoPE-reshape literals -> TRT pins Lp STATIC (can't run the 2*Lp-token
+    #     ref-edit streaming path). fix_klein_dynamic_seq.py rewrites that literal to 0 ->
+    #     transformer_dynseq/, which build_klein_engines.py's build_transformer consumes. REQUIRED, or
+    #     the bf16 engine comes out single-image only.
     run("fix_klein_dynamic_seq.py")
     # 2. bf16 TRT engines (transformer/qwen/vae_decoder/vae_encoder)
     run("build_klein_engines.py", "--which", "all")
@@ -370,9 +403,9 @@ def export_klein(args):
         run("build_one_fp8.py", fp8_onnx, fp8_plan)
 
     # 4. stage the node-ready bundle: copy the canonical engines + side files into --output.
-    # Engines come from eng_dir. The side files (bn_*.bin, tokenizer.json) aren't produced by the engine
-    # build — they're VENDORED in klein/assets/ (self-contained; no external /media path needed). RIFE is
-    # vendored as ONNX and built into a .plan here (GPU-specific + honors --hw-compat).
+    # Engines come from eng_dir; bn_*.bin / tokenizer.json from calib_dir (step 0 read them off the
+    # model), with klein/assets/ as the fallback. RIFE is vendored as ONNX and built into a .plan here
+    # (GPU-specific + honors --hw-compat).
     ASSETS = os.path.join(sd, "assets")  # sd = --klein-scripts-dir (the vendored klein/ dir)
     # Optional prebuilt-engine reference dirs (env): only used if a vendored asset is somehow missing.
     REF = os.environ.get("KLEIN_ENGINE_REF", "")
@@ -385,29 +418,38 @@ def export_klein(args):
             if os.path.exists(s):
                 shutil.copy2(s, os.path.join(out, dst or src)); print(f"[klein] staged {dst or src} (from {d})"); return True
         print(f"[klein] WARNING missing {src} (looked in {srcdirs})"); return False
-    for f in ["transformer_bf16.plan", "transformer_fp8_calib.plan",
-              "qwen3_encoder_bf16.plan", "vae_decoder_bf16.plan", "vae_encoder_bf16.plan"]:
+    engines = ["qwen3_encoder_bf16.plan", "vae_decoder_bf16.plan", "vae_encoder_bf16.plan"]
+    if args.klein_quality in ("quality", "both"):
+        engines.append("transformer_bf16.plan")
+    if args.klein_quality in ("speed", "both"):
+        engines.append("transformer_fp8_calib.plan")
+    for f in engines:
         cp(f, [eng_dir])
-    # side files: prefer the freshly-built eng_dir, else the VENDORED assets, else the legacy /media ref.
+    # calib_dir first: bn_mean/bn_std and tokenizer.json read off THIS model, so a fine-tune or a
+    # different snapshot gets its own constants instead of the vendored ones from the stock release.
     for f in ["bn_mean.bin", "bn_std.bin", "tokenizer.json"]:
-        cp(f, [eng_dir, ASSETS, REF])
+        cp(f, [calib_dir, eng_dir, ASSETS, REF])
     # RIFE: use a prebuilt .plan if present (eng_dir/legacy ref), else BUILD it from the vendored ONNX so
     # the bundle is self-contained and the engine matches this GPU + --hw-compat.
     rife_plan_out = os.path.join(out, "rife_ifnet_fp16.plan")
     if not cp("rife_ifnet_fp16.plan", [eng_dir, RIFE_REF, REF]):
         rife_onnx = os.path.join(ASSETS, "rife_ifnet_fp16.onnx")
-        if os.path.exists(rife_onnx):
-            print("[klein] building rife_ifnet_fp16.plan from vendored ONNX ...")
-            # build_rife.py: single 'frames'[B,6,H,W] input, profile B[1-7] H/W[64-1024], honors KLEIN_HW_COMPAT.
-            run("build_rife.py", rife_onnx, rife_plan_out)
-        else:
-            print(f"[klein] WARNING no rife .plan and no vendored ONNX at {rife_onnx}")
+        if not os.path.exists(rife_onnx):
+            raise SystemExit(f"[klein] no rife .plan and no vendored ONNX at {rife_onnx}")
+        print("[klein] building rife_ifnet_fp16.plan from vendored ONNX ...")
+        # build_rife.py: single 'frames'[B,6,H,W] input, profile B[1-7] H/W[64-1024], honors KLEIN_HW_COMPAT.
+        run("build_rife.py", rife_onnx, rife_plan_out)
+    # Fail here rather than at load time in the node: a bundle missing one engine looks fine on disk.
+    required = engines + ["bn_mean.bin", "bn_std.bin", "tokenizer.json", "rife_ifnet_fp16.plan"]
+    missing = [f for f in required if not os.path.exists(os.path.join(out, f))]
+    if missing:
+        raise SystemExit(f"[klein] incomplete bundle at {out}, missing: {', '.join(missing)}")
     # introspection sidecar: the node reads this (no GPU) to show what loaded + its features.
     write_manifest(out, {
         "model_type": "klein",
         "model_family": "flux2",
         "base_model": "black-forest-labs/FLUX.2-klein-4B",
-        "resolution": {"width": 320, "height": 576},
+        "resolution": {"width": width, "height": height},
         "denoising_steps": 2,
         "precision": ("fp8+bf16" if args.klein_quality == "both"
                       else ("fp8" if args.klein_quality == "speed" else "bf16")),
@@ -415,6 +457,8 @@ def export_klein(args):
         "features": {"controlnet": False, "ipadapter": False, "v2v": False, "rife": True,
                      "reference_edit": True},
     }, out)
+    for f in sorted(os.listdir(out)):
+        print(f"[klein]   {f}  {os.path.getsize(os.path.join(out, f))/1e6:.1f} MB")
     print(f"[klein] DONE -> bundle at {out}")
 
 
