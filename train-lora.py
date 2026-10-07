@@ -326,6 +326,8 @@ def parse_args():
                   "--min-height", "--max-height", "--opt-width", "--opt-height")
     a.resolution_explicit = any(arg == f or arg.startswith(f + "=")
                                 for arg in sys.argv[1:] for f in _res_flags)
+    a.klein_quality_explicit = any(arg == "--klein-quality" or arg.startswith("--klein-quality=")
+                                   for arg in sys.argv[1:])
     return a
 
 
@@ -356,6 +358,21 @@ def export_klein(args):
     height = args.opt_height if args.resolution_explicit else 576
     lp = (height // 16) * (width // 16)
     print(f"[klein] {width}x{height} (Lp={lp}) model={model_dir}")
+
+    # FP8 Q/DQ engines need Ada (SM 8.9) or newer. TensorRT only says so when it builds the engine --
+    # the LAST step -- so on an Ampere card the default --klein-quality both died after the whole ONNX
+    # export and all four bf16 engines were already done ("Error Code 9: Networks with FP8 Q/DQ layers
+    # require hardware with FP8 support"). Decide it here instead, before any work.
+    quality = args.klein_quality
+    if quality in ("speed", "both"):
+        cc = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None
+        if cc is not None and cc < (8, 9):
+            why = (f"[klein] {torch.cuda.get_device_name(0)} is SM {cc[0]}.{cc[1]}; TensorRT needs "
+                   "SM 8.9 (Ada) or newer to build an FP8 engine")
+            if args.klein_quality_explicit:
+                raise SystemExit(f"{why}.\nRe-run with --klein-quality quality for the bf16 bundle.")
+            print(f"{why} -- falling back to the bf16 transformer alone.")
+            quality = "quality"
     env = dict(os.environ, KLEIN_MODEL_DIR=model_dir, KLEIN_ONNX_DIR=onnx_dir, KLEIN_ENGINE_DIR=eng_dir,
                KLEIN_CALIB_DIR=calib_dir,
                KLEIN_WIDTH=str(width), KLEIN_HEIGHT=str(height),
@@ -394,7 +411,7 @@ def export_klein(args):
     # 2. bf16 TRT engines (transformer/qwen/vae_decoder/vae_encoder)
     run("build_klein_engines.py", "--which", "all")
     # 3. FP8-calibrated transformer (speed) — modelopt calib -> ONNX, then build_one_fp8.py -> .plan
-    if args.klein_quality in ("speed", "both"):
+    if quality in ("speed", "both"):
         run("export_klein_fp8_calib.py")
         # same static-720 fix for the fp8-calib ONNX (its own torch.onnx.export bakes 1232 too).
         run("fix_klein_dynamic_seq.py", "transformer_fp8_calib", "transformer_fp8_calib_dynseq")
@@ -419,9 +436,9 @@ def export_klein(args):
                 shutil.copy2(s, os.path.join(out, dst or src)); print(f"[klein] staged {dst or src} (from {d})"); return True
         print(f"[klein] WARNING missing {src} (looked in {srcdirs})"); return False
     engines = ["qwen3_encoder_bf16.plan", "vae_decoder_bf16.plan", "vae_encoder_bf16.plan"]
-    if args.klein_quality in ("quality", "both"):
+    if quality in ("quality", "both"):
         engines.append("transformer_bf16.plan")
-    if args.klein_quality in ("speed", "both"):
+    if quality in ("speed", "both"):
         engines.append("transformer_fp8_calib.plan")
     for f in engines:
         cp(f, [eng_dir])
@@ -451,8 +468,8 @@ def export_klein(args):
         "base_model": "black-forest-labs/FLUX.2-klein-4B",
         "resolution": {"width": width, "height": height},
         "denoising_steps": 2,
-        "precision": ("fp8+bf16" if args.klein_quality == "both"
-                      else ("fp8" if args.klein_quality == "speed" else "bf16")),
+        "precision": ("fp8+bf16" if quality == "both"
+                      else ("fp8" if quality == "speed" else "bf16")),
         "hw_compat": args.hw_compat,
         "features": {"controlnet": False, "ipadapter": False, "v2v": False, "rife": True,
                      "reference_edit": True},
