@@ -117,13 +117,21 @@ def main() -> int:
         p = calib / f"{n}.npy"
         return np.load(p) if p.exists() else None
 
-    results, failures = [], []
+    results, failures, skipped = [], [], []
 
     def record(name, metric, value, threshold, ok):
         results.append({"check": name, "metric": metric, "value": value, "threshold": threshold,
                         "pass": bool(ok)})
         print(f"  {'PASS' if ok else 'FAIL'}  {name:28s} {metric}={value:.6g} (need {threshold})")
         if not ok:
+            failures.append(name)
+
+    def skip(name, why, fatal):
+        """A skip that is allowed to be a pass only when the thing is genuinely optional. Anything
+        else counts as a failure: a checker that verifies nothing must not report success."""
+        skipped.append({"check": name, "reason": why, "fatal": bool(fatal)})
+        print(f"  {'FAIL' if fatal else 'SKIP'}  {name:28s} ({why})")
+        if fatal:
             failures.append(name)
 
     print(f"bundle {bundle}\ncalib  {calib}\n")
@@ -138,7 +146,7 @@ def main() -> int:
         record("qwen3_encoder", "cos", cosine(v, ehs), COS_MIN["qwen"],
                cosine(v, ehs) >= COS_MIN["qwen"])
     else:
-        print(f"  SKIP  qwen3_encoder (engine or reference missing)")
+        skip("qwen3_encoder", "engine or reference missing", fatal=True)
 
     # --- transformer (bf16 and fp8) ------------------------------------------------------------
     img_ids, txt_ids = ref("031_ids__img_ids"), ref("030_ids__txt_ids")
@@ -147,10 +155,12 @@ def main() -> int:
                       ("transformer_fp8_calib.plan", "transformer_fp8")):
         p = bundle / plan
         if not p.exists():
-            print(f"  SKIP  {key} (no {plan})")
+            # The fp8 transformer is genuinely optional (--klein-quality, and it needs SM 8.9+);
+            # a missing bf16 transformer means the bundle is broken.
+            skip(key, f"no {plan}", fatal=(key != "transformer_fp8"))
             continue
         if ehs is None or img_ids is None or txt_ids is None or sigmas is None:
-            print(f"  SKIP  {key} (reference missing)")
+            skip(key, "reference missing", fatal=True)
             continue
         eng = Engine(p, logger)
         worst = 1.0
@@ -182,14 +192,15 @@ def main() -> int:
                     v = psnr(img, r)
                     record("vae_decoder_vs_reference", "psnr_db", v, PSNR_MIN, v >= PSNR_MIN)
                 else:
-                    print(f"  SKIP  vae psnr (shape {img.shape} vs reference {r.shape})")
+                    skip("vae_decoder_vs_reference",
+                         f"shape {img.shape} vs reference {r.shape}", fatal=True)
         except ImportError:
             np.save(out / "trt_vae_decode.npy", img)
             print("  (no PIL; wrote .npy instead of .png)")
         # Independent of the reference: a decode that collapsed would be flat or non-finite.
         record("vae_decoder_signal", "std", float(img.std()), 10.0, float(img.std()) >= 10.0)
     else:
-        print("  SKIP  vae_decoder (engine or reference missing)")
+        skip("vae_decoder", "engine or reference missing", fatal=True)
 
     # --- vae encoder (the img2img / reference-edit path) ---------------------------------------
     enc_in, enc_out = ref("210_vae__encoder_in_image"), ref("211_vae__encoder_out_latent")
@@ -200,7 +211,7 @@ def main() -> int:
         c = cosine(v, enc_out)
         record("vae_encoder", "cos", c, COS_MIN["qwen"], c >= COS_MIN["qwen"])
     else:
-        print("  SKIP  vae_encoder (engine or reference missing)")
+        skip("vae_encoder", "engine or reference missing", fatal=True)
 
     # --- rife: interpolate between two real frames ---------------------------------------------
     p = bundle / "rife_ifnet_fp16.plan"
@@ -230,18 +241,21 @@ def main() -> int:
             db = psnr(mid, (b_f * 255).astype(np.uint8))
             print(f"  rife psnr vs A={da:.1f} dB, vs B={db:.1f} dB (both finite and unequal = blended)")
         else:
-            print("  SKIP  rife (no decoded frame to interpolate)")
+            skip("rife", "no decoded frame to interpolate", fatal=True)
     else:
-        print("  SKIP  rife (engine or reference missing)")
+        skip("rife", "engine or reference missing", fatal=True)
 
     (out / "check.json").write_text(json.dumps(
         {"bundle": str(bundle), "calib": str(calib), "results": results,
-         "failures": failures}, indent=2))
+         "skipped": skipped, "failures": failures}, indent=2))
     print(f"\nreport -> {out / 'check.json'}")
+    if not results:
+        print("FAILED: no check actually ran -- nothing was verified")
+        return 1
     if failures:
         print(f"FAILED: {', '.join(failures)}")
         return 1
-    print("ALL CHECKS PASSED")
+    print(f"ALL CHECKS PASSED ({len(results)} ran, {len(skipped)} skipped)")
     return 0
 
 
