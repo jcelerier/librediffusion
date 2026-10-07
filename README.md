@@ -32,6 +32,29 @@ All commands run as `uv run python train-lora.py <args>`. Resolution flags are
 `--min-resolution/--max-resolution/--opt-width/--opt-height` (512 for SD1.5, 1024 for SDXL);
 add `-l REPO` (or `-l "REPO|file.safetensors"`) to fuse a LoRA, repeatable to stack LoRAs.
 
+### On Windows: pass `--cache-dir` on the build volume
+
+uv's cache defaults to `%LOCALAPPDATA%\uv\cache` on `C:`. The engine-build venv is ~10 GB of
+torch/TensorRT wheels, and if you build anywhere other than `C:` — which you will, because the
+engines and the HF snapshot need tens of GB — uv cannot hardlink out of its cache across the volume
+boundary and copies every file instead:
+
+```
+warning: Failed to hardlink files; falling back to full copy. This may lead to degraded performance.
+         If the cache and target directories are on different filesystems, hardlinking may not be supported.
+```
+
+So you pay for the wheels twice on disk and wait through the copy. Point the cache at the volume you
+are building on, and keep passing it on every later `uv` call in the same tree:
+
+```bat
+uv sync    --cache-dir D:\tmp\uvcache
+uv run     --cache-dir D:\tmp\uvcache python train-lora.py --type sd15 --model stabilityai/sd-turbo ...
+```
+
+`set UV_CACHE_DIR=D:\tmp\uvcache` does the same thing for a whole shell session. The HF snapshot has
+its own cache: `set HF_HOME=D:\tmp\hf` (or `hf download --cache-dir D:\tmp\hf\hub`).
+
 ### Base models
 
 ```bash
@@ -50,10 +73,37 @@ train-lora.py --type sdxl --model stabilityai/stable-diffusion-xl-base-1.0 -l "B
 train-lora.py --type sdxl --model stabilityai/stable-diffusion-xl-base-1.0 -l "ByteDance/SDXL-Lightning|sdxl_lightning_4step_lora.safetensors" --min-resolution 1024 --max-resolution 1024 --output engines/sdxl-lightning
 train-lora.py --type sdxl --model segmind/Segmind-Vega -l segmind/Segmind-VegaRT    --min-resolution 1024 --max-resolution 1024 --output engines/vega-rt
 
-# img2img-turbo (GaParmar pix2pix-turbo skip-VAE) and FLUX.2-klein-4B
+# img2img-turbo (GaParmar pix2pix-turbo skip-VAE)
 train-lora.py --type img2img-turbo --model edge_to_image --min-resolution 512 --max-resolution 512 --output engines/img2img-turbo
+```
+
+### FLUX.2-klein-4B (`--type klein`)
+
+Download the weights first; the single-file `.safetensors` is a second copy of the same transformer
+that this export does not read, so excluding it saves 7.3 GB of the 23 GB:
+
+```bash
+hf download black-forest-labs/FLUX.2-klein-4B --exclude flux-2-klein-4b.safetensors
 train-lora.py --type klein --model black-forest-labs/FLUX.2-klein-4B --output engines/klein
 ```
+
+One command, same as the models above: it runs the reference pipeline once to get the FP8
+calibration activations and the VAE normalisation constants, exports the three ONNX graphs, patches
+them (`fix_qwen_complex` for the Qwen COMPLEX128 casts, `fix_klein_dynamic_seq` for the baked
+sequence length), builds the bf16 and FP8 transformers, the Qwen encoder and both VAE halves, builds
+RIFE from the vendored ONNX, and stages a bundle the node loads directly. It refuses to finish if any
+piece is missing. Nothing outside this repo and the HF snapshot is needed; `--model` also takes a
+local snapshot directory.
+
+Expect ~18 GB of engines (the bf16 transformer alone is 7.8 GB) plus the ONNX intermediates, and a
+long build — the transformer and Qwen engines dominate. Steps are idempotent enough to resume: a
+rerun reuses an existing calibration directory.
+
+- `--klein-quality speed` builds only the FP8 transformer, `quality` only bf16, `both` (default) both.
+- Resolution defaults to klein's native 320x576. `--opt-width/--opt-height` (multiples of 16) build
+  another geometry; cost scales with `(W/16)*(H/16)` tokens, so 1024x1024 is ~5.7x the 320x576 work.
+- `--hw-compat ampere_plus` makes the engines portable across SM 8.0+ instead of locked to the
+  build GPU.
 
 ### ControlNet (`--controlnet REPO`)
 
