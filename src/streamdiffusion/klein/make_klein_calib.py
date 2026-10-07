@@ -200,6 +200,14 @@ def main() -> int:
     if "dec_in" in cap:
         save("200_vae__decoder_in_latent", cap["dec_in"])
 
+    # The pipeline's own output: a free end-to-end check that the weights and the venv are sane before
+    # hours of engine building, and the reference to compare the finished bundle's frames against.
+    image.save(out / "calib_reference.png")
+    ref = np.asarray(image).astype(np.float32)
+    print(f"[calib] calib_reference.png {image.size} mean={ref.mean():.1f} std={ref.std():.2f}")
+    if ref.std() < 1.0:
+        raise RuntimeError("reference image is flat -- the pipeline produced no signal")
+
     # The txt2img run never encodes, but the img2img / reference-edit path does, so give the encoder
     # engine a reference too: round-trip the frame we just generated through the real VAE encoder.
     # The execution device, NOT next(parameters()).device: under cpu offload the VAE's parameters sit
@@ -213,14 +221,6 @@ def main() -> int:
         enc_out = pipe.vae.encode(enc_in.to(vae_dev, pipe.vae.dtype)).latent_dist.mode()
     save("210_vae__encoder_in_image", enc_in)
     save("211_vae__encoder_out_latent", enc_out.detach().to(torch.float32).cpu().numpy())
-
-    # The pipeline's own output: a free end-to-end check that the weights and the venv are sane before
-    # hours of engine building, and the reference to compare the finished bundle's frames against.
-    image.save(out / "calib_reference.png")
-    ref = np.asarray(image).astype(np.float32)
-    print(f"[calib] calib_reference.png {image.size} mean={ref.mean():.1f} std={ref.std():.2f}")
-    if ref.std() < 1.0:
-        raise RuntimeError("reference image is flat -- the pipeline produced no signal")
 
     lp = (height // 16) * (width // 16)
     (out / "calib.json").write_text(json.dumps({
