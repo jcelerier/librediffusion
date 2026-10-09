@@ -360,9 +360,9 @@ private:
 
     // ControlNet + IP-Adapter config (optional: older .so may lack these,
     // keep the loader available so SD/SDXL/V2V/turbo still work)
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, config_add_controlnet);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, config_set_ipadapter);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, config_set_ipadapter_image_encoder);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, config_add_controlnet);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, config_set_ipadapter);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, config_set_ipadapter_image_encoder);
 
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, config_get_width);
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, config_get_height);
@@ -400,16 +400,16 @@ private:
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, set_delta);
 
     // ControlNet + IP-Adapter per-frame setters (optional)
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, set_controlnet_cond);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, set_controlnet_cond_rgba);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, set_controlnet_scale);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, set_ipadapter_image);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, set_ipadapter_tokens);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, set_ipadapter_scale);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, set_ipadapter_scale_vector);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, num_runtime_loras);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, set_lora_scale);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, set_lora_scale_vector);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, set_controlnet_cond);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, set_controlnet_cond_rgba);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, set_controlnet_scale);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, set_ipadapter_image);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, set_ipadapter_tokens);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, set_ipadapter_scale);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, set_ipadapter_scale_vector);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, num_runtime_loras);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, set_lora_scale);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, set_lora_scale_vector);
 
     /*=====================================================================*/
     /* High-Level Inference (CPU buffers)                                  */
@@ -474,49 +474,49 @@ private:
     /* keep the loader available so SD/SDXL/V2V still work)                */
     /*=====================================================================*/
 
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_create);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_destroy);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_set_steps);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_set_strength);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_set_schedule);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_set_mask);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_set_bn);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_set_prompt);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_frame);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_set_reference);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_frame_cached);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, flux2_stream_dims);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux2_stream_create);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux2_stream_destroy);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux2_stream_set_steps);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux2_stream_set_strength);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux2_stream_set_schedule);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux2_stream_set_mask);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux2_stream_set_bn);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux2_stream_set_prompt);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux2_stream_frame);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux2_stream_set_reference);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux2_stream_frame_cached);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux2_stream_dims);
 
     /*=====================================================================*/
     /* RIFE frame interpolation (optional)                                 */
     /*=====================================================================*/
 
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_create);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_destroy);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_set_enabled);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_is_enabled);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_set_interpolation_exp);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_get_interpolation_exp);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_interpolate);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_interpolate_gpu);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_interpolate_sized);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_interpolate_gpu_sized);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, rife_required_out_bytes);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, rife_create);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, rife_destroy);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, rife_set_enabled);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, rife_is_enabled);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, rife_set_interpolation_exp);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, rife_get_interpolation_exp);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, rife_interpolate);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, rife_interpolate_gpu);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, rife_interpolate_sized);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, rife_interpolate_gpu_sized);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, rife_required_out_bytes);
 
     /*=====================================================================*/
     /* img2img-turbo (pix2pix-turbo skip-VAE)                              */
     /*=====================================================================*/
 
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_create);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_destroy);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_forward);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_frame);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_frame_dev);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_frame_sized);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_frame_dev_sized);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_frame_bytes);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_ehs_elements);
-    LIBREDIFFUSION_SYMBOL_INIT_OPT(librediffusion, img2img_turbo_frame_size);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, img2img_turbo_create);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, img2img_turbo_destroy);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, img2img_turbo_forward);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, img2img_turbo_frame);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, img2img_turbo_frame_dev);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, img2img_turbo_frame_sized);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, img2img_turbo_frame_dev_sized);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, img2img_turbo_frame_bytes);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, img2img_turbo_ehs_elements);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, img2img_turbo_frame_size);
 
     /*=====================================================================*/
     /* Utility Functions                                                   */
