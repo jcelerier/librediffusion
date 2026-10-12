@@ -804,22 +804,10 @@ librediffusion_pipeline_init_buffers(librediffusion_pipeline_handle pipeline)
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_pipeline_init_all(librediffusion_pipeline_handle pipeline)
 {
-  librediffusion_error_t err;
-
-  err = librediffusion_pipeline_init_cuda(pipeline);
-  if(err != LIBREDIFFUSION_SUCCESS)
-    return err;
-
-  err = librediffusion_pipeline_init_npp(pipeline);
-  if(err != LIBREDIFFUSION_SUCCESS)
-    return err;
-
-  err = librediffusion_pipeline_init_engines(pipeline);
-  if(err != LIBREDIFFUSION_SUCCESS)
-    return err;
-
-  err = librediffusion_pipeline_init_buffers(pipeline);
-  return err;
+  // pipeline_create already ran init_cuda / init_npp / init_engines / init_buffers. Running them a
+  // second time only rebuilt every execution context and buffer: twice the load time, a transient
+  // second copy of the TensorRT activation memory, and a leaked CUDA stream per pipeline.
+  return valid(pipeline) ? LIBREDIFFUSION_SUCCESS : LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
 }
 
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL

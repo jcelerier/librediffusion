@@ -34,6 +34,8 @@ void LibreDiffusionPipeline::init_cuda()
         + std::to_string(deviceCount) + " device(s))");
 
   cudaSetDevice(this->config_.device);
+  if(stream_)  // re-initialization (librediffusion_pipeline_init_cuda): keep the stream
+    return;
   cudaError_t err = cudaStreamCreate(&stream_);
   if(err != cudaSuccess)
   {
@@ -77,8 +79,8 @@ void LibreDiffusionPipeline::init_engines()
 
   // ControlNet (optional, multi): create a wrapper per configured net. Enabled only when at least one
   // net is configured AND the UNet engine is control-aware (declares input_control_* inputs).
-  // NOTE: init_engines() can be called more than once (ctor + pipeline_init_all); clear first so the
-  // wrapper/cond/scale vectors don't ACCUMULATE duplicates across calls.
+  // NOTE: init_engines() can be called more than once (ctor + librediffusion_pipeline_init_engines);
+  // clear first so the wrapper/cond/scale vectors don't ACCUMULATE duplicates across calls.
   controlnets_.clear();
   controlnet_cond_.clear();
   controlnet_scales_.clear();
@@ -324,12 +326,12 @@ void LibreDiffusionPipeline::init_buffers()
     temporal_state_.frame_id = 0;
   }
 
-  // CRITICAL: populate init_noise/stock_noise NOW. init_buffers() runs again from
-  // pipeline_init_all() AFTER the ctor's reseed(), re-allocating init_noise_ — so without this the
-  // freshly-allocated init_noise_ would be left UNFILLED (garbage) in the live img2img path (the
-  // shared-PCG noise generated in the ctor was thrown away by the re-alloc). reseed fills init_noise_
-  // with the shared launch_randn_fp16 PCG32 (matches Python pcg32_randn), zeros stock_noise, and
-  // seeds the v2v temporal buffers.
+  // CRITICAL: populate init_noise/stock_noise NOW. init_buffers() can run again (reinit_buffers,
+  // librediffusion_pipeline_init_buffers) AFTER the ctor's reseed(), re-allocating init_noise_ — so
+  // without this the freshly-allocated init_noise_ would be left UNFILLED (garbage) in the live
+  // img2img path (the shared-PCG noise generated in the ctor was thrown away by the re-alloc).
+  // reseed fills init_noise_ with the shared launch_randn_fp16 PCG32 (matches Python pcg32_randn),
+  // zeros stock_noise, and seeds the v2v temporal buffers.
   reseed(config_.seed);
 }
 
