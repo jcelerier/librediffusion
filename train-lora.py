@@ -131,6 +131,33 @@ class LoraSpec:
         return cls(path=spec, weight=1.0, weight_name=wn)
 
 
+def _resolve_weights_file(spec):
+    """"REPO|file" -> the downloaded file; anything else is a local path, returned as is."""
+    if "|" in spec:
+        from huggingface_hub import hf_hub_download
+        repo, fn = spec.split("|", 1)
+        return hf_hub_download(repo, fn)
+    return spec
+
+
+def load_unet_weights(unet, spec):
+    """Replace `unet`'s weights with the full state dict named by --unet. Strict, so a checkpoint for
+    another architecture (an SD1.5 UNet on an SDXL base, a ComfyUI single-file with prefixed keys)
+    fails here instead of exporting an engine that produces noise."""
+    if os.path.isdir(spec):
+        from diffusers import UNet2DConditionModel
+        sd = UNet2DConditionModel.from_pretrained(spec).state_dict()
+    else:
+        path = _resolve_weights_file(spec)
+        if path.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            sd = load_file(path)
+        else:
+            sd = torch.load(path, map_location="cpu", weights_only=True)
+    unet.load_state_dict(sd, strict=True)
+    print(f"Replaced UNet weights from {spec} ({len(sd)} tensors)")
+
+
 def _splice_lora_scale(onnx_path, out_path, ranks, adapter_names):
     """Add a runtime `lora_scale[N]` input to an UNFUSED-LoRA UNet ONNX (N = #runtime adapters).
 
@@ -255,6 +282,18 @@ def parse_args():
     p.add_argument("-o", "--output", default="./engines")
     p.add_argument("-l", "--lora", action="append", dest="loras", default=[], metavar="PATH[:WEIGHT]")
     p.add_argument("--lora-scale", type=float, default=1.0)
+    # Step-distilled models that ship ONLY a UNet on top of a stock base (DMD2, NitroFusion, ...):
+    # --model is the base the text encoders / scheduler come from, --unet replaces the UNet weights.
+    p.add_argument("--unet", default=None, metavar="REPO|FILE or PATH",
+                   help="sd15/sdxl: replace the base UNet's weights with this full UNet state dict "
+                        "(e.g. \"tianweiy/DMD2|dmd2_sdxl_1step_unet_fp16.bin\", a local .bin/"
+                        ".safetensors, or a diffusers UNet dir). Loaded strictly: it must match --model's "
+                        "UNet architecture.")
+    p.add_argument("--unet-timestep-scale", type=float, default=1.0, metavar="S",
+                   help="sd15/sdxl: models distilled with a shifted timestep: the UNet is fed and "
+                        "x0 is predicted at floor(t*S) while noise is injected at t. NitroFusion: 0.25 "
+                        "(Realism, shifted_timestep=250) or 0.5 (Vibrant, 500). Recorded in bundle.json "
+                        "as unet_timestep_scale and applied by the host; the engine itself is unchanged.")
     p.add_argument("--no-fuse-lora", action="store_true",
                    help="EXPERIMENT: keep the LoRA active as graph ops (unfused) instead of fusing it "
                         "into the weights. The trace then emits lora_A/lora_B matmuls (scale baked at "
@@ -323,6 +362,12 @@ def parse_args():
     a.opt_height = a.opt_height or a.max_height
     a.opt_width = a.opt_width or a.max_width
     a.lora_specs = [LoraSpec.parse(x) for x in a.loras]
+    if not 0.0 < a.unet_timestep_scale <= 1.0:
+        p.error("--unet-timestep-scale must be in (0, 1]")
+    if a.type not in ("sd15", "sdxl") and (a.unet or a.unet_timestep_scale != 1.0):
+        p.error("--unet / --unet-timestep-scale only apply to --type sd15/sdxl")
+    if a.type == "klein" and any(s.runtime for s in a.lora_specs):
+        p.error("--type klein bakes its LoRAs into the transformer; :runtime is not supported")
     # klein has its own native geometry (320x576) and the sd15/sdxl resolution defaults are meaningless
     # for it -- silently building a 1024x1024 klein would quadruple Lp and the engine with it. So the
     # klein path only takes a resolution the caller actually asked for.
@@ -333,6 +378,55 @@ def parse_args():
     a.klein_quality_explicit = any(arg == "--klein-quality" or arg.startswith("--klein-quality=")
                                    for arg in sys.argv[1:])
     return a
+
+
+def klein_fuse_loras(base_dir, specs, dst_prefix):
+    """Bake LoRAs into a klein snapshot that the klein scripts read like any other --model directory.
+
+    Only the transformer is rewritten; every other entry is a symlink into base_dir, so this costs one
+    transformer (~7.7 GB) and not a whole snapshot. The directory name carries a hash of the base and
+    the LoRA list: a different list gets a fresh snapshot, and with it a fresh calibration, since the
+    calibration reuse check keys on the model dir."""
+    import hashlib, json, shutil
+    from diffusers import Flux2KleinPipeline
+    key = json.dumps({"base": os.path.realpath(base_dir), "loras": [vars(s) for s in specs]},
+                     sort_keys=True)
+    dst = f"{dst_prefix}-{hashlib.sha256(key.encode()).hexdigest()[:12]}"
+    if os.path.exists(os.path.join(dst, "fused_loras.json")):
+        print(f"[klein] reusing LoRA-fused snapshot {dst}")
+        return dst
+
+    pipe = Flux2KleinPipeline.from_pretrained(base_dir, text_encoder=None, tokenizer=None, vae=None,
+                                              torch_dtype=torch.bfloat16)
+    for i, s in enumerate(specs):
+        kw = {"weight_name": s.weight_name} if s.weight_name else {}
+        # Everything else in the snapshot is shared with the base, so a LoRA that also adapts the text
+        # encoder cannot be honoured here; refuse it rather than drop half of it.
+        sd = Flux2KleinPipeline.lora_state_dict(s.path, **kw)
+        sd = sd[0] if isinstance(sd, tuple) else sd
+        foreign = sorted({k.split(".", 1)[0] for k in sd if not k.startswith("transformer.")})
+        if foreign:
+            raise SystemExit(f"[klein] LoRA {s.path} adapts {foreign}, only transformer LoRAs are supported")
+        name = f"lora{i}"
+        pipe.load_lora_weights(s.path, adapter_name=name, **kw)
+        pipe.fuse_lora(components=["transformer"], adapter_names=[name], lora_scale=s.weight)
+        print(f"[klein] fused LoRA {s.path} (weight_name={s.weight_name}) @ {s.weight}")
+    pipe.unload_lora_weights()
+
+    tmp = dst + ".partial"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    pipe.transformer.save_pretrained(os.path.join(tmp, "transformer"))
+    for entry in os.listdir(base_dir):
+        if entry != "transformer":
+            os.symlink(os.path.realpath(os.path.join(base_dir, entry)), os.path.join(tmp, entry))
+    with open(os.path.join(tmp, "fused_loras.json"), "w") as f:
+        f.write(key)
+    shutil.rmtree(dst, ignore_errors=True)
+    os.rename(tmp, dst)
+    del pipe
+    print(f"[klein] LoRA-fused snapshot -> {dst}")
+    return dst
 
 
 def export_klein(args):
@@ -358,6 +452,9 @@ def export_klein(args):
             "first:\n  hf download black-forest-labs/FLUX.2-klein-4B "
             "--exclude flux-2-klein-4b.safetensors\n(the single-file .safetensors is not used by this "
             "export; excluding it saves 7.3 GB)")
+    base_model_dir = model_dir
+    if args.lora_specs:
+        model_dir = klein_fuse_loras(model_dir, args.lora_specs, out + "_model-klein")
     width = args.opt_width if args.resolution_explicit else 320
     height = args.opt_height if args.resolution_explicit else 576
     lp = (height // 16) * (width // 16)
@@ -484,7 +581,9 @@ def export_klein(args):
     write_manifest(out, {
         "model_type": "klein",
         "model_family": "flux2",
-        "base_model": "black-forest-labs/FLUX.2-klein-4B",
+        # A non-directory --model always resolves to the cached FLUX.2-klein-4B snapshot (see above).
+        "base_model": base_model_dir if os.path.isdir(args.model) else "black-forest-labs/FLUX.2-klein-4B",
+        "loras": args.loras,
         "resolution": {"width": width, "height": height},
         "denoising_steps": 2,
         "precision": ("fp8+bf16" if quality == "both"
@@ -628,6 +727,8 @@ def main():
 
     Pipe = StableDiffusionXLPipeline if is_sdxl else StableDiffusionPipeline
     pipe = Pipe.from_pretrained(args.model).to(device=device, dtype=dtype)
+    if args.unet:
+        load_unet_weights(pipe.unet, args.unet)
 
     stream = StreamDiffusion(pipe, t_index_list=[30, 45], torch_dtype=dtype, cfg_type="none")
 
@@ -999,6 +1100,9 @@ def main():
         "model_type": args.type,                       # sd15 | sdxl
         "model_family": "sdxl" if is_sdxl else "sd",
         "base_model": args.model,
+        "unet": args.unet,
+        # Host side: UNet input and x0 coefficients at floor(t * scale), noise injection at t (NitroFusion).
+        "unet_timestep_scale": args.unet_timestep_scale,
         "embedding_dim": embedding_dim,
         "resolution": {"min": args.min_resolution, "max": args.max_resolution,
                        "opt_width": args.opt_width, "opt_height": args.opt_height},

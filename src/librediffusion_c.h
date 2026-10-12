@@ -598,6 +598,29 @@ librediffusion_set_delta(librediffusion_pipeline_handle pipeline, float delta);
 /*===========================================================================*/
 
 /**
+ * Set the coefficients noise is injected with, when they differ from the denoising ones.
+ *
+ * Models distilled with a shifted UNet timestep (NitroFusion) predict x0 with the coefficients of
+ * the shifted t -- pass those to librediffusion_prepare_scheduler, along with the shifted t as the
+ * timesteps -- while their input is noised, by the img2img encode and between steps, at the
+ * original t: pass that t's sqrt(alpha_cumprod) / sqrt(1 - alpha_cumprod) here.
+ *
+ * Optional. Call it AFTER librediffusion_prepare_scheduler, which clears it: until then noise is
+ * injected with prepare_scheduler's own alpha/beta, as it always was.
+ *
+ * @param pipeline          Pipeline handle
+ * @param alpha_prod_t_sqrt sqrt(alpha_cumprod) at each step's noise level [num_timesteps]
+ * @param beta_prod_t_sqrt  sqrt(1 - alpha_cumprod) at each step's noise level [num_timesteps]
+ * @param num_timesteps     Same count as the prepare_scheduler schedule; 0 clears the override
+ * @return LIBREDIFFUSION_SUCCESS, or LIBREDIFFUSION_ERROR_INVALID_ARGUMENT on a length mismatch or a
+ *         call before prepare_scheduler
+ */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_prepare_noise_schedule(
+    librediffusion_pipeline_handle pipeline, const float* alpha_prod_t_sqrt,
+    const float* beta_prod_t_sqrt, size_t num_timesteps);
+
+/**
  * Run image-to-image inference with CPU RGBA buffers.
  *
  * @param pipeline         Pipeline handle

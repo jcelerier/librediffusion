@@ -989,6 +989,22 @@ librediffusion_prepare_scheduler(
 }
 
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_prepare_noise_schedule(
+    librediffusion_pipeline_handle pipeline, const float* alpha_prod_t_sqrt,
+    const float* beta_prod_t_sqrt, size_t num_timesteps)
+{
+  if (!valid(pipeline))
+    return LIBREDIFFUSION_ERROR_NOT_INITIALIZED;
+  if (num_timesteps > 0 && (!alpha_prod_t_sqrt || !beta_prod_t_sqrt))
+    return LIBREDIFFUSION_ERROR_NULL_POINTER;
+
+  return try_catch_wrapper(pipeline->device, [&]() {
+    pipeline->cpp_pipeline->prepare_noise_schedule(
+        {alpha_prod_t_sqrt, num_timesteps}, {beta_prod_t_sqrt, num_timesteps});
+  });
+}
+
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_set_init_noise(
     librediffusion_pipeline_handle pipeline, const librediffusion_half_t* noise)
 {

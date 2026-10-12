@@ -18,6 +18,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace librediffusion
@@ -247,6 +248,15 @@ public:
       std::span<float> c_out              // [num_timesteps] - output scaling
   );
 
+  // Noise-injection coefficients, for models whose noise level and denoising timestep differ: a
+  // model distilled with a shifted UNet timestep (NitroFusion) predicts x0 with the coefficients of
+  // the shifted t (prepare_scheduler) while its input is noised -- by the img2img encode and between
+  // steps -- at the original t (these). Optional: until it is called, and after every
+  // prepare_scheduler (which clears it), noise is injected with prepare_scheduler's alpha/beta.
+  // Same length as that schedule; empty spans clear the override.
+  void prepare_noise_schedule(
+      std::span<const float> alpha_prod_t_sqrt, std::span<const float> beta_prod_t_sqrt);
+
   // Is the pipeline in a state where txt2img()/img2img() can legally run? The constructor brings up
   // CUDA, the engines and the buffers but NOT the conditioning or the scheduler coefficients, which
   // arrive later from the host. Returns nullptr when ready, else a static string naming what is
@@ -279,6 +289,9 @@ public:
   float beta_at(int i) const;
   float c_skip_at(int i) const;
   float c_out_at(int i) const;
+  // The coefficients noise is injected with: prepare_noise_schedule's, else alpha_at / beta_at.
+  float noise_alpha_at(int i) const;
+  float noise_beta_at(int i) const;
 
   // Set initial noise from Python (for testing/validation)
   void set_init_noise(const __half* noise); // [denoising_steps, 4, latent_h, latent_w]
@@ -467,6 +480,10 @@ public:
   std::unique_ptr<CUDATensor<__half>> model_pred_tmp_;
   std::unique_ptr<CUDATensor<__half>> unet_output_buffer_;
 
+  // SDXL pooled text_embeds / time_ids tiled to the UNet batch (tile_sdxl_conditioning; grow-only).
+  std::unique_ptr<CUDATensor<__half>> sdxl_tiled_text_embeds_;
+  std::unique_ptr<CUDATensor<__half>> sdxl_tiled_time_ids_;
+
   // Multi-step batched persistent scratch — hoisted from per-call stack CUDATensors so the batched
   // denoise path does NO per-frame cudaMalloc (was the "spurious allocations" FIXME); grow-on-first-use.
   // Prerequisite for capturing the multi-step path into a CUDA graph (a per-call malloc is illegal
@@ -476,8 +493,6 @@ public:
   std::unique_ptr<CUDATensor<__half>> mp_denoised_;
   std::unique_ptr<CUDATensor<__half>> mp_concatenated_;
   std::unique_ptr<CUDATensor<float>>  mp_unet_input_latent_fp32_;
-  std::unique_ptr<CUDATensor<__half>> mp_tiled_text_embeds_;
-  std::unique_ptr<CUDATensor<__half>> mp_tiled_time_ids_;
   std::unique_ptr<CUDATensor<__half>> mp_ext_ehs_;
 
   // Scheduler parameters
@@ -489,6 +504,9 @@ public:
   // Host-side copies of scheduler parameters for CPU access
   std::vector<float> alpha_prod_t_sqrt_host_;
   std::vector<float> beta_prod_t_sqrt_host_;
+  // prepare_noise_schedule override; empty = inject noise with the denoising coefficients
+  std::vector<float> noise_alpha_host_;
+  std::vector<float> noise_beta_host_;
   std::vector<float> c_skip_host_;
   std::vector<float> c_out_host_;
   std::unique_ptr<CUDATensor<float>> sub_timesteps_;
@@ -551,13 +569,21 @@ public:
   cudaGraph_t graph_ = nullptr;
   cudaGraphExec_t graph_exec_ = nullptr;
   uint64_t graph_sig_ = 0;
-  // Fixed staging buffer for the single_step input latent: the graph bakes the load_d2d SOURCE pointer,
+  // Fixed staging buffer for the input latent: the graph bakes the load_d2d SOURCE pointer,
   // so the volatile caller pointer must be staged into THIS persistent buffer before the captured region.
   std::unique_ptr<CUDATensor<__half>> graph_in_staging_;
   // Hoisted IP-Adapter extended-ehs buffer (was a per-frame stack CUDATensor -> illegal cudaMalloc in capture).
   std::unique_ptr<CUDATensor<__half>> ip_ext_ehs_;
   uint64_t capture_signature() const;            // recapture key: config + persistent-buffer device addresses
+  std::pair<const __half*, const __half*> tile_sdxl_conditioning(int unet_batch_size, cudaStream_t stream);
+  // The device work of one predict_x0_batch call: the 1-step body, or the denoise-batch multi-step body.
+  using GraphBody = void (LibreDiffusionPipeline::*)(const __half*, __half*, cudaStream_t);
+  GraphBody graph_body_ = nullptr;               // the body graph_ was captured from (part of the recapture key)
+  const __half* graph_out_ = nullptr;            // the output address graph_ writes (baked into the graph)
+  bool graph_capturable() const;                 // the config gate for graph_enabled_
+  void run_graphed(GraphBody body, const __half* x_t_latent_in, __half* x_0_pred_out, cudaStream_t stream);
   void run_single_step_body(const __half* x_t_latent_in, __half* x_0_pred_out, cudaStream_t stream);
+  void run_multi_step_batched_body(const __half* x_t_latent_in, __half* x_0_pred_out, cudaStream_t stream);
 
   // StreamV2V temporal state
   TemporalState temporal_state_;
@@ -573,11 +599,7 @@ public:
   void scheduler_step_batch(
       const __half* model_pred, const __half* x_t_latent, __half* denoised_out, int idx,
       int N, cudaStream_t stream);
-  void predict_x0_batch_impl_single_step(
-      const __half* x_t_latent_in, __half* x_0_pred_out, cudaStream_t stream);
   void predict_x0_batch_impl_multi_step_sequential(
-      const __half* x_t_latent_in, __half* x_0_pred_out, cudaStream_t stream);
-  void predict_x0_batch_impl_multi_step_batched(
       const __half* x_t_latent_in, __half* x_0_pred_out, cudaStream_t stream);
 
   void apply_cfg(

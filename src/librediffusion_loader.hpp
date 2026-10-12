@@ -99,6 +99,7 @@ public:
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, prepare_negative_embeds);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, prepare_sdxl_conditioning);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, prepare_scheduler);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, prepare_noise_schedule);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, blend_embeds);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, set_init_noise);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, reseed);
@@ -394,6 +395,7 @@ private:
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, prepare_negative_embeds);
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, prepare_sdxl_conditioning);
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, prepare_scheduler);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, prepare_noise_schedule);
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, set_init_noise);
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, reseed);
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, set_guidance_scale);
