@@ -436,7 +436,7 @@ public:
   LibreDiffusionConfig config_;
 
   // CUDA stream for async operations
-  cudaStream_t stream_;
+  cudaStream_t stream_{};
 
   NppStreamContext npp_stream_;
 

@@ -3,7 +3,9 @@
 
 #include "model_cache.hpp"
 
+#include <initializer_list>
 #include <stdexcept>
+#include <utility>
 
 namespace librediffusion
 {
@@ -20,6 +22,41 @@ makeContext(std::shared_ptr<CachedTensorRTEngine>& eng, const std::string& path)
   if(!ctx)
     throw std::runtime_error("klein: failed to create context: " + path);
   return ctx;
+}
+
+const char* dtypeName(nvinfer1::DataType t)
+{
+  switch(t)
+  {
+    case nvinfer1::DataType::kFLOAT: return "fp32";
+    case nvinfer1::DataType::kHALF: return "fp16";
+    case nvinfer1::DataType::kBF16: return "bf16";
+    case nvinfer1::DataType::kINT64: return "int64";
+    case nvinfer1::DataType::kINT32: return "int32";
+    default: return "another type";
+  }
+}
+
+// The forward()s bind raw device buffers sized for one element type, so an engine whose I/O differs
+// (an older exporter wrote the qwen output as fp32) would be written past the end of its buffer: an
+// illegal address that loses the CUDA context. Refuse it at load instead.
+using TensorTypes = std::initializer_list<std::pair<const char*, nvinfer1::DataType>>;
+void requireTypes(const CachedTensorRTEngine& eng, const std::string& path, TensorTypes tensors)
+{
+  const nvinfer1::ICudaEngine* e = eng.getEngine();
+  for(const auto& [name, type] : tensors)
+  {
+    bool found = false;
+    for(int i = 0; i < e->getNbIOTensors() && !found; ++i)
+      found = std::string(e->getIOTensorName(i)) == name;
+    if(!found)
+      throw std::runtime_error(
+          "klein: " + path + " has no '" + name + "' tensor; rebuild it with train-lora.py");
+    if(const auto actual = e->getTensorDataType(name); actual != type)
+      throw std::runtime_error(
+          "klein: " + path + ": '" + name + "' is " + dtypeName(actual) + ", expected "
+          + dtypeName(type) + "; rebuild it with train-lora.py");
+  }
 }
 
 void bindIn(nvinfer1::IExecutionContext* ctx, const char* name, const void* ptr, nvinfer1::Dims d)
@@ -60,6 +97,14 @@ Flux2TransformerWrapper::~Flux2TransformerWrapper() = default;
 void Flux2TransformerWrapper::loadEngine(const std::string& p)
 {
   context_ = makeContext(cached_engine_, p);
+  requireTypes(
+      *cached_engine_, p,
+      {{"hidden_states", nvinfer1::DataType::kBF16},
+       {"encoder_hidden_states", nvinfer1::DataType::kBF16},
+       {"timestep", nvinfer1::DataType::kFLOAT},
+       {"img_ids", nvinfer1::DataType::kFLOAT},
+       {"txt_ids", nvinfer1::DataType::kFLOAT},
+       {"velocity", nvinfer1::DataType::kBF16}});
 }
 
 void Flux2TransformerWrapper::forward(
@@ -84,6 +129,11 @@ Qwen3EncoderWrapper::~Qwen3EncoderWrapper() = default;
 void Qwen3EncoderWrapper::loadEngine(const std::string& p)
 {
   context_ = makeContext(cached_engine_, p);
+  requireTypes(
+      *cached_engine_, p,
+      {{"input_ids", nvinfer1::DataType::kINT64},
+       {"attention_mask", nvinfer1::DataType::kINT64},
+       {"encoder_hidden_states", nvinfer1::DataType::kBF16}});
 }
 
 void Qwen3EncoderWrapper::forward(
@@ -104,6 +154,7 @@ KleinVAEEncoderWrapper::~KleinVAEEncoderWrapper() = default;
 void KleinVAEEncoderWrapper::loadEngine(const std::string& p)
 {
   context_ = makeContext(cached_engine_, p);
+  requireTypes(*cached_engine_, p, {{"image", nvinfer1::DataType::kBF16}, {"latent", nvinfer1::DataType::kBF16}});
 }
 void KleinVAEEncoderWrapper::encode(
     const __nv_bfloat16* image, __nv_bfloat16* latent, int batch, int H, int W, cudaStream_t stream)
@@ -121,6 +172,7 @@ KleinVAEDecoderWrapper::~KleinVAEDecoderWrapper() = default;
 void KleinVAEDecoderWrapper::loadEngine(const std::string& p)
 {
   context_ = makeContext(cached_engine_, p);
+  requireTypes(*cached_engine_, p, {{"latent", nvinfer1::DataType::kBF16}, {"image", nvinfer1::DataType::kBF16}});
 }
 void KleinVAEDecoderWrapper::decode(
     const __nv_bfloat16* latent, __nv_bfloat16* image, int batch, int h, int w, cudaStream_t stream)

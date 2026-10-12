@@ -266,7 +266,8 @@ librediffusion_config_get_denoising_steps(librediffusion_config_handle config);
 /*===========================================================================*/
 
 /**
- * Create a new StreamDiffusion pipeline.
+ * Create a new StreamDiffusion pipeline, ready to use: its CUDA stream, engines and buffers are
+ * initialized from the config.
  *
  * @param config       Configuration handle
  * @param[out] pipeline Pointer to receive the pipeline handle
@@ -334,8 +335,9 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_pipeline_init_buffers(librediffusion_pipeline_handle pipeline);
 
 /**
- * Convenience function to initialize everything.
- * Calls init_cuda, init_npp, init_engines, and init_buffers.
+ * Kept for compatibility: librediffusion_pipeline_create returns a fully initialized pipeline
+ * (CUDA stream, NPP, engines, buffers), so this only validates the handle. The individual
+ * init_* calls above re-run one stage.
  */
 LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_pipeline_init_all(librediffusion_pipeline_handle pipeline);
