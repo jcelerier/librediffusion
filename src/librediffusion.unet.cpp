@@ -107,8 +107,8 @@ void LibreDiffusionPipeline::add_noise(
     int t_index, int N, cudaStream_t stream)
 {
   // Access host-side copies (safe for CPU access)
-  float alpha = alpha_at(t_index);
-  float beta = beta_at(t_index);
+  float alpha = noise_alpha_at(t_index);
+  float beta = noise_beta_at(t_index);
 
   launch_add_noise_fp16(original_samples, noise, noisy_samples, alpha, beta, N, stream);
 }
@@ -164,7 +164,7 @@ void LibreDiffusionPipeline::scheduler_step_batch(
 }
 
 
-void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
+void LibreDiffusionPipeline::run_multi_step_batched_body(
     const __half* x_t_latent_in, __half* x_0_pred_out, cudaStream_t stream)
 {
   const int latent_size
@@ -389,22 +389,7 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
       // cudaErrorInvalidDevice in the scheduler step. Tile the single conditioning row to
       // unet_batch_size here. (Single-step turbo never hit this: unet_batch_size==1==batch_size.)
       const int pooled_dim = config_.pooled_embedding_dim;
-      const int time_ids_dim = config_.time_ids_dim;
-      const size_t tte_n = (size_t)unet_batch_size * pooled_dim;
-      const size_t tti_n = (size_t)unet_batch_size * time_ids_dim;
-      if(!mp_tiled_text_embeds_ || mp_tiled_text_embeds_->size() < tte_n)
-        mp_tiled_text_embeds_ = std::make_unique<CUDATensor<__half>>(tte_n);
-      if(!mp_tiled_time_ids_ || mp_tiled_time_ids_->size() < tti_n)
-        mp_tiled_time_ids_ = std::make_unique<CUDATensor<__half>>(tti_n);
-      CUDATensor<__half>& tiled_text_embeds = *mp_tiled_text_embeds_;
-      CUDATensor<__half>& tiled_time_ids = *mp_tiled_time_ids_;
-      for(int i = 0; i < unet_batch_size; i++)
-      {
-        cudaMemcpyAsync(tiled_text_embeds.data() + (size_t)i * pooled_dim, text_embeds_->data(),
-                        pooled_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
-        cudaMemcpyAsync(tiled_time_ids.data() + (size_t)i * time_ids_dim, time_ids_->data(),
-                        time_ids_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
-      }
+      const auto [tiled_text_embeds, tiled_time_ids] = tile_sdxl_conditioning(unet_batch_size, stream);
       if(controlnet_enabled_)
       {
         // SDXL + ControlNet (multi): run every net (same x_t/timestep/ehs + tiled SDXL conditioning +
@@ -413,12 +398,12 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
         const __half* mid_ptr = nullptr;
         int down_count = 0;
         run_controlnets(unet_input_latent_ptr, unet_input_timestep_ptr, unet_encoder_hidden_states_ptr,
-                        tiled_text_embeds.data(), tiled_time_ids.data(), unet_batch_size,
+                        tiled_text_embeds, tiled_time_ids, unet_batch_size,
                         config_.text_seq_len, config_.text_hidden_dim, pooled_dim,
                         down_ptrs, &mid_ptr, down_count, stream);
         unet_->forward_controlnet_sdxl(
             unet_input_latent_fp32.data(), unet_input_timestep_ptr, unet_encoder_hidden_states_ptr,
-            tiled_text_embeds.data(), tiled_time_ids.data(), down_ptrs, mid_ptr,
+            tiled_text_embeds, tiled_time_ids, down_ptrs, mid_ptr,
             unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
             config_.text_seq_len, config_.text_hidden_dim, config_.pooled_embedding_dim, stream);
       }
@@ -456,7 +441,7 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
         if(nlay <= 0) nlay = (int)ipadapter_scale_vec_.size();
         unet_->forward_ipadapter_sdxl(
             unet_input_latent_fp32.data(), unet_input_timestep_ptr, ext_ehs.data(),
-            tiled_text_embeds.data(), tiled_time_ids.data(),
+            tiled_text_embeds, tiled_time_ids,
             ipadapter_scale_vec_.data(), nlay,
             unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
             ext_tok, config_.text_hidden_dim, config_.pooled_embedding_dim, stream);
@@ -466,7 +451,7 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
         unet_->forward_sdxl(
             unet_input_latent_fp32.data(), unet_input_timestep_ptr,
             unet_encoder_hidden_states_ptr,
-            tiled_text_embeds.data(), tiled_time_ids.data(),
+            tiled_text_embeds, tiled_time_ids,
             unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
             config_.text_seq_len, config_.text_hidden_dim,
             config_.pooled_embedding_dim, stream);
@@ -770,7 +755,7 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
         {
           int denoised_offset = i * stride; // denoised[i] = x_0_pred[i]
           int buffer_offset = i * stride;   // buffer[i]
-          float alpha_next = alpha_at(i + 1); // alpha[i+1]
+          float alpha_next = noise_alpha_at(i + 1); // alpha[i+1], at the next step's noise level
           cudaMemcpyAsync(
               x_t_latent_buffer_->data() + buffer_offset, denoised.data() + denoised_offset,
               stride * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
@@ -836,20 +821,11 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_batched(
     {
       // Tile SDXL conditioning to unet_batch_size (see the primary batched path for rationale).
       const int pooled_dim = config_.pooled_embedding_dim;
-      const int time_ids_dim = config_.time_ids_dim;
-      CUDATensor<__half> tiled_text_embeds((size_t)unet_batch_size * pooled_dim);
-      CUDATensor<__half> tiled_time_ids((size_t)unet_batch_size * time_ids_dim);
-      for(int i = 0; i < unet_batch_size; i++)
-      {
-        cudaMemcpyAsync(tiled_text_embeds.data() + (size_t)i * pooled_dim, text_embeds_->data(),
-                        pooled_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
-        cudaMemcpyAsync(tiled_time_ids.data() + (size_t)i * time_ids_dim, time_ids_->data(),
-                        time_ids_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
-      }
+      const auto [tiled_text_embeds, tiled_time_ids] = tile_sdxl_conditioning(unet_batch_size, stream);
       unet_->forward_sdxl(
           unet_input_latent_fp32_2.data(), unet_input_timestep->data(),
           prompt_embeds_->data(),
-          tiled_text_embeds.data(), tiled_time_ids.data(),
+          tiled_text_embeds, tiled_time_ids,
           unet_output_ptr, unet_batch_size,
           config_.latent_height, config_.latent_width, config_.text_seq_len, config_.text_hidden_dim,
           config_.pooled_embedding_dim, stream);
@@ -1064,16 +1040,7 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
       // Tile SDXL conditioning to unet_batch_size (see the batched path for the full rationale:
       // text_embeds_/time_ids_ are sized config_.batch_size; the UNet runs unet_batch_size rows).
       const int pooled_dim = config_.pooled_embedding_dim;
-      const int time_ids_dim = config_.time_ids_dim;
-      CUDATensor<__half> tiled_text_embeds((size_t)unet_batch_size * pooled_dim);
-      CUDATensor<__half> tiled_time_ids((size_t)unet_batch_size * time_ids_dim);
-      for(int i = 0; i < unet_batch_size; i++)
-      {
-        cudaMemcpyAsync(tiled_text_embeds.data() + (size_t)i * pooled_dim, text_embeds_->data(),
-                        pooled_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
-        cudaMemcpyAsync(tiled_time_ids.data() + (size_t)i * time_ids_dim, time_ids_->data(),
-                        time_ids_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
-      }
+      const auto [tiled_text_embeds, tiled_time_ids] = tile_sdxl_conditioning(unet_batch_size, stream);
       if(controlnet_enabled_)
       {
         // SDXL + ControlNet in the sequential multi-step path (mirrors the batched site ~386):
@@ -1085,13 +1052,13 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
         int down_count = 0;
         run_controlnets(unet_input_latent->data(), unet_input_timestep->data(),
                         unet_encoder_hidden_states_seq->data(),
-                        tiled_text_embeds.data(), tiled_time_ids.data(), unet_batch_size,
+                        tiled_text_embeds, tiled_time_ids, unet_batch_size,
                         config_.text_seq_len, config_.text_hidden_dim, pooled_dim,
                         down_ptrs, &mid_ptr, down_count, stream);
         unet_->forward_controlnet_sdxl(
             unet_input_latent_fp32_seq.data(), unet_input_timestep->data(),
             unet_encoder_hidden_states_seq->data(),
-            tiled_text_embeds.data(), tiled_time_ids.data(), down_ptrs, mid_ptr,
+            tiled_text_embeds, tiled_time_ids, down_ptrs, mid_ptr,
             unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
             config_.text_seq_len, config_.text_hidden_dim, config_.pooled_embedding_dim, stream);
       }
@@ -1100,7 +1067,7 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
         unet_->forward_sdxl(
             unet_input_latent_fp32_seq.data(), unet_input_timestep->data(),
             unet_encoder_hidden_states_seq->data(),
-            tiled_text_embeds.data(), tiled_time_ids.data(),
+            tiled_text_embeds, tiled_time_ids,
             unet_output_ptr, unet_batch_size, config_.latent_height, config_.latent_width,
             config_.text_seq_len, config_.text_hidden_dim,
             config_.pooled_embedding_dim, stream);
@@ -1315,7 +1282,7 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
         // No noise: just scale with alpha
         // current_latent = alpha[idx+1] * x_0_pred
         int next_t_idx = idx + 1;
-        float alpha = alpha_at(next_t_idx);
+        float alpha = noise_alpha_at(next_t_idx);
 
         // Copy and scale x_0_pred by alpha
         current_latent.load_d2d(x_0_pred_step.data(), latent_size, stream);
@@ -1337,7 +1304,38 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_multi_step_sequential(
   current_latent.store_d2d(x_0_pred_out, latent_size, stream);
 }
 
-// ---- CUDA-graph capture/replay wrapper around the 1-step device work ----
+// SDXL pooled text_embeds / time_ids are sized for one frame (config_.batch_size rows); the UNet runs
+// unet_batch_size rows (x2 for cfg full/initialize, x steps with denoise-batch), so every SDXL UNet call
+// tiles them first. The tiled copies live in grow-only members: a per-call allocation would be illegal
+// inside the 1-step CUDA graph capture, and the stable addresses are part of capture_signature().
+std::pair<const __half*, const __half*>
+LibreDiffusionPipeline::tile_sdxl_conditioning(int unet_batch_size, cudaStream_t stream)
+{
+  const int pooled_dim = config_.pooled_embedding_dim;
+  const int time_ids_dim = config_.time_ids_dim;
+  const size_t tte_n = (size_t)unet_batch_size * pooled_dim;
+  const size_t tti_n = (size_t)unet_batch_size * time_ids_dim;
+  if(!sdxl_tiled_text_embeds_ || sdxl_tiled_text_embeds_->size() < tte_n)
+  {
+    sdxl_tiled_text_embeds_ = std::make_unique<CUDATensor<__half>>(tte_n);
+    graph_ready_ = false;
+  }
+  if(!sdxl_tiled_time_ids_ || sdxl_tiled_time_ids_->size() < tti_n)
+  {
+    sdxl_tiled_time_ids_ = std::make_unique<CUDATensor<__half>>(tti_n);
+    graph_ready_ = false;
+  }
+  for(int i = 0; i < unet_batch_size; i++)
+  {
+    cudaMemcpyAsync(sdxl_tiled_text_embeds_->data() + (size_t)i * pooled_dim, text_embeds_->data(),
+                    pooled_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(sdxl_tiled_time_ids_->data() + (size_t)i * time_ids_dim, time_ids_->data(),
+                    time_ids_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
+  }
+  return {sdxl_tiled_text_embeds_->data(), sdxl_tiled_time_ids_->data()};
+}
+
+// ---- CUDA-graph capture/replay wrapper around the predict_x0_batch device work ----
 // capture_signature(): recapture key. Bakes everything the graph fixes — config geometry + the persistent
 // buffer device addresses the body reads/writes. If any address moves (resolution change, engine swap,
 // IP token resize), the signature changes -> recapture. Mirrors the Python allocate_buffers() graph-reset rule.
@@ -1363,6 +1361,17 @@ uint64_t LibreDiffusionPipeline::capture_signature() const
   if(predict_x0_batch_unet_output) h = mix(h, ptr(predict_x0_batch_unet_output->data()));
   if(predict_x0_batch_model_pred) h = mix(h, ptr(predict_x0_batch_model_pred->data()));
   if(predict_x0_batch_denoised) h = mix(h, ptr(predict_x0_batch_denoised->data()));
+  // denoise-batch multi-step body: its grow-only scratch, the shared UNet I/O buffers, and the
+  // persistent x_t_latent_buffer_ / init_noise_ it carries between frames.
+  for(const auto* b : {mp_x_t_latent_.get(), mp_model_pred_.get(), mp_denoised_.get(),
+                       mp_concatenated_.get(), mp_ext_ehs_.get(), unet_input_latent_.get(),
+                       unet_output_buffer_.get(), unet_encoder_hidden_states_.get(),
+                       x_t_latent_buffer_.get(), init_noise_.get()})
+    if(b) h = mix(h, ptr(b->data()));
+  if(mp_unet_input_latent_fp32_) h = mix(h, ptr(mp_unet_input_latent_fp32_->data()));
+  if(unet_input_timestep_) h = mix(h, ptr(unet_input_timestep_->data()));
+  h = mix(h, (uint64_t)config_.denoising_steps);
+  h = mix(h, (uint64_t)config_.do_add_noise);
   // Conditioning + scheduler buffers the captured body memcpy's from BY ADDRESS (prompt/negative embeds,
   // SDXL pooled text_embeds/time_ids, sub_timesteps + scheduler coeffs). The prepare_* now reuse these
   // in place for a fixed shape (stable address -> no recapture on a live prompt/timestep edit), but a
@@ -1372,6 +1381,8 @@ uint64_t LibreDiffusionPipeline::capture_signature() const
   if(negative_embeds_) h = mix(h, ptr(negative_embeds_->data()));
   if(text_embeds_) h = mix(h, ptr(text_embeds_->data()));
   if(time_ids_) h = mix(h, ptr(time_ids_->data()));
+  if(sdxl_tiled_text_embeds_) h = mix(h, ptr(sdxl_tiled_text_embeds_->data()));
+  if(sdxl_tiled_time_ids_) h = mix(h, ptr(sdxl_tiled_time_ids_->data()));
   if(sub_timesteps_) h = mix(h, ptr(sub_timesteps_->data()));
   if(alpha_prod_t_sqrt_) h = mix(h, ptr(alpha_prod_t_sqrt_->data()));
   if(beta_prod_t_sqrt_) h = mix(h, ptr(beta_prod_t_sqrt_->data()));
@@ -1397,15 +1408,15 @@ uint64_t LibreDiffusionPipeline::capture_signature() const
   return h;
 }
 
-void LibreDiffusionPipeline::predict_x0_batch_impl_single_step(
-    const __half* x_t_latent_in, __half* x_0_pred_out, cudaStream_t stream)
+void LibreDiffusionPipeline::run_graphed(
+    GraphBody body, const __half* x_t_latent_in, __half* x_0_pred_out, cudaStream_t stream)
 {
-  // Graph path: only for 1-step, non-V2V, cfg-none (graph_enabled_ already gates 1-step+non-V2V; cfg-none
-  // because the cfg-full/self/init post-process allocates per-frame scratch -> not capturable). All other
-  // configs fall through to a direct body call (per-call enqueue), unchanged behavior.
+  // Graph path: only for cfg-none (graph_enabled_ already gates the step/batch/V2V config; cfg-none
+  // because the cfg-full/self/init post-process allocates per-frame scratch and host-syncs -> not
+  // capturable). All other configs fall through to a direct body call (per-call enqueue).
   if(!graph_enabled_ || config_.cfg_type != 0)
   {
-    run_single_step_body(x_t_latent_in, x_0_pred_out, stream);
+    (this->*body)(x_t_latent_in, x_0_pred_out, stream);
     return;
   }
 
@@ -1420,13 +1431,13 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_single_step(
   graph_in_staging_->load_d2d(x_t_latent_in, latent_size, stream);
 
   const uint64_t sig = capture_signature();
-  if(!graph_ready_ || sig != graph_sig_)
+  if(!graph_ready_ || sig != graph_sig_ || body != graph_body_ || x_0_pred_out != graph_out_)
   {
     if(graph_exec_) { cudaGraphExecDestroy(graph_exec_); graph_exec_ = nullptr; }
     if(graph_)      { cudaGraphDestroy(graph_);          graph_ = nullptr; }
     // Warm enqueue (TRT requires a real enqueue before capture; also primes shapes/addresses). This run
     // also produces a VALID output for THIS frame, so we return after capturing.
-    run_single_step_body(graph_in_staging_->data(), x_0_pred_out, stream);
+    (this->*body)(graph_in_staging_->data(), x_0_pred_out, stream);
     cudaStreamSynchronize(stream);
     cudaError_t cap = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
     if(cap != cudaSuccess)
@@ -1437,15 +1448,16 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_single_step(
       graph_enabled_ = false;
       return;
     }
-    // The capture-run enqueue can FAIL by THROWING — e.g. SDXL UNets hit CUDA error 901
-    // (StreamCaptureUnsupported) at the time-embedding myelin node, so enqueueV3 returns false and the
-    // wrapper throws. We MUST still call cudaStreamEndCapture to take the stream OUT of capture mode
+    // The capture-run body can FAIL by THROWING — an engine with a non-capturable node (CUDA error 901,
+    // StreamCaptureUnsupported, makes enqueueV3 return false), or a CUDATensor allocated inside the body
+    // (cudaMalloc is illegal while capturing: keep every buffer the body touches persistent, see
+    // tile_sdxl_conditioning). We MUST still call cudaStreamEndCapture to take the stream OUT of capture mode
     // (otherwise the next op on this stream fails), then fall back to per-call enqueue — the warm run
     // above already produced THIS frame's output, so correctness holds.
     bool body_ok = true;
     try
     {
-      run_single_step_body(graph_in_staging_->data(), x_0_pred_out, stream);
+      (this->*body)(graph_in_staging_->data(), x_0_pred_out, stream);
     }
     catch(const std::exception& e)
     {
@@ -1486,6 +1498,8 @@ void LibreDiffusionPipeline::predict_x0_batch_impl_single_step(
     // very next frame's signature differ -> a forced recapture, and that recapture frame faulted
     // (ControlNet illegal memory access). Storing the post-alloc sig makes frame 2 match -> replay.
     graph_sig_ = capture_signature();
+    graph_body_ = body;
+    graph_out_ = x_0_pred_out;
     graph_ready_ = true;
     return;  // warm run already wrote x_0_pred_out for this frame
   }
@@ -1636,16 +1650,7 @@ void LibreDiffusionPipeline::run_single_step_body(
     // batched path. Single-step turbo with batch_size==1 was the only previously-exercised SDXL case,
     // so this only mattered once batch_size>1 / cfg doubling landed.
     const int pooled_dim = config_.pooled_embedding_dim;
-    const int time_ids_dim = config_.time_ids_dim;
-    CUDATensor<__half> tiled_text_embeds((size_t)unet_batch_size * pooled_dim);
-    CUDATensor<__half> tiled_time_ids((size_t)unet_batch_size * time_ids_dim);
-    for(int i = 0; i < unet_batch_size; i++)
-    {
-      cudaMemcpyAsync(tiled_text_embeds.data() + (size_t)i * pooled_dim, text_embeds_->data(),
-                      pooled_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
-      cudaMemcpyAsync(tiled_time_ids.data() + (size_t)i * time_ids_dim, time_ids_->data(),
-                      time_ids_dim * sizeof(__half), cudaMemcpyDeviceToDevice, stream);
-    }
+    const auto [tiled_text_embeds, tiled_time_ids] = tile_sdxl_conditioning(unet_batch_size, stream);
     if(controlnet_enabled_)
     {
       // SDXL + ControlNet in the single-step path (mirrors the batched site ~386): run every net
@@ -1658,14 +1663,14 @@ void LibreDiffusionPipeline::run_single_step_body(
       run_controlnets(predict_x0_batch_unet_input_latent->data(),
                       predict_x0_batch_unet_input_timestep->data(),
                       predict_x0_batch_unet_encoder_hidden_states_single->data(),
-                      tiled_text_embeds.data(), tiled_time_ids.data(), unet_batch_size,
+                      tiled_text_embeds, tiled_time_ids, unet_batch_size,
                       config_.text_seq_len, config_.text_hidden_dim, pooled_dim,
                       down_ptrs, &mid_ptr, down_count, stream);
       unet_->forward_controlnet_sdxl(
           predict_x0_batch_unet_input_latent_fp32_single->data(),
           predict_x0_batch_unet_input_timestep->data(),
           predict_x0_batch_unet_encoder_hidden_states_single->data(),
-          tiled_text_embeds.data(), tiled_time_ids.data(), down_ptrs, mid_ptr,
+          tiled_text_embeds, tiled_time_ids, down_ptrs, mid_ptr,
           predict_x0_batch_unet_output->data(), unet_batch_size, config_.latent_height,
           config_.latent_width, config_.text_seq_len, config_.text_hidden_dim,
           config_.pooled_embedding_dim, stream);
@@ -1707,7 +1712,7 @@ void LibreDiffusionPipeline::run_single_step_body(
       unet_->forward_ipadapter_sdxl(
           predict_x0_batch_unet_input_latent_fp32_single->data(),
           predict_x0_batch_unet_input_timestep->data(), ext_ehs,
-          tiled_text_embeds.data(), tiled_time_ids.data(),
+          tiled_text_embeds, tiled_time_ids,
           ipadapter_scale_vec_.data(), nlay,
           predict_x0_batch_unet_output->data(), unet_batch_size, config_.latent_height,
           config_.latent_width, ext_tok, config_.text_hidden_dim,
@@ -1719,7 +1724,7 @@ void LibreDiffusionPipeline::run_single_step_body(
           predict_x0_batch_unet_input_latent_fp32_single->data(),
           predict_x0_batch_unet_input_timestep->data(),
           predict_x0_batch_unet_encoder_hidden_states_single->data(),
-          tiled_text_embeds.data(), tiled_time_ids.data(),
+          tiled_text_embeds, tiled_time_ids,
           predict_x0_batch_unet_output->data(), unet_batch_size, config_.latent_height,
           config_.latent_width, config_.text_seq_len, config_.text_hidden_dim,
           config_.pooled_embedding_dim, stream);
@@ -1817,7 +1822,7 @@ void LibreDiffusionPipeline::run_single_step_body(
   }
 
   // StreamV2V temporal coherence is handled by the live kvo_cache design (forward_v2v) on the
-  // batched denoising path (predict_x0_batch_impl_multi_step_batched). The legacy post-hoc
+  // batched denoising path (run_multi_step_batched_body). The legacy post-hoc
   // attention-output feature injection that used to live here was removed: it operated on
   // getAttentionBuffers() AFTER the whole engine ran (a no-op — a static TRT graph can't be
   // re-injected from outside) and targeted attention_* outputs that only the dead tensorrt_orig
@@ -1918,7 +1923,8 @@ void LibreDiffusionPipeline::predict_x0_batch(
   {
     if(config_.use_denoising_batch)
     {
-      predict_x0_batch_impl_multi_step_batched(x_t_latent_in, x_0_pred_out, stream);
+      run_graphed(&LibreDiffusionPipeline::run_multi_step_batched_body, x_t_latent_in, x_0_pred_out,
+                  stream);
     }
     else
     {
@@ -1927,7 +1933,7 @@ void LibreDiffusionPipeline::predict_x0_batch(
   }
   else
   {
-    predict_x0_batch_impl_single_step(x_t_latent_in, x_0_pred_out, stream);
+    run_graphed(&LibreDiffusionPipeline::run_single_step_body, x_t_latent_in, x_0_pred_out, stream);
   }
 }
 }

@@ -32,6 +32,12 @@ All commands run as `uv run python train-lora.py <args>`. Resolution flags are
 `--min-resolution/--max-resolution/--opt-width/--opt-height` (512 for SD1.5, 1024 for SDXL);
 add `-l REPO` (or `-l "REPO|file.safetensors"`) to fuse a LoRA, repeatable to stack LoRAs.
 
+Batch flags decide how many denoising steps a bundle can run. With denoise-batch on, the UNet runs
+one row per step, so **`--max-batch` must be >= the step count** you intend to use; a static bundle
+(`--min-batch 1 --max-batch 1`) is 1-step only, and is ~10-13% faster at batch 1 than a dynamic one.
+Non-square geometry uses `--min-width/--max-width/--min-height/--max-height` instead of
+`--min-resolution/--max-resolution`.
+
 ### On Windows: pass `--cache-dir` on the build volume
 
 uv's cache defaults to `%LOCALAPPDATA%\uv\cache` on `C:`. The engine-build venv is ~10 GB of
@@ -70,17 +76,36 @@ train-lora.py --type sd15 --model SimianLuo/LCM_Dreamshaper_v7         --min-res
 train-lora.py --type sd15 --model Lykon/dreamshaper-8-lcm              --min-resolution 512 --max-resolution 512  --output engines/dreamshaper-8-lcm
 train-lora.py --type sd15 --model IDKiro/sdxs-512-dreamshaper          --min-resolution 512 --max-resolution 512  --output engines/sdxs
 train-lora.py --type sd15 --model runwayml/stable-diffusion-v1-5 -l latent-consistency/lcm-lora-sdv1-5            --min-resolution 512 --max-resolution 512 --output engines/sd15-lcm-lora
-train-lora.py --type sd15 --model runwayml/stable-diffusion-v1-5 -l "ByteDance/Hyper-SD|Hyper-SD15-4steps-lora.safetensors" --min-resolution 512 --max-resolution 512 --output engines/hyper-sd15
+train-lora.py --type sd15 --model runwayml/stable-diffusion-v1-5 -l "ByteDance/Hyper-SD|Hyper-SD15-4steps-lora.safetensors" --min-resolution 512 --max-resolution 512 --max-batch 4 --output engines/hyper-sd15
+train-lora.py --type sd15 --model runwayml/stable-diffusion-v1-5 -l "ByteDance/Hyper-SD|Hyper-SD15-1step-lora.safetensors"  --min-resolution 512 --max-resolution 512 --min-batch 1 --max-batch 1 --opt-batch 1 --output engines/hyper-sd15-1step
+train-lora.py --type sd15 --model runwayml/stable-diffusion-v1-5 -l "ByteDance/Hyper-SD|Hyper-SD15-2steps-lora.safetensors" --min-resolution 512 --max-resolution 512 --max-batch 2 --output engines/hyper-sd15-2step
+# SD2.1 shares the sd15 path but encodes to 1024 (the bundle manifest carries embedding_dim; the node reads it)
+train-lora.py --type sd15 --model sd-research/stable-diffusion-2-1-base --min-resolution 512 --max-resolution 512 --min-batch 1 --max-batch 1 --opt-batch 1 --output engines/sd21-base-1step
+train-lora.py --type sd15 --model sd-research/stable-diffusion-2-1-base --min-resolution 512 --max-resolution 512 --max-batch 4 --output engines/sd21-base-4step
+# non-square / larger SD-Turbo (one bundle per geometry: the profile is baked in)
+train-lora.py --type sd15 --model stabilityai/sd-turbo --min-width 512 --max-width 512 --min-height 768 --max-height 768 --min-batch 1 --max-batch 1 --opt-batch 1 --output engines/sd-turbo-512x768
+train-lora.py --type sd15 --model stabilityai/sd-turbo --min-resolution 768 --max-resolution 768 --min-batch 1 --max-batch 1 --opt-batch 1 --output engines/sd-turbo-768
 
 # SDXL family (--type sdxl)
 train-lora.py --type sdxl --model stabilityai/sdxl-turbo                            --min-resolution 1024 --max-resolution 1024 --output engines/sdxl-turbo
+train-lora.py --type sdxl --model stabilityai/sdxl-turbo                            --min-resolution 512  --max-resolution 512  --min-batch 1 --max-batch 1 --opt-batch 1 --output engines/sdxl-turbo-512
 train-lora.py --type sdxl --model stabilityai/stable-diffusion-xl-base-1.0 -l latent-consistency/lcm-lora-sdxl   --min-resolution 1024 --max-resolution 1024 --output engines/sdxl-lcm-lora
 train-lora.py --type sdxl --model stabilityai/stable-diffusion-xl-base-1.0 -l "ByteDance/Hyper-SD|Hyper-SDXL-4steps-lora.safetensors" --min-resolution 1024 --max-resolution 1024 --output engines/hyper-sdxl
 train-lora.py --type sdxl --model stabilityai/stable-diffusion-xl-base-1.0 -l "ByteDance/SDXL-Lightning|sdxl_lightning_4step_lora.safetensors" --min-resolution 1024 --max-resolution 1024 --output engines/sdxl-lightning
 train-lora.py --type sdxl --model segmind/Segmind-Vega -l segmind/Segmind-VegaRT    --min-resolution 1024 --max-resolution 1024 --output engines/vega-rt
+# SDXL with a distilled replacement UNet (--unet "REPO|file", a local file or a diffusers dir; loaded strictly)
+# DMD2 4-step UNet: the DMD2 for video. img2img at 1-2 steps (Timesteps "32, 45"); its 4 steps are for txt2img
+# ("0, 12, 25, 37", its trained 999/749/499/249), and need --max-batch 4 with denoise-batch. CC-BY-NC-4.0.
+train-lora.py --type sdxl --model stabilityai/stable-diffusion-xl-base-1.0 --unet "tianweiy/DMD2|dmd2_sdxl_4step_unet_fp16.bin" --min-resolution 1024 --max-resolution 1024 --max-batch 4 --opt-batch 4 --output engines/dmd2-sdxl-4step
+# DMD2 1-step UNet: txt2img only (trained from pure noise at t=399; img2img input comes out blurred)
+train-lora.py --type sdxl --model stabilityai/stable-diffusion-xl-base-1.0 --unet "tianweiy/DMD2|dmd2_sdxl_1step_unet_fp16.bin" --min-resolution 1024 --max-resolution 1024 --min-batch 1 --max-batch 1 --opt-batch 1 --output engines/dmd2-sdxl-1step
+# NitroFusion: the UNet was distilled on a shifted timestep; --unet-timestep-scale records it in bundle.json for the host
+train-lora.py --type sdxl --model stabilityai/stable-diffusion-xl-base-1.0 --unet "ChenDY/NitroFusion|nitrosd-realism_unet.safetensors" --unet-timestep-scale 0.25 --min-resolution 1024 --max-resolution 1024 --max-batch 2 --output engines/nitrosd-realism
+train-lora.py --type sdxl --model stabilityai/stable-diffusion-xl-base-1.0 --unet "ChenDY/NitroFusion|nitrosd-vibrant_unet.safetensors" --unet-timestep-scale 0.5  --min-resolution 1024 --max-resolution 1024 --max-batch 2 --output engines/nitrosd-vibrant
 
 # img2img-turbo (GaParmar pix2pix-turbo skip-VAE)
 train-lora.py --type img2img-turbo --model edge_to_image --min-resolution 512 --max-resolution 512 --output engines/img2img-turbo
+train-lora.py --type img2img-turbo --model sketch_to_image_stochastic --min-resolution 512 --max-resolution 512 --output engines/img2img-turbo-sketch
 ```
 
 ### FLUX.2-klein-4B (`--type klein`)
@@ -91,6 +116,11 @@ that this export does not read, so excluding it saves 7.3 GB of the 23 GB:
 ```bash
 hf download black-forest-labs/FLUX.2-klein-4B --exclude flux-2-klein-4b.safetensors
 train-lora.py --type klein --model black-forest-labs/FLUX.2-klein-4B --output engines/klein
+# klein at a non-square geometry needs its own VAE pair; transformer/qwen/rife are geometry-agnostic and can be reused
+train-lora.py --type klein --model black-forest-labs/FLUX.2-klein-4B --opt-width 576 --opt-height 320 --output engines/klein-landscape
+# klein + a LoRA (fused into a transformer-only copy of the model next to the bundle, then exported
+# from it, FP8 calibration included). SANA-Sprint makes 1 step usable (Timesteps "1.0"):
+train-lora.py --type klein --model black-forest-labs/FLUX.2-klein-4B -l radames/FLUX.2-klein-Sana-Sprint --output engines/klein-sprint
 ```
 
 One command, same as the models above: it runs the reference pipeline once to get the FP8
@@ -117,6 +147,30 @@ rerun reuses an existing calibration directory.
 - `--hw-compat ampere_plus` makes the engines portable across SM 8.0+ instead of locked to the
   build GPU.
 
+### Frame interpolation (RIFE)
+
+The node's `Interpolation exp` control runs RIFE between consecutive diffused frames (2^exp displayed
+frames per diffused one). klein bundles always ship `rife_ifnet_fp16.plan`. RIFE works on decoded RGB
+frames, so one engine serves every model: add `--rife` to an SD / SDXL / img2img-turbo export to put
+it in that bundle, or build it once into the folder that holds the bundles (the node looks in the
+bundle folder, then in its parent):
+
+```bash
+python src/streamdiffusion/klein/build_rife.py src/streamdiffusion/klein/assets/rife_ifnet_fp16.onnx engines/rife_ifnet_fp16.plan
+```
+
+The engine covers 64..1024 px per side (`KLEIN_HW_COMPAT=ampere_plus` for a portable one). RIFE runs
+after each diffusion on the same producer thread, so it lowers the diffused rate; at 1024 on a 4090
+it costs ~7-13 ms per frame at exp 1 and ~21-26 ms at exp 2 (`validation_cpp/sd_video_harness --rife
+PLAN --rife-exp N` measures both):
+
+| SDXL 1024, img2img | diffused fps | displayed fps |
+|---|---|---|
+| sdxl-turbo 1 step, exp 1 | 12.6 | 25 |
+| sdxl-turbo 2 steps, exp 2 | 7.8 | 31 |
+| DMD2 2 steps, exp 2 | 8.0 | 32 |
+| DMD2 4 steps, exp 2 | 4.8 | 19 |
+
 ### ControlNet (`--controlnet REPO`)
 
 The ControlNet must match the base UNet's block/residual count: standard SD1.5/SDXL ControlNets
@@ -135,6 +189,11 @@ train-lora.py --type sd15 --model IDKiro/sdxs-512-dreamshaper --controlnet IDKir
 ```
 
 ### IP-Adapter (`--ipadapter CKPT`)
+
+`--ipadapter` produces a COMPLETE bundle: the IP cross-attention baked into `unet.engine` **and**
+the on-device image side (`clip_image_encoder.engine` + `ip_image_proj.engine`) that turns the node's
+Control/Style texture into IP tokens. Without the image side the node silently falls back to
+externally-fed tokens and the style image appears to do nothing.
 
 ```bash
 # SD1.5 (h94 ip-adapter_sd15.bin) — works on standard SD1.5 bases (NOT sdxs, whose attention differs)
@@ -158,6 +217,18 @@ train-lora.py --type sdxl --model stabilityai/stable-diffusion-xl-base-1.0 \
 train-lora.py --type sdxl --model stabilityai/sdxl-turbo \
   -l "ostris/ikea-instructions-lora-sdxl|ikea_instructions_xl_v1_5.safetensors" \
   --min-resolution 1024 --max-resolution 1024 --output engines/sdxlturbo-ikea
+```
+
+### Runtime LoRA (`-l PATH:runtime`)
+
+Fused LoRAs are baked at export time and cannot be changed later. Suffix a LoRA with `:runtime`
+instead to expose it as a `lora_scale` engine input, which the node's "LoRA scale" knob drives live
+(1 = fully on, matching a fused build). Costs ~2%.
+
+```bash
+train-lora.py --type sdxl --model stabilityai/stable-diffusion-xl-base-1.0 \
+  -l "/path/to/crayons_v1_sdxl.safetensors:runtime" \
+  --min-resolution 1024 --max-resolution 1024 --output engines/crayon-rt
 ```
 
 ### Optional flags

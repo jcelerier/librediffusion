@@ -9,9 +9,9 @@ void LibreDiffusionPipeline::add_noise_direct(
     __half* original_samples, const __half* noise, int t_index, int N,
     cudaStream_t stream)
 {
-  // Access host-side copies 
-  float alpha = alpha_at(t_index);
-  float beta = beta_at(t_index);
+  // Access host-side copies
+  float alpha = noise_alpha_at(t_index);
+  float beta = noise_beta_at(t_index);
 
   launch_add_noise_direct_fp16(original_samples, noise, alpha, beta, N, stream);
 }

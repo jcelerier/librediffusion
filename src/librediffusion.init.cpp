@@ -139,18 +139,16 @@ void LibreDiffusionPipeline::init_engines()
     }
   }
 
-  // CUDA graph: only the 1-step, non-V2V single_step path is capturable (multi-step has per-step host
-  // branches + a changing timestep). Gate strictly so enabling the flag on an unsupported config is a
+  // CUDA graph: gate strictly (graph_capturable) so enabling the flag on an unsupported config is a
   // silent no-op (falls back to per-call enqueue) rather than a capture failure.
   graph_ready_ = false;  // any engine (re)load invalidates a prior graph (buffer addresses moved)
-  graph_enabled_ = config_.use_cuda_graph
-                   && config_.denoising_steps == 1
-                   && config_.mode != PipelineMode::TEMPORAL_V2V;
+  graph_enabled_ = graph_capturable();
   if(config_.use_cuda_graph && !graph_enabled_)
-    std::cout << "Note: CUDA graph requested but config is not 1-step/non-V2V; using per-call enqueue"
+    std::cout << "Note: CUDA graph requested but config is V2V or multi-step without denoising batch; "
+                 "using per-call enqueue"
               << std::endl;
   else if(graph_enabled_)
-    std::cout << "Note: CUDA graph enabled (1-step single_step capture)" << std::endl;
+    std::cout << "Note: CUDA graph enabled (" << config_.denoising_steps << "-step capture)" << std::endl;
 }
 
 void LibreDiffusionPipeline::init_buffers()
@@ -187,7 +185,7 @@ void LibreDiffusionPipeline::init_buffers()
 
   // Case !denoising_batch && config_.denoising_steps == 1
   {
-    // See logic in predict_x0_batch_impl_single_step
+    // See logic in run_single_step_body
     predict_x0_batch_x_t_latent = std::make_unique<CUDATensor<__half>>(latent_size);
     {
       int total_batch = config_.batch_size
@@ -440,8 +438,16 @@ void LibreDiffusionPipeline::reinit_buffers(const LibreDiffusionConfig& new_conf
   // would also catch the address change, but re-evaluating graph_enabled_ here keeps a 1-step->multi-step or
   // ->V2V reconfigure from even attempting a capture.)
   graph_ready_ = false;
-  graph_enabled_ = config_.use_cuda_graph
-                   && config_.denoising_steps == 1
-                   && config_.mode != PipelineMode::TEMPORAL_V2V;
+  graph_enabled_ = graph_capturable();
+}
+
+// The 1-step body and the denoise-batch multi-step body (one batched UNet call, per-step work
+// unrolled on the host from the config) are capturable; the sequential multi-step path is not, and
+// V2V rolls a host-side K/V bank per frame. cfg-none is checked per call in run_graphed.
+bool LibreDiffusionPipeline::graph_capturable() const
+{
+  return config_.use_cuda_graph
+         && (config_.denoising_steps == 1 || config_.use_denoising_batch)
+         && config_.mode != PipelineMode::TEMPORAL_V2V;
 }
 }

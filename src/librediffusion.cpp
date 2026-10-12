@@ -118,6 +118,16 @@ float LibreDiffusionPipeline::beta_at(int i) const
 {
   return coeff_at(beta_prod_t_sqrt_host_, i, "beta_prod_t_sqrt");
 }
+float LibreDiffusionPipeline::noise_alpha_at(int i) const
+{
+  return noise_alpha_host_.empty() ? alpha_at(i)
+                                   : coeff_at(noise_alpha_host_, i, "noise alpha_prod_t_sqrt");
+}
+float LibreDiffusionPipeline::noise_beta_at(int i) const
+{
+  return noise_beta_host_.empty() ? beta_at(i)
+                                  : coeff_at(noise_beta_host_, i, "noise beta_prod_t_sqrt");
+}
 float LibreDiffusionPipeline::c_skip_at(int i) const
 {
   return coeff_at(c_skip_host_, i, "c_skip");
@@ -174,6 +184,10 @@ void LibreDiffusionPipeline::prepare_scheduler(
 {
   // Copy to host side
   alpha_prod_t_sqrt_host_.assign(alpha_prod_t_sqrt.begin(), alpha_prod_t_sqrt.end());
+  // A noise schedule set for the previous schedule has no meaning for this one (and may not even
+  // have its length); the host re-sends it after this call when it needs one.
+  noise_alpha_host_.clear();
+  noise_beta_host_.clear();
   beta_prod_t_sqrt_host_.assign(beta_prod_t_sqrt.begin(), beta_prod_t_sqrt.end());
   c_skip_host_.assign(c_skip.begin(), c_skip.end());
   c_out_host_.assign(c_out.begin(), c_out.end());
@@ -266,6 +280,34 @@ void LibreDiffusionPipeline::prepare_scheduler(
   // live timestep/coefficient edit must therefore force a recapture, exactly as set_lora_scale does for
   // its baked value. capture_signature() only hashes buffer ADDRESSES (stable here), so it cannot catch a
   // value-only change — hence this explicit invalidation.
+  graph_ready_ = false;
+}
+
+void LibreDiffusionPipeline::prepare_noise_schedule(
+    std::span<const float> alpha_prod_t_sqrt, std::span<const float> beta_prod_t_sqrt)
+{
+  if(alpha_prod_t_sqrt.empty() && beta_prod_t_sqrt.empty())
+  {
+    noise_alpha_host_.clear();
+    noise_beta_host_.clear();
+  }
+  else
+  {
+    const size_t n = alpha_prod_t_sqrt_host_.size();
+    if(n == 0)
+      throw invalid_argument_error("prepare_noise_schedule: call prepare_scheduler first");
+    if(alpha_prod_t_sqrt.size() != n || beta_prod_t_sqrt.size() != n)
+      throw invalid_argument_error(
+          "prepare_noise_schedule: expected " + std::to_string(n)
+          + " entries per array, like the prepare_scheduler schedule");
+    for(size_t i = 0; i < n; i++)
+      if(!std::isfinite(alpha_prod_t_sqrt[i]) || !std::isfinite(beta_prod_t_sqrt[i]))
+        throw invalid_argument_error("prepare_noise_schedule: non-finite coefficient");
+    noise_alpha_host_.assign(alpha_prod_t_sqrt.begin(), alpha_prod_t_sqrt.end());
+    noise_beta_host_.assign(beta_prod_t_sqrt.begin(), beta_prod_t_sqrt.end());
+  }
+  // The noise coefficients reach the kernels as by-value host scalars, so a captured graph would
+  // keep the old ones (see prepare_scheduler).
   graph_ready_ = false;
 }
 
