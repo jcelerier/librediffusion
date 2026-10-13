@@ -272,7 +272,7 @@ wheels = [
 [[package]]
 name = "diffusers"
 version = "0.38.0"
-source = { git = "https://github.com/jcelerier/diffusers.git?rev=kvo-cache-0.38#1b7b45ee24ee859724204266da2ef4958883214a" }
+source = { url = "https://github.com/jcelerier/diffusers/archive/1b7b45ee24ee859724204266da2ef4958883214a.tar.gz" }
 dependencies = [
     { name = "filelock" },
     { name = "httpx" },
@@ -284,16 +284,120 @@ dependencies = [
     { name = "requests" },
     { name = "safetensors" },
 ]
+sdist = { hash = "sha256:a2abb7db411cda02792b4e6ce7eb17229a9cace42c6d083202f19acdc65b8673" }
+
+[package.metadata]
+requires-dist = [
+    { name = "accelerate", marker = "extra == 'bitsandbytes'", specifier = ">=0.31.0" },
+    { name = "accelerate", marker = "extra == 'dev'", specifier = ">=0.31.0" },
+    { name = "accelerate", marker = "extra == 'gguf'", specifier = ">=0.31.0" },
+    { name = "accelerate", marker = "extra == 'optimum-quanto'", specifier = ">=0.31.0" },
+    { name = "accelerate", marker = "extra == 'torch'", specifier = ">=0.31.0" },
+    { name = "accelerate", marker = "extra == 'torchao'", specifier = ">=0.31.0" },
+    { name = "accelerate", marker = "extra == 'training'", specifier = ">=0.31.0" },
+    { name = "bitsandbytes", marker = "extra == 'bitsandbytes'", specifier = ">=0.43.3" },
+    { name = "compel", marker = "extra == 'dev'", specifier = "==0.1.8" },
+    { name = "compel", marker = "extra == 'test'", specifier = "==0.1.8" },
+    { name = "datasets", marker = "extra == 'dev'" },
+    { name = "datasets", marker = "extra == 'test'" },
+    { name = "datasets", marker = "extra == 'training'" },
+    { name = "filelock" },
+    { name = "flashpack", marker = "extra == 'flashpack'" },
+    { name = "flax", marker = "extra == 'dev'", specifier = ">=0.4.1" },
+    { name = "flax", marker = "extra == 'flax'", specifier = ">=0.4.1" },
+    { name = "ftfy", marker = "extra == 'dev'" },
+    { name = "ftfy", marker = "extra == 'test'" },
+    { name = "gguf", marker = "extra == 'gguf'", specifier = ">=0.10.0" },
+    { name = "gitpython", marker = "extra == 'dev'", specifier = "<3.1.19" },
+    { name = "gitpython", marker = "extra == 'test'", specifier = "<3.1.19" },
+    { name = "hf-doc-builder", marker = "extra == 'dev'", specifier = ">=0.3.0" },
+    { name = "hf-doc-builder", marker = "extra == 'docs'", specifier = ">=0.3.0" },
+    { name = "hf-doc-builder", marker = "extra == 'quality'", specifier = ">=0.3.0" },
+    { name = "httpx", specifier = "<1.0.0" },
+    { name = "huggingface-hub", specifier = ">=0.34.0,<2.0" },
+    { name = "importlib-metadata" },
+    { name = "invisible-watermark", marker = "extra == 'dev'", specifier = ">=0.2.0" },
+    { name = "invisible-watermark", marker = "extra == 'test'", specifier = ">=0.2.0" },
+    { name = "isort", marker = "extra == 'dev'", specifier = ">=5.5.4" },
+    { name = "isort", marker = "extra == 'quality'", specifier = ">=5.5.4" },
+    { name = "jax", marker = "extra == 'dev'", specifier = ">=0.4.1" },
+    { name = "jax", marker = "extra == 'flax'", specifier = ">=0.4.1" },
+    { name = "jaxlib", marker = "extra == 'dev'", specifier = ">=0.4.1" },
+    { name = "jaxlib", marker = "extra == 'flax'", specifier = ">=0.4.1" },
+    { name = "jinja2", marker = "extra == 'dev'" },
+    { name = "jinja2", marker = "extra == 'test'" },
+    { name = "jinja2", marker = "extra == 'training'" },
+    { name = "librosa", marker = "extra == 'dev'" },
+    { name = "librosa", marker = "extra == 'test'" },
+    { name = "numpy" },
+    { name = "nvidia-modelopt", extras = ["hf"], marker = "extra == 'nvidia-modelopt'", specifier = ">=0.33.1" },
+    { name = "optimum-quanto", marker = "extra == 'optimum-quanto'", specifier = ">=0.2.6" },
+    { name = "parameterized", marker = "extra == 'dev'" },
+    { name = "parameterized", marker = "extra == 'test'" },
+    { name = "peft", marker = "extra == 'dev'", specifier = ">=0.17.0" },
+    { name = "peft", marker = "extra == 'training'", specifier = ">=0.17.0" },
+    { name = "phonemizer", marker = "extra == 'dev'" },
+    { name = "phonemizer", marker = "extra == 'test'" },
+    { name = "pillow" },
+    { name = "protobuf", marker = "extra == 'dev'", specifier = ">=3.20.3,<4" },
+    { name = "protobuf", marker = "extra == 'test'", specifier = ">=3.20.3,<4" },
+    { name = "protobuf", marker = "extra == 'training'", specifier = ">=3.20.3,<4" },
+    { name = "pytest", marker = "extra == 'dev'" },
+    { name = "pytest", marker = "extra == 'test'" },
+    { name = "pytest-timeout", marker = "extra == 'dev'" },
+    { name = "pytest-timeout", marker = "extra == 'test'" },
+    { name = "pytest-xdist", marker = "extra == 'dev'" },
+    { name = "pytest-xdist", marker = "extra == 'test'" },
+    { name = "regex", specifier = "!=2019.12.17" },
+    { name = "requests" },
+    { name = "requests-mock", marker = "extra == 'dev'", specifier = "==1.10.0" },
+    { name = "requests-mock", marker = "extra == 'test'", specifier = "==1.10.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = "==0.9.10" },
+    { name = "ruff", marker = "extra == 'quality'", specifier = "==0.9.10" },
+    { name = "safetensors", specifier = ">=0.8.0rc0" },
+    { name = "safetensors", marker = "extra == 'dev'", specifier = ">=0.8.0rc0" },
+    { name = "safetensors", marker = "extra == 'test'", specifier = ">=0.8.0rc0" },
+    { name = "scipy", marker = "extra == 'dev'" },
+    { name = "scipy", marker = "extra == 'test'" },
+    { name = "sentencepiece", marker = "extra == 'dev'", specifier = ">=0.1.91,!=0.1.92" },
+    { name = "sentencepiece", marker = "extra == 'test'", specifier = ">=0.1.91,!=0.1.92" },
+    { name = "tensorboard", marker = "extra == 'dev'" },
+    { name = "tensorboard", marker = "extra == 'training'" },
+    { name = "tiktoken", marker = "extra == 'dev'", specifier = ">=0.7.0" },
+    { name = "tiktoken", marker = "extra == 'test'", specifier = ">=0.7.0" },
+    { name = "timm", marker = "extra == 'dev'" },
+    { name = "timm", marker = "extra == 'training'" },
+    { name = "torch", marker = "extra == 'dev'", specifier = ">=1.4" },
+    { name = "torch", marker = "extra == 'torch'", specifier = ">=1.4" },
+    { name = "torchao", marker = "extra == 'torchao'", specifier = ">=0.7.0" },
+    { name = "torchsde", marker = "extra == 'dev'" },
+    { name = "torchsde", marker = "extra == 'test'" },
+    { name = "torchvision", marker = "extra == 'dev'" },
+    { name = "torchvision", marker = "extra == 'test'" },
+    { name = "transformers", marker = "extra == 'dev'", specifier = ">=4.41.2" },
+    { name = "transformers", marker = "extra == 'test'", specifier = ">=4.41.2" },
+    { name = "urllib3", marker = "extra == 'dev'", specifier = "<=2.0.0" },
+    { name = "urllib3", marker = "extra == 'quality'", specifier = "<=2.0.0" },
+]
+provides-extras = ["quality", "docs", "training", "test", "torch", "bitsandbytes", "gguf", "optimum-quanto", "torchao", "nvidia-modelopt", "flashpack", "flax", "dev"]
 
 [[package]]
 name = "diffusers-ipadapter"
 version = "0.1.2"
-source = { git = "https://github.com/livepeer/Diffusers_IPAdapter.git?rev=405f87da#405f87da42932e30bd55ee8dca3ce502d7834a99" }
+source = { url = "https://github.com/livepeer/Diffusers_IPAdapter/archive/405f87da42932e30bd55ee8dca3ce502d7834a99.tar.gz" }
 dependencies = [
     { name = "numpy" },
     { name = "pillow" },
     { name = "torch", version = "2.12.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
     { name = "torch", version = "2.12.0+cu132", source = { registry = "https://download.pytorch.org/whl/cu132" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+sdist = { hash = "sha256:53c6bd46eedad46f307987c3b2bcae135c224031d040b9ffb35104c395e1e1c9" }
+
+[package.metadata]
+requires-dist = [
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "torch" },
 ]
 
 [[package]]
@@ -1174,8 +1278,8 @@ requires-dist = [
     { name = "controlnet-aux", specifier = ">=0.0.10" },
     { name = "cuda-python", specifier = ">=13.3" },
     { name = "cudart", specifier = ">=1" },
-    { name = "diffusers", git = "https://github.com/jcelerier/diffusers.git?rev=kvo-cache-0.38" },
-    { name = "diffusers-ipadapter", git = "https://github.com/livepeer/Diffusers_IPAdapter.git?rev=405f87da" },
+    { name = "diffusers", url = "https://github.com/jcelerier/diffusers/archive/1b7b45ee24ee859724204266da2ef4958883214a.tar.gz" },
+    { name = "diffusers-ipadapter", url = "https://github.com/livepeer/Diffusers_IPAdapter/archive/405f87da42932e30bd55ee8dca3ce502d7834a99.tar.gz" },
     { name = "fire", specifier = ">=0.7.1" },
     { name = "ninja", specifier = ">=1.11" },
     { name = "nvidia-modelopt", specifier = ">=0.44" },
