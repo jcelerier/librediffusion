@@ -15,11 +15,14 @@ dependencies = [
     "onnxsim_prebuilt>=0.4.36",
     # diffusers: REQUIRES our kvo_cache fork (branch kvo-cache-0.38 = base diffusers 0.38.0 + kvo_cache),
     # needed for the IP-Adapter kvo_cache export and the klein/Flux2 path. Generic diffusers will NOT work.
-    # Fork is pushed: github.com/jcelerier/diffusers @ kvo-cache-0.38 (HEAD 1b7b45ee2 — VAE-tuple fix).
-    "diffusers @ git+https://github.com/jcelerier/diffusers.git@kvo-cache-0.38",
+    # Fork is pushed: github.com/jcelerier/diffusers @ kvo-cache-0.38 (HEAD 1b7b45ee2, VAE-tuple fix).
+    # Both forks are fetched as source archives of a pinned commit rather than git URLs: a git
+    # URL makes uv shell out to git, which a Windows machine running the packaged builder
+    # usually does not have, and the build then fails before downloading anything.
+    "diffusers @ https://github.com/jcelerier/diffusers/archive/1b7b45ee24ee859724204266da2ef4958883214a.tar.gz",
     # diffusers_ipadapter: fork (livepeer/Diffusers_IPAdapter @ 405f87da), imported by the export as
     # `diffusers_ipadapter`; supplies the AttnProcessor2_0 patch for IP-Adapter kvo_cache support.
-    "diffusers_ipadapter @ git+https://github.com/livepeer/Diffusers_IPAdapter.git@405f87da",
+    "diffusers_ipadapter @ https://github.com/livepeer/Diffusers_IPAdapter/archive/405f87da42932e30bd55ee8dca3ce502d7834a99.tar.gz",
     "ninja>=1.11",
     "onnx-graphsurgeon>=0.5.8",
     "onnxruntime==1.23.2",
