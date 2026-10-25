@@ -157,6 +157,9 @@ jobs:
     needs: [ linux, windows ]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    # The repository's default GITHUB_TOKEN is read-only; creating the release needs write.
+    permissions:
+      contents: write
     steps:
       - name: Checkout source (Python export toolchain)
         uses: actions/checkout@v4
