@@ -169,6 +169,8 @@ add_library(librediffusion SHARED
     src/librediffusion.img2img_turbo.hpp
     src/librediffusion_c.img2img_turbo.cpp
     src/cuda_tensor.hpp
+    src/out_of_memory.hpp
+    src/create_error.hpp
     src/cuda_tensor.cpp
     src/pcg.hpp
 

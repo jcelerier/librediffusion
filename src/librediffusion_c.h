@@ -304,6 +304,12 @@ librediffusion_engine_cache_clear(void);
 LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
 librediffusion_engine_cache_count(void);
 
+/* Result of the most recent *_create call on the calling thread (pipeline, clip, rife, flux2,
+ * flux2_stream, img2img_turbo). LIBREDIFFUSION_ERROR_OUT_OF_MEMORY means the device lacked the
+ * memory: freeing other pipelines on that device and retrying can succeed. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_last_create_error(void);
+
 /* Cap the cache's LRU size (default 16); immediately evicts the least-recently-used UNUSED engines
  * down to the cap. Set to 0 to keep VRAM as tight as possible (engines load on demand, evicted as soon
  * as unused). */

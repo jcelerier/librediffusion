@@ -8,6 +8,7 @@
 #include <memory>
 #include <stdexcept>
 
+#include "create_error.hpp"
 #include "device_guard.hpp"
 
 using namespace librediffusion;
@@ -28,6 +29,7 @@ librediffusion_img2img_turbo_handle librediffusion_img2img_turbo_create(
   if(dev < 0)
   {
     fprintf(stderr, "img2img_turbo_create: device %d is not a valid CUDA device ordinal\n", device);
+    set_create_error(LIBREDIFFUSION_ERROR_INVALID_ARGUMENT);
     return nullptr;
   }
   try
@@ -40,11 +42,13 @@ librediffusion_img2img_turbo_handle librediffusion_img2img_turbo_create(
     auto h = std::make_unique<librediffusion_img2img_turbo>();
     h->device = dev;
     h->pipe = std::make_unique<Img2ImgTurboPipeline>(p);  // may throw (engine load) -> h freed by RAII
+    set_create_error(LIBREDIFFUSION_SUCCESS);
     return h.release();
   }
   catch(const std::exception& e)
   {
     fprintf(stderr, "img2img_turbo_create failed: %s\n", e.what());
+    set_create_error(e);
     return nullptr;
   }
 }

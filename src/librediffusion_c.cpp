@@ -11,6 +11,7 @@
 #include "tensorrt_wrappers.hpp"
 
 #include "cuda_error_state.hpp"
+#include "create_error.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -155,10 +156,10 @@ librediffusion_error_t try_catch_wrapper(Func&& func)
     func();
     return check_cuda_error();
   }
-  catch (const std::bad_alloc&)
+  catch (const std::bad_alloc& e)
   {
     drain_cuda_error();
-    std::fprintf(stderr, "[librediffusion] OUT_OF_MEMORY\n");
+    std::fprintf(stderr, "[librediffusion] OUT_OF_MEMORY: %s\n", e.what());
     return LIBREDIFFUSION_ERROR_OUT_OF_MEMORY;
   }
   catch (const librediffusion::invalid_dimensions_error& e)
@@ -689,8 +690,9 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_pipeline_create(
     librediffusion_config_handle config, librediffusion_pipeline_handle* pipeline)
 {
+  using librediffusion::set_create_error;
   if (!valid(config) || !pipeline)
-    return LIBREDIFFUSION_ERROR_NULL_POINTER;
+    return set_create_error(LIBREDIFFUSION_ERROR_NULL_POINTER);
 
   // ALWAYS write the out-parameter, so a host that checks the handle rather than the return code
   // does not carry an uninitialised local into every later call.
@@ -698,16 +700,16 @@ librediffusion_pipeline_create(
 
   const int dev = librediffusion::resolve_device(config->cpp_config.device);
   if (dev < 0)
-    return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+    return set_create_error(LIBREDIFFUSION_ERROR_INVALID_ARGUMENT);
 
-  return try_catch_wrapper(dev, [&]() {
+  return set_create_error(try_catch_wrapper(dev, [&]() {
     auto p = std::make_unique<librediffusion_pipeline_t>();
     p->device = dev;
     p->cpp_pipeline = std::make_unique<librediffusion::LibreDiffusionPipeline>(
         config->cpp_config);
     register_handle(p.get());
     *pipeline = p.release();
-  });
+  }));
 }
 
 LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
@@ -742,6 +744,12 @@ librediffusion_engine_cache_clear(void)
   {
     return -1;
   }
+}
+
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_last_create_error(void)
+{
+  return librediffusion::g_last_create_error;
 }
 
 LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
@@ -1582,20 +1590,21 @@ LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
 librediffusion_clip_create(
     const char* engine_path, int device, librediffusion_clip_handle* clip)
 {
+  using librediffusion::set_create_error;
   if (!engine_path || !clip)
-    return LIBREDIFFUSION_ERROR_NULL_POINTER;
+    return set_create_error(LIBREDIFFUSION_ERROR_NULL_POINTER);
   *clip = nullptr;
 
   const int dev = librediffusion::resolve_device(device);
   if (dev < 0)
-    return LIBREDIFFUSION_ERROR_INVALID_ARGUMENT;
+    return set_create_error(LIBREDIFFUSION_ERROR_INVALID_ARGUMENT);
 
-  return try_catch_wrapper(dev, [&]() {
+  return set_create_error(try_catch_wrapper(dev, [&]() {
     auto c = new librediffusion_clip_t{};
     c->device = dev;
     c->cpp_clip = std::make_unique<librediffusion::CLIPWrapper>(engine_path);
     *clip = c;
-  });
+  }));
 }
 
 LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
