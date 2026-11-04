@@ -3,6 +3,7 @@
 #include "device_guard.hpp"
 #include "librediffusion_c.h"
 #include "cuda_error_state.hpp"
+#include "create_error.hpp"
 #include "kernels.hpp"
 #include "qwen_tokenizer_c.h"
 
@@ -49,6 +50,7 @@ librediffusion_flux2_handle librediffusion_flux2_create(
   if(dev < 0)
   {
     fprintf(stderr, "flux2_create: device %d is not a valid CUDA device ordinal\n", device);
+    set_create_error(LIBREDIFFUSION_ERROR_INVALID_ARGUMENT);
     return nullptr;
   }
   try
@@ -59,15 +61,17 @@ librediffusion_flux2_handle librediffusion_flux2_create(
     p.qwen = qwen_engine ? qwen_engine : "";
     p.vae_decoder = vae_decoder_engine ? vae_decoder_engine : "";
     p.vae_encoder = vae_encoder_engine ? vae_encoder_engine : "";
-    auto* h = new librediffusion_flux2;
+    auto h = std::make_unique<librediffusion_flux2>();
     h->device = dev;
     h->pipe = std::make_unique<Flux2Pipeline>(p);
-    return h;
+    set_create_error(LIBREDIFFUSION_SUCCESS);
+    return h.release();
   }
   catch(const std::exception& e)
   {
     librediffusion::drain_cuda_error();
     fprintf(stderr, "flux2_create failed: %s\n", e.what());
+    set_create_error(e);
     return nullptr;
   }
 }
@@ -256,6 +260,7 @@ librediffusion_flux2_stream_handle librediffusion_flux2_stream_create(
   if(dev < 0)
   {
     fprintf(stderr, "flux2_stream_create: device %d is not a valid CUDA device ordinal\n", device);
+    set_create_error(LIBREDIFFUSION_ERROR_INVALID_ARGUMENT);
     return nullptr;
   }
   try
@@ -309,12 +314,14 @@ librediffusion_flux2_stream_handle librediffusion_flux2_stream_create(
     launch_klein_txt_ids(s->txt_ids, s->Lt, s->stream);
     launch_klein_randn_bf16(s->init_noise, s->seed, (long)Lp * 128, s->stream);
     cudaStreamSynchronize(s->stream);
+    set_create_error(LIBREDIFFUSION_SUCCESS);
     return s;
   }
   catch(const std::exception& e)
   {
     librediffusion::drain_cuda_error();
     fprintf(stderr, "flux2_stream_create failed: %s\n", e.what());
+    set_create_error(e);
     return nullptr;
   }
 }

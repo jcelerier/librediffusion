@@ -1,5 +1,6 @@
 /** RIFE frame-interpolation C-API implementation (shared/model-agnostic). */
 #include "librediffusion.rife.hpp"
+#include "create_error.hpp"
 #include "device_guard.hpp"
 #include "librediffusion_c.h"
 
@@ -24,19 +25,22 @@ librediffusion_rife_handle librediffusion_rife_create(const char* engine_path, i
   if(dev < 0)
   {
     fprintf(stderr, "rife_create: device %d is not a valid CUDA device ordinal\n", device);
+    set_create_error(LIBREDIFFUSION_ERROR_INVALID_ARGUMENT);
     return nullptr;
   }
   try
   {
     DeviceGuard guard{dev};
-    auto* h = new librediffusion_rife;
+    auto h = std::make_unique<librediffusion_rife>();
     h->device = dev;
     h->interp = std::make_unique<RifeInterpolator>(engine_path ? engine_path : "");
-    return h;
+    set_create_error(LIBREDIFFUSION_SUCCESS);
+    return h.release();
   }
   catch(const std::exception& e)
   {
     fprintf(stderr, "rife_create failed: %s\n", e.what());
+    set_create_error(e);
     return nullptr;
   }
 }

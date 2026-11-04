@@ -83,6 +83,7 @@ public:
 
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, pipeline_create);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, pipeline_destroy);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, last_create_error);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, pipeline_init_cuda);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, pipeline_init_npp);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, pipeline_init_engines);
@@ -378,6 +379,7 @@ private:
 
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, pipeline_create);
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, pipeline_destroy);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, last_create_error);
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, pipeline_init_cuda);
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, pipeline_init_npp);
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, pipeline_init_engines);

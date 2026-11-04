@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <nppi.h>
+#include "out_of_memory.hpp"
 #include <stdexcept>
 #include <string>
 
@@ -36,9 +37,11 @@ public:
     {
       data_ = nullptr;
       owns_memory_ = false;
-      throw std::runtime_error(
-          std::string("CUDATensor: cudaMalloc of ") + std::to_string(bytes)
-          + " bytes failed: " + cudaGetErrorString(e));
+      std::string msg = std::string("CUDATensor: cudaMalloc of ") + std::to_string(bytes)
+                        + " bytes failed: " + cudaGetErrorString(e);
+      if(e == cudaErrorMemoryAllocation)
+        throw device_out_of_memory(std::move(msg));
+      throw std::runtime_error(std::move(msg));
     }
   }
 

@@ -11,6 +11,7 @@
 
 #include "NvInfer.h"
 #include "NvInferRuntime.h"
+#include "out_of_memory.hpp"
 
 #include <cuda_runtime.h>
 
@@ -370,13 +371,7 @@ public:
    * Create an execution context from this cached engine.
    * Each wrapper should call this to get its own context.
    */
-  nvinfer1::IExecutionContext* createExecutionContext() const
-  {
-    touch();
-    if(!engine_)
-      return nullptr;
-    return engine_->createExecutionContext();
-  }
+  nvinfer1::IExecutionContext* createExecutionContext() const;
 
   nvinfer1::ICudaEngine* getEngine() const
   {
@@ -537,15 +532,16 @@ public:
     evict_if_needed();
   }
 
-  void evict_one()
+  // Evicts the least-recently-used engine that only the cache holds, on `device` (-1: any).
+  // Returns false when there is none: evicting an engine a live wrapper holds frees no VRAM.
+  bool evict_one(int device = -1)
   {
-    if(cache_.size() == 0)
-      return;
-
-    if(auto lru_key = get_lru())
+    while(auto lru_key = get_lru(device))
     {
-      cache_.erase(*lru_key);
+      if(cache_.erase_if(*lru_key, [](const auto& entry) { return unused(entry.second); }))
+        return true;
     }
+    return false;
   }
 
 private:
@@ -553,7 +549,18 @@ private:
   size_t max_entries_;
   std::mutex load_mutex_;
 
-  std::optional<std::string> get_lru()
+  static bool unused(const EnginePtr& e) { return !e || e.use_count() == 1; }
+
+  static bool on_device(const std::string& key, int device)
+  {
+    if(device < 0)
+      return true;
+    const auto sep = key.rfind('\x1f');
+    return sep != std::string::npos
+           && key.compare(sep + 1, std::string::npos, std::to_string(device)) == 0;
+  }
+
+  std::optional<std::string> get_lru(int device = -1)
   {
     if(cache_.size() == 0)
       return std::nullopt;
@@ -563,6 +570,8 @@ private:
     bool found = false;
 
     cache_.visit_all([&](const auto& entry) {
+      if(!unused(entry.second) || !on_device(entry.first, device))
+        return;
       // A null entry (should be unreachable) is the oldest: evict it rather than dereference it.
       if(!entry.second)
       {
@@ -588,16 +597,8 @@ private:
 
   void evict_if_needed()
   {
-    while(cache_.size() > max_entries_)
+    while(cache_.size() > max_entries_ && evict_one())
     {
-      if(auto lru_key = get_lru())
-      {
-        cache_.erase(*lru_key);
-      }
-      else
-      {
-        break;
-      }
     }
   }
 };
@@ -652,6 +653,31 @@ private:
   TensorRTLogger logger_;
 };
 
+// The context's activation memory is allocated here and can be far larger than the plan file the
+// load-time check accounted for: make room among the unused engines of this device until it fits.
+inline nvinfer1::IExecutionContext* CachedTensorRTEngine::createExecutionContext() const
+{
+  touch();
+  if(!engine_)
+    return nullptr;
+  int device = 0;
+  cudaGetDevice(&device);
+  for(;;)
+  {
+    if(auto* ctx = engine_->createExecutionContext())
+      return ctx;
+    size_t free = 0, total = 0;
+    cudaMemGetInfo(&free, &total);
+    const auto need = static_cast<size_t>(engine_->getDeviceMemorySizeV2());
+    if(free >= need)
+      return nullptr;
+    if(!GlobalEngineCache::instance().engines().evict_one(device))
+      throw device_out_of_memory(
+          "execution context needs " + std::to_string(need) + " bytes, "
+          + std::to_string(free) + " free");
+  }
+}
+
 /**
  * Load a TensorRT engine from file using streaming I/O.
  * Uses low-level OS file operations to avoid loading entire engine into memory.
@@ -674,25 +700,15 @@ loadEngineFromFile(const std::string& engine_path, nvinfer1::ILogger& logger)
     cudaMemGetInfo(&f, &t);
     auto sz = stream_reader.fileSize();
 
-    int n = GlobalEngineCache::instance().engines().size();
-    while(f < sz && n > 0)
-    {
+    int device = 0;
+    cudaGetDevice(&device);
+    while(f < sz && GlobalEngineCache::instance().engines().evict_one(device))
       cudaMemGetInfo(&f, &t);
-      if(f < sz)
-      {
-        GlobalEngineCache::instance().engines().evict_one();
-        n--;
-      }
-      else
-      {
-        break;
-      }
-    }
 
     cudaMemGetInfo(&f, &t);
-    // Not enough memory to load the model
     if(f < sz)
-      return nullptr;
+      throw device_out_of_memory(
+          engine_path + " needs " + std::to_string(sz) + " bytes, " + std::to_string(f) + " free");
   }
 
   // Create runtime
