@@ -27,6 +27,11 @@ int qwen_tokenizer_load(const char* tokenizer_json_path);
 int qwen_tokenizer_encode_chat(
     const char* prompt, int max_len, int64_t* out_ids, int64_t* out_mask);
 
+/* FLUX.3-klein template: <|im_start|>user\n{P}<|im_end|>\n<|im_start|>assistant\n (no think block).
+ * Same buffers and return value as qwen_tokenizer_encode_chat. */
+int qwen_tokenizer_encode_chat_nothink(
+    const char* prompt, int max_len, int64_t* out_ids, int64_t* out_mask);
+
 /* Free the tokenizer (idempotent). */
 void qwen_tokenizer_free(void);
 

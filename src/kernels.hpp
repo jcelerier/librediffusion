@@ -164,6 +164,8 @@ void launch_klein_chw_to_rgba_u8(const void* in, void* out, int H, int W, void* 
 void launch_klein_rgba_u8_to_chw_m1p1(const void* in, void* out, int H, int W, void* stream_ptr);
 void launch_klein_ref_ids(void* out, int Th, int Tw, float t_offset, void* stream_ptr);
 void launch_klein_concat_seq(const void* a, const void* b, void* out, long Na, long Nb, void* stream_ptr);
+// FLUX.3: x(fp32) += bf16(dt*v); xb = bf16(x)
+void launch_flux3_euler(void* x, void* xb, const void* v, float dt, long N, void* stream_ptr);
 
 // ===== RIFE (IFNet) frame-interpolation helpers (fp16, model-agnostic) =====
 // RGBA uint8 NHWC [H,W,4] <-> RGB fp16 CHW [3,H,W] in [0,1] (RIFE's I/O domain).

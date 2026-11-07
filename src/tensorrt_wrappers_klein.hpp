@@ -45,6 +45,30 @@ private:
   void loadEngine(const std::string& engine_path);
 };
 
+// FLUX.3-image-klein transformer (flow map, one sample):
+//   img[1,Li,128] cond[1,Lc,128] txt[1,Lt,20480] bf16, rope_{img,cond,txt}[1,L,64,4] fp32, t[1] r[1] fp32
+//   -> velocity[1,Li,128] bf16. Lc may be 0 (text-to-image).
+class Flux3TransformerWrapper
+{
+public:
+  explicit Flux3TransformerWrapper(const std::string& engine_path);
+  ~Flux3TransformerWrapper();
+  Flux3TransformerWrapper(const Flux3TransformerWrapper&) = delete;
+  Flux3TransformerWrapper& operator=(const Flux3TransformerWrapper&) = delete;
+
+  void forward(
+      const __nv_bfloat16* img, const __nv_bfloat16* cond, const __nv_bfloat16* txt,
+      const float* rope_img, const float* rope_cond, const float* rope_txt, const float* t,
+      const float* r, __nv_bfloat16* velocity, int Li, int Lc, int Lt, cudaStream_t stream);
+
+  // profile-0 max of the reference ("cond") sequence
+  int max_cond_tokens() const;
+
+private:
+  std::shared_ptr<CachedTensorRTEngine> cached_engine_;
+  std::unique_ptr<nvinfer1::IExecutionContext> context_;
+};
+
 class Qwen3EncoderWrapper
 {
 public:

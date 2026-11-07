@@ -431,6 +431,27 @@ pub extern "C" fn qwen_tokenizer_encode_chat(
     out_ids: *mut i64,
     out_mask: *mut i64,
 ) -> c_int {
+    qwen_encode_chat(prompt, max_len, out_ids, out_mask, true)
+}
+
+/// FLUX.3-klein template: as qwen_tokenizer_encode_chat without the empty think block.
+#[no_mangle]
+pub extern "C" fn qwen_tokenizer_encode_chat_nothink(
+    prompt: *const c_char,
+    max_len: c_int,
+    out_ids: *mut i64,
+    out_mask: *mut i64,
+) -> c_int {
+    qwen_encode_chat(prompt, max_len, out_ids, out_mask, false)
+}
+
+fn qwen_encode_chat(
+    prompt: *const c_char,
+    max_len: c_int,
+    out_ids: *mut i64,
+    out_mask: *mut i64,
+    think: bool,
+) -> c_int {
     if prompt.is_null() || out_ids.is_null() || out_mask.is_null() || max_len <= 0 {
         return -1;
     }
@@ -450,10 +471,12 @@ pub extern "C" fn qwen_tokenizer_encode_chat(
     ids.extend_from_slice(&qt.nl);
     ids.push(qt.im_start);
     ids.extend_from_slice(&qt.assistant_nl);
-    ids.push(qt.think);
-    ids.extend_from_slice(&qt.nlnl);
-    ids.push(qt.think_end);
-    ids.extend_from_slice(&qt.nlnl);
+    if think {
+        ids.push(qt.think);
+        ids.extend_from_slice(&qt.nlnl);
+        ids.push(qt.think_end);
+        ids.extend_from_slice(&qt.nlnl);
+    }
 
     if ids.len() > max_len {
         ids.truncate(max_len);

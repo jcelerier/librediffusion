@@ -461,3 +461,23 @@ void launch_klein_concat_seq(const void* a, const void* b, void* out, long Na, l
   int blocks = (int)((tot + threads - 1) / threads);
   k_concat_seq_bf16<<<blocks, threads, 0, s>>>((const bf16*)a, (const bf16*)b, (bf16*)out, Na, Nb);
 }
+
+// ---- FLUX.3 flow-map Euler on an fp32 state ---------------------------------------------------
+// Reference: x(fp32) = x + dt * v(bf16), where dt * v is a bf16 product. xb is the engine input.
+__global__ void k_flux3_euler(float* x, bf16* xb, const bf16* v, float dt, long N)
+{
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if(idx >= N) return;
+  float step = __bfloat162float(__float2bfloat16(dt * __bfloat162float(v[idx])));
+  float nx = x[idx] + step;
+  x[idx] = nx;
+  xb[idx] = __float2bfloat16(nx);
+}
+
+void launch_flux3_euler(void* x, void* xb, const void* v, float dt, long N, void* stream_ptr)
+{
+  cudaStream_t s = (cudaStream_t)stream_ptr;
+  int threads = 256;
+  int blocks = (int)((N + threads - 1) / threads);
+  k_flux3_euler<<<blocks, threads, 0, s>>>((float*)x, (bf16*)xb, (const bf16*)v, dt, N);
+}
