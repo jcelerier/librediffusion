@@ -167,3 +167,15 @@ target_link_libraries(img2img_turbo_harness PRIVATE ${LRD_LIB})
 target_link_directories(img2img_turbo_harness PRIVATE ${TENSORRT_LIB_DIR} ${CUDA_LIB_DIR})
 target_link_libraries(img2img_turbo_harness PRIVATE nvinfer cudart)
 set_target_properties(img2img_turbo_harness PROPERTIES BUILD_RPATH "${_rpaths}" INSTALL_RPATH "${_rpaths}")
+
+# FLUX.3-image-klein harness (goldens from src/streamdiffusion/flux3/make_flux3_golden.py).
+add_executable(flux3_harness flux3_harness.cpp)
+target_include_directories(flux3_harness PRIVATE
+  ${LRD_SRC_DIR} ${LRD_SRC_DIR}/clip-tokenizer-c ${CMAKE_CURRENT_SOURCE_DIR}
+  /usr/local/cuda-13.3/targets/x86_64-linux/include)
+target_link_directories(flux3_harness PRIVATE ${TENSORRT_LIB_DIR} ${CUDA_LIB_DIR})
+target_link_libraries(flux3_harness PRIVATE ${LRD_LIB} cudart)
+set_target_properties(flux3_harness PROPERTIES
+  BUILD_RPATH "${_rpaths}"
+  INSTALL_RPATH "${_rpaths}"
+)

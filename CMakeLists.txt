@@ -154,6 +154,8 @@ add_library(librediffusion SHARED
     src/librediffusion.workflows.cpp
     src/librediffusion.flux2.cpp
     src/librediffusion.flux2.hpp
+    src/librediffusion.flux3.cpp
+    src/librediffusion.flux3.hpp
     src/librediffusion.hpp
     src/tensorrt_wrappers.cpp
     src/tensorrt_wrappers.hpp
@@ -165,6 +167,7 @@ add_library(librediffusion SHARED
     src/librediffusion.rife.hpp
     src/librediffusion_c.rife.cpp
     src/librediffusion_c.flux2.cpp
+    src/librediffusion_c.flux3.cpp
     src/librediffusion.img2img_turbo.cpp
     src/librediffusion.img2img_turbo.hpp
     src/librediffusion_c.img2img_turbo.cpp

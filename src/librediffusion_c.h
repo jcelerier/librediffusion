@@ -1256,6 +1256,88 @@ librediffusion_flux2_stream_frame_cached(
 LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
 librediffusion_flux2_stream_dims(librediffusion_flux2_stream_handle s, int* H, int* W);
 
+/* ===================== FLUX.3-image-klein =====================
+ * Distilled flow-map DiT: text-to-image, or reference-image editing when a reference is set.
+ * Images are H x W with H, W multiples of 16. Calls on one handle must not overlap. */
+typedef struct librediffusion_flux3* librediffusion_flux3_handle;
+
+/* vae_encoder_engine may be NULL (no reference images). Returns NULL on failure. */
+LIBREDIFFUSION_API librediffusion_flux3_handle LIBREDIFFUSION_CALL
+librediffusion_flux3_create(
+    const char* transformer_engine, const char* qwen_engine, const char* vae_decoder_engine,
+    const char* vae_encoder_engine, const char* tokenizer_json, int device);
+
+LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
+librediffusion_flux3_destroy(librediffusion_flux3_handle h);
+
+/* VAE batch-norm statistics, host fp32 [128] each (std = sqrt(running_var + eps)). Required. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_flux3_set_bn(librediffusion_flux3_handle h, const float* bn_mean, const float* bn_std);
+
+/* Tokenizes and encodes the prompt, caching the embeddings; no-op if unchanged.
+ * Returns the padded text length (a multiple of 80), or -1. */
+LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+librediffusion_flux3_set_prompt(librediffusion_flux3_handle h, const char* prompt);
+
+/* Host RGBA uint8 [H*W*4] reference image, encoded and cached, replacing all references.
+ * rgba = NULL clears them (text-to-image). */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_flux3_set_reference(
+    librediffusion_flux3_handle h, const unsigned char* rgba, int H, int W);
+
+/* Appends a reference (multi-reference editing; the output follows the first). Each has its own
+ * size. INVALID_DIMENSIONS when the total (H/16)*(W/16) over all references would exceed
+ * max_reference_tokens; the existing references are kept on any failure. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_flux3_add_reference(
+    librediffusion_flux3_handle h, const unsigned char* rgba, int H, int W);
+
+LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+librediffusion_flux3_reference_count(librediffusion_flux3_handle h);
+
+/* Token budget of all references together, from the transformer engine's profile. */
+LIBREDIFFUSION_API int LIBREDIFFUSION_CALL
+librediffusion_flux3_max_reference_tokens(librediffusion_flux3_handle h);
+
+/* Default schedule: steps (default 16) with time shift alpha (default 6.93). */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_flux3_set_steps(librediffusion_flux3_handle h, int steps, float alpha);
+
+/* Explicit times, high->low in [0,1], terminal 0 appended. times[0] < 1 starts from the reference
+ * noised to times[0] (needs a reference of the output size). n <= 0 clears it. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_flux3_set_times(librediffusion_flux3_handle h, const float* times, int n);
+
+/* Fixed noise seed; the noise is regenerated only when the seed or the geometry changes. */
+LIBREDIFFUSION_API void LIBREDIFFUSION_CALL
+librediffusion_flux3_set_seed(librediffusion_flux3_handle h, unsigned long long seed);
+
+/* Generates one image into host RGBA uint8 [H*W*4]. Needs set_bn and set_prompt first. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_flux3_generate(librediffusion_flux3_handle h, int H, int W, unsigned char* rgba_out);
+
+/* Seams for validation. Device pointers unless noted.
+ * encode_text: int64 [Lt] ids/mask -> bf16 [Lt,20480].
+ * denoise_decode: noise bf16 [th*tw,128]; cond NULL or the references' bf16 tokens concatenated,
+ *   with ref_hw = {th_0, tw_0, th_1, tw_1, ...} for n_refs of them; ehs bf16 [Lt,20480];
+ *   times host [n] high->low with the terminal included; rgba_out host [16th*16tw*4];
+ *   final_tokens host fp32 [th*tw*128] and velocity0 host fp32 [th*tw*128] are optional. */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_flux3_encode_text(
+    librediffusion_flux3_handle h, const void* input_ids, const void* attention_mask, void* ehs_out,
+    int Lt);
+
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_flux3_denoise_decode(
+    librediffusion_flux3_handle h, const void* noise, const void* cond, const int* ref_hw, int n_refs,
+    const void* ehs, int Lt, int th, int tw, const float* times, int n, unsigned char* rgba_out,
+    float* final_tokens, float* velocity0);
+
+/* Encodes a host RGBA [16th*16tw*4] reference to bf16 tokens [th*tw,128] (device). */
+LIBREDIFFUSION_API librediffusion_error_t LIBREDIFFUSION_CALL
+librediffusion_flux3_encode_reference(
+    librediffusion_flux3_handle h, const unsigned char* rgba, int th, int tw, void* cond_out);
+
 /* ===================== RIFE frame interpolation (SHARED/model-agnostic) =====================
  * RIFE operates on decoded RGB frames AFTER any pipeline's decode step, so it multiplies the
  * DISPLAYED fps for ALL methods (FLUX/klein, SDXL, SD1.5, v2v) equally. It is fully OPTIONAL:

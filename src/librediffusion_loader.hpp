@@ -194,6 +194,19 @@ public:
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux2_stream_frame_cached);
   LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux2_stream_dims);
 
+  /* FLUX.3-image-klein */
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux3_create);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux3_destroy);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux3_set_bn);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux3_set_prompt);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux3_set_reference);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux3_add_reference);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux3_max_reference_tokens);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux3_set_steps);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux3_set_times);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux3_set_seed);
+  LIBREDIFFUSION_SYMBOL_DEF(librediffusion, flux3_generate);
+
   /*=========================================================================*/
   /* RIFE frame interpolation (optional, model-agnostic)                     */
   /*=========================================================================*/
@@ -490,6 +503,19 @@ private:
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux2_stream_set_reference);
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux2_stream_frame_cached);
     LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux2_stream_dims);
+
+    /* FLUX.3-image-klein */
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux3_create);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux3_destroy);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux3_set_bn);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux3_set_prompt);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux3_set_reference);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux3_add_reference);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux3_max_reference_tokens);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux3_set_steps);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux3_set_times);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux3_set_seed);
+    LIBREDIFFUSION_SYMBOL_INIT(librediffusion, flux3_generate);
 
     /*=====================================================================*/
     /* RIFE frame interpolation (optional)                                 */

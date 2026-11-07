@@ -147,6 +147,30 @@ rerun reuses an existing calibration directory.
 - `--hw-compat ampere_plus` makes the engines portable across SM 8.0+ instead of locked to the
   build GPU.
 
+### FLUX.3-image-klein (`--type flux3`)
+
+The export reads `model.safetensors`, `ae.safetensors`, `vae/` and `text_encoder/`; the diffusers
+`transformer/` copy and the `variants/` save 17 GB when excluded:
+
+```bash
+hf download black-forest-labs/flux-3-image-klein --exclude "transformer/*" "variants/*"
+train-lora.py --type flux3 --model black-forest-labs/flux-3-image-klein --output engines/flux3
+```
+
+One engine set serves text-to-image and editing with up to several reference images (the node's
+`FLUX3_KLEIN_*` workflows). BFL's inference code is vendored under `src/streamdiffusion/flux3/bfl`
+(Apache-2.0); `--flux3-ref` exports from a checkout of github.com/black-forest-labs/flux-3-image-klein
+instead. The weights are under the FLUX Kommunity License.
+
+- `--klein-quality` works as for klein: `both` (default) ships the bf16 and FP8 transformers; FP8
+  needs SM 8.9+ and is ~1.8x faster on a 4090 (4-step 512x512: 234 ms vs 436 ms).
+- Engines are shape-dynamic: 128..1024 px per side with a 512x512 optimum by default. Explicit
+  `--min/--max-resolution` and `--opt-width/--opt-height` set the range and optimum. All reference
+  images together get one max-resolution square of tokens (1024x1024 = 4096 tokens).
+- Steps are a runtime choice (the node's Timesteps: a step count or a list of times); 3-4 steps at
+  512x512 or larger give the best results.
+- Bundles always ship RIFE. Expect ~24 GB with `both`.
+
 ### Frame interpolation (RIFE)
 
 The node's `Interpolation exp` control runs RIFE between consecutive diffused frames (2^exp displayed

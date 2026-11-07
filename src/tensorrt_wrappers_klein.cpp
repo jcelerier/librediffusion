@@ -89,6 +89,11 @@ nvinfer1::Dims dims4(int a, int b, int c, int e)
 {
   nvinfer1::Dims d; d.nbDims = 4; d.d[0] = a; d.d[1] = b; d.d[2] = c; d.d[3] = e; return d;
 }
+// [1, L, 64, 2, 2] RoPE rotation table
+nvinfer1::Dims dims_rope(int L)
+{
+  nvinfer1::Dims d; d.nbDims = 5; d.d[0] = 1; d.d[1] = L; d.d[2] = 64; d.d[3] = 2; d.d[4] = 2; return d;
+}
 } // namespace
 
 // ---------------- Flux2Transformer ----------------
@@ -121,6 +126,50 @@ void Flux2TransformerWrapper::forward(
   bindOut(c, "velocity", velocity);
   if(!c->enqueueV3(stream))
     throw std::runtime_error("klein: transformer enqueueV3 failed");
+}
+
+// ---------------- Flux3Transformer ----------------
+Flux3TransformerWrapper::Flux3TransformerWrapper(const std::string& p)
+{
+  context_ = makeContext(cached_engine_, p);
+  requireTypes(
+      *cached_engine_, p,
+      {{"img", nvinfer1::DataType::kBF16},
+       {"cond", nvinfer1::DataType::kBF16},
+       {"txt", nvinfer1::DataType::kBF16},
+       {"rope_img", nvinfer1::DataType::kFLOAT},
+       {"rope_cond", nvinfer1::DataType::kFLOAT},
+       {"rope_txt", nvinfer1::DataType::kFLOAT},
+       {"t", nvinfer1::DataType::kFLOAT},
+       {"r", nvinfer1::DataType::kFLOAT},
+       {"velocity", nvinfer1::DataType::kBF16}});
+}
+Flux3TransformerWrapper::~Flux3TransformerWrapper() = default;
+
+int Flux3TransformerWrapper::max_cond_tokens() const
+{
+  const auto d = cached_engine_->getEngine()->getProfileShape(
+      "cond", 0, nvinfer1::OptProfileSelector::kMAX);
+  return d.nbDims == 3 ? (int)d.d[1] : 0;
+}
+
+void Flux3TransformerWrapper::forward(
+    const __nv_bfloat16* img, const __nv_bfloat16* cond, const __nv_bfloat16* txt,
+    const float* rope_img, const float* rope_cond, const float* rope_txt, const float* t,
+    const float* r, __nv_bfloat16* velocity, int Li, int Lc, int Lt, cudaStream_t stream)
+{
+  auto* c = context_.get();
+  bindIn(c, "img", img, dims3(1, Li, 128));
+  bindIn(c, "cond", cond, dims3(1, Lc, 128));
+  bindIn(c, "txt", txt, dims3(1, Lt, 20480));
+  bindIn(c, "rope_img", rope_img, dims_rope(Li));
+  bindIn(c, "rope_cond", rope_cond, dims_rope(Lc));
+  bindIn(c, "rope_txt", rope_txt, dims_rope(Lt));
+  bindIn(c, "t", t, dims1(1));
+  bindIn(c, "r", r, dims1(1));
+  bindOut(c, "velocity", velocity);
+  if(!c->enqueueV3(stream))
+    throw std::runtime_error("flux3: transformer enqueueV3 failed");
 }
 
 // ---------------- Qwen3Encoder ----------------
