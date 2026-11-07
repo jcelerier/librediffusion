@@ -1,9 +1,10 @@
 """Build FLUX.3-image-klein bf16 TRT engines from export_flux3.py's ONNX.
 
-Profiles (tokens = (H/16)*(W/16)): image 128..1024 px per side, reference 0 (text-to-image)
-or 128..1024 px, text 80..640 tokens. --which transformer_fp8 builds transformer_fp8.plan from
-export_flux3_fp8.py's ONNX.
-Env: FLUX3_ONNX_DIR, FLUX3_ENGINE_DIR, FLUX3_OPT_SIZE (512).
+Profiles (tokens = (H/16)*(W/16)): image MIN_PX..MAX_PX per side, references 0 (text-to-image) up
+to one MAX_PX square in total, text 80..640 tokens. --which transformer_fp8 builds
+transformer_fp8.plan from export_flux3_fp8.py's ONNX.
+Env: FLUX3_ONNX_DIR, FLUX3_ENGINE_DIR, FLUX3_MIN_PX (128), FLUX3_MAX_PX (1024),
+FLUX3_OPT_WIDTH / FLUX3_OPT_HEIGHT (FLUX3_OPT_SIZE, 512).
 """
 from __future__ import annotations
 
@@ -21,9 +22,14 @@ from build_klein_engines import build  # noqa: E402
 ONNX = Path(os.environ.get("FLUX3_ONNX_DIR", "./onnx-flux3"))
 ENG = Path(os.environ.get("FLUX3_ENGINE_DIR", "./engine-flux3"))
 OPT = int(os.environ.get("FLUX3_OPT_SIZE", "512"))
-L_MIN, L_OPT, L_MAX = 8 * 8, (OPT // 16) ** 2, 64 * 64
+OPT_W = int(os.environ.get("FLUX3_OPT_WIDTH", OPT)) // 16 * 16
+OPT_H = int(os.environ.get("FLUX3_OPT_HEIGHT", OPT)) // 16 * 16
+PX_MIN = int(os.environ.get("FLUX3_MIN_PX", "128")) // 16 * 16
+PX_MAX = int(os.environ.get("FLUX3_MAX_PX", "1024")) // 16 * 16
+if not PX_MIN <= min(OPT_W, OPT_H) <= max(OPT_W, OPT_H) <= PX_MAX:
+    raise SystemExit(f"opt {OPT_W}x{OPT_H} outside {PX_MIN}..{PX_MAX}")
+L_MIN, L_OPT, L_MAX = (PX_MIN // 16) ** 2, (OPT_W // 16) * (OPT_H // 16), (PX_MAX // 16) ** 2
 T_MIN, T_OPT, T_MAX = 80, 80, 640
-PX_MIN, PX_MAX = 128, 1024
 
 
 def build_transformer(name="transformer.plan", src="transformer", lc_min=0):
@@ -63,11 +69,11 @@ def build_qwen():
 
 
 def build_vae():
-    lo, hi, opt = PX_MIN // 8, PX_MAX // 8, OPT // 8
+    lo, hi = PX_MIN // 8, PX_MAX // 8
     build(ONNX / "vae_decoder/model.onnx", ENG / "vae_decoder.plan",
-          {"latent": ((1, 32, lo, lo), (1, 32, opt, opt), (1, 32, hi, hi))}, workspace_gb=8)
+          {"latent": ((1, 32, lo, lo), (1, 32, OPT_H // 8, OPT_W // 8), (1, 32, hi, hi))}, workspace_gb=8)
     build(ONNX / "vae_encoder/model.onnx", ENG / "vae_encoder.plan",
-          {"image": ((1, 3, PX_MIN, PX_MIN), (1, 3, OPT, OPT), (1, 3, PX_MAX, PX_MAX))}, workspace_gb=8)
+          {"image": ((1, 3, PX_MIN, PX_MIN), (1, 3, OPT_H, OPT_W), (1, 3, PX_MAX, PX_MAX))}, workspace_gb=8)
     for f in ("bn_mean.bin", "bn_std.bin", "tokenizer.json"):
         shutil.copy(ONNX / f, ENG / f)
 

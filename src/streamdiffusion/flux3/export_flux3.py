@@ -10,7 +10,7 @@
                 (hidden layers 4..32 of the Qwen3-VL text tower, positions as the reference builds them)
   vae         : same graphs as klein.2 (AutoencoderKLFlux2), new weights.
 
-The DiT is BFL's reference module (FLUX3_REF/src/flux3/dit.py) re-driven densely for one sample.
+The DiT is BFL's reference module (bfl/flux3/dit.py, or FLUX3_REF's checkout) re-driven densely for one sample.
 """
 from __future__ import annotations
 
@@ -24,8 +24,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-REF = Path(os.environ.get("FLUX3_REF", "/media/data1/flux3/ref"))
-sys.path.insert(0, str(REF / "src"))
+# BFL's inference code: the vendored copy, or a checkout of flux-3-image-klein
+REF = Path(os.environ.get("FLUX3_REF") or Path(__file__).resolve().parent / "bfl")
+sys.path.insert(0, str(REF / "src" if (REF / "src" / "flux3").is_dir() else REF))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "klein"))
 
 from flux3 import dit as fdit  # noqa: E402

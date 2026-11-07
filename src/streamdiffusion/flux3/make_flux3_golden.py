@@ -15,7 +15,9 @@ Dumps every seam the C++ port has to match, per case, as .npy under OUT/<case>/:
   image.png, image                [3,H,W] decoded, in [-1,1]
 
 Usage: python make_flux3_golden.py --ref /media/data1/flux3/ref --out /media/data1/flux3/golden
-       python make_flux3_golden.py --ref ... --out /media/data1/flux3/calib --calib
+       python make_flux3_golden.py --out /media/data1/flux3/calib --calib
+--ref is a flux-3-image-klein checkout (the validation cases read its examples/); it defaults to the
+vendored bfl/, which carries the calibration input.
 """
 from __future__ import annotations
 
@@ -80,12 +82,12 @@ def center_fit(path: Path, w: int, h: int) -> Image.Image:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ref", required=True, type=Path)
+    ap.add_argument("--ref", type=Path, default=Path(__file__).resolve().parent / "bfl")
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--cases", default="", help="comma-separated subset")
     ap.add_argument("--calib", action="store_true", help="dump the FP8 calibration cases instead")
     a = ap.parse_args()
-    sys.path.insert(0, str(a.ref / "src"))
+    sys.path.insert(0, str(a.ref / "src" if (a.ref / "src" / "flux3").is_dir() else a.ref))
     from flux3.autoencoder import AutoEncoder, latent_ids, latent_shape
     from flux3.checkpoint import load_checkpoint
     from flux3.dit import DiT, IN_CHANNELS, rope_embed

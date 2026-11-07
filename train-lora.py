@@ -271,8 +271,8 @@ def parse_args():
                                         "src", "streamdiffusion", "klein"),
                    help="dir holding export_klein.py / build_klein_engines.py / export_klein_fp8_calib.py")
     p.add_argument("--flux3-ref", default=os.environ.get("FLUX3_REF", ""),
-                   help="flux3 only: checkout of github.com/black-forest-labs/flux-3-image-klein "
-                        "(its DiT module is what gets exported)")
+                   help="flux3 only: a github.com/black-forest-labs/flux-3-image-klein checkout to "
+                        "export from instead of the vendored copy")
     p.add_argument("--klein-quality", choices=["speed", "quality", "both"], default="both",
                    help="klein/flux3: speed=fp8 transformer, quality=bf16, both")
     p.add_argument("--hw-compat", choices=["none", "ampere_plus", "same_cc"], default="none",
@@ -371,8 +371,6 @@ def parse_args():
         p.error("--unet / --unet-timestep-scale only apply to --type sd15/sdxl")
     if a.type == "flux3" and a.lora_specs:
         p.error("--type flux3 does not take LoRAs yet")
-    if a.type == "flux3" and not a.flux3_ref:
-        p.error("--type flux3 needs --flux3-ref (or FLUX3_REF)")
     if a.type == "klein" and any(s.runtime for s in a.lora_specs):
         p.error("--type klein bakes its LoRAs into the transformer; :runtime is not supported")
     # klein has its own native geometry (320x576) and the sd15/sdxl resolution defaults are meaningless
@@ -605,8 +603,9 @@ def export_klein(args):
 
 
 def export_flux3(args):
-    """FLUX.3-image-klein: ONNX export + bf16 (and FP8, per --klein-quality) engines, shape-dynamic
-    128..1024 px, staged into --output."""
+    """FLUX.3-image-klein: ONNX export + bf16 (and FP8, per --klein-quality) engines + RIFE, staged
+    into --output. Shape-dynamic: 128..1024 px with a 512x512 optimum unless a resolution is passed.
+    BFL's inference code is vendored (src/streamdiffusion/flux3/bfl); --flux3-ref overrides it."""
     import subprocess, shutil, glob as _glob
     sd = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "streamdiffusion", "flux3")
     out = os.path.abspath(args.output)
@@ -618,8 +617,20 @@ def export_flux3(args):
     if not model_dir:
         raise SystemExit("[flux3] flux-3-image-klein not found: pass --model with a snapshot dir, or "
                          "hf download black-forest-labs/flux-3-image-klein")
-    env = dict(os.environ, FLUX3_REF=os.path.abspath(args.flux3_ref), FLUX3_MODEL_DIR=model_dir,
-               FLUX3_ONNX_DIR=onnx_dir, FLUX3_ENGINE_DIR=eng_dir, KLEIN_HW_COMPAT=args.hw_compat)
+    if args.resolution_explicit:
+        px_min, px_max = min(args.min_width, args.min_height), max(args.max_width, args.max_height)
+        opt_w, opt_h = args.opt_width, args.opt_height
+    else:
+        px_min, px_max, opt_w, opt_h = 128, 1024, 512, 512
+    env = dict(os.environ, FLUX3_MODEL_DIR=model_dir, FLUX3_ONNX_DIR=onnx_dir, FLUX3_ENGINE_DIR=eng_dir,
+               KLEIN_HW_COMPAT=args.hw_compat, FLUX3_MIN_PX=str(px_min), FLUX3_MAX_PX=str(px_max),
+               FLUX3_OPT_WIDTH=str(opt_w), FLUX3_OPT_HEIGHT=str(opt_h))
+    ref_args = []
+    if args.flux3_ref:
+        env["FLUX3_REF"] = os.path.abspath(args.flux3_ref)
+        ref_args = ["--ref", env["FLUX3_REF"]]
+    else:
+        env.pop("FLUX3_REF", None)
 
     def run(script, *a):
         cmd = [sys.executable, os.path.join(sd, script), *a]
@@ -645,24 +656,25 @@ def export_flux3(args):
     if quality in ("speed", "both"):
         # the node falls back to transformer.plan, so the bf16 engine stays in the bundle either way
         calib_dir = os.path.join(onnx_dir, "calib")
-        run("make_flux3_golden.py", "--ref", os.path.abspath(args.flux3_ref), "--out", calib_dir, "--calib")
+        run("make_flux3_golden.py", *ref_args, "--out", calib_dir, "--calib")
         run("export_flux3_fp8.py", "--calib", calib_dir)
         run("build_flux3_engines.py", "--which", "transformer_fp8")
         files.append("transformer_fp8.plan")
     for f in files:
         shutil.copy2(os.path.join(eng_dir, f), os.path.join(out, f))
-    if args.rife:
+    # the FLUX.3 presets interpolate, so the bundle always carries RIFE, as klein's does
+    if args.rife or not os.path.exists(os.path.join(out, "rife_ifnet_fp16.plan")):
         build_rife(args, out)
     write_manifest(out, {
         "model_type": "flux3",
         "model_family": "flux3",
         "base_model": model_dir if os.path.isdir(args.model) else "black-forest-labs/flux-3-image-klein",
-        "resolution": {"min": 128, "max": 1024},
+        "resolution": {"min": px_min, "max": px_max, "opt_width": opt_w, "opt_height": opt_h},
         "denoising_steps": 4,
         "precision": "fp8+bf16" if quality in ("speed", "both") else "bf16",
         "hw_compat": args.hw_compat,
-        "features": {"controlnet": False, "ipadapter": False, "v2v": False, "rife": args.rife,
-                     "reference_edit": True},
+        "features": {"controlnet": False, "ipadapter": False, "v2v": False, "rife": True,
+                     "reference_edit": True, "max_references_tokens": (px_max // 16) ** 2},
     })
     print(f"[flux3] DONE -> bundle at {out}")
 
