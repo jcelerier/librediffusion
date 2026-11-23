@@ -26,6 +26,30 @@ Models need to be converted to TensorRT through the Python script [train-lora.py
 $ uv run train-lora.py --model stabilityai/sd-turbo --min-batch 1 --max-batch 1 --opt-batch 1 --min-resolution 512 --max-resolution 1024 --output ./engines-sd-turbo
 ```
 
+## Building the library on Windows
+
+- **Host compiler**: nvcc needs MSVC `cl.exe`, also when the host application (e.g. ossia score) is
+  built with clang-cl; the library is only loaded through its C API, so the two need not match.
+- **CUDA vs. Visual Studio 2026**: CUDA 13.1's `cudafe++` crashes (access violation) on the MSVC
+  14.51 STL headers shipped with VS 2026. CUDA 13.3 builds fine; pass
+  `-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler` if nvcc refuses the newer MSVC.
+- **cutlass**: the `3rdparty/cutlass` submodule has paths longer than `MAX_PATH`; run
+  `git config core.longpaths true` before `git submodule update --init`.
+- **TensorRT**: CI builds against TensorRT 11, and TensorRT 10 (10.14) still builds as well
+  (`nvinfer_10.lib` is found the same way). A serialized engine only loads with the TensorRT version
+  that built it, so build the library against the version your engine bundles were exported with,
+  or re-export them.
+- **Boost**: point `-DBOOST_INCLUDE_DIR` at any Boost headers tree.
+
+```bat
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+  -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl ^
+  -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe" -DCMAKE_CUDA_ARCHITECTURES=120 ^
+  -DTENSORRT_INCLUDE_DIR=C:/TensorRT/include -DTENSORRT_LIB_DIR=C:/TensorRT/lib ^
+  -DBOOST_INCLUDE_DIR=C:/boost
+cmake --build build --target librediffusion
+```
+
 ## Engine build recipes (validated)
 
 All commands run as `uv run python train-lora.py <args>`. Resolution flags are
