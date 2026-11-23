@@ -176,6 +176,12 @@ void LibreDiffusionPipeline::init_buffers()
           + " latent needs " + std::to_string(worst) + " elements, which does not fit in int");
   }
 
+  // The loaded engines' optimization profiles must admit this geometry, as reinit_buffers already
+  // requires: past this point a mismatch only surfaces at the first frame, as an opaque
+  // "Failed to set images shape" from TensorRT on every frame. Name the bound instead.
+  if(auto why = geometry_rejection(config_); !why.empty())
+    throw invalid_dimensions_error("init_buffers: " + why);
+
   // Calculate sizes
   int latent_size
       = config_.batch_size * 4 * config_.latent_height * config_.latent_width;
