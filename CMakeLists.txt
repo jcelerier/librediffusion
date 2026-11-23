@@ -59,9 +59,11 @@ if(NOT MSVC)
     set(CMAKE_EXE_LINKER_FLAGS "-flto -O3 -ffast-math")
   endif()
 else()
-  set(CMAKE_CXX_FLAGS "/EHsc")
-  set(CMAKE_CXX_FLAGS "/O2 /GL /fp:fast /arch:AVX2 /LTCG /EHsc")
-  set(CMAKE_EXE_LINKER_FLAGS "/O2 /GL /fp:fast /arch:AVX2 /LTCG")
+  # /GL is a compiler flag, /LTCG a linker one: cl ignores /LTCG (D9002) and link.exe the compiler
+  # flags (LNK4044). The library itself is a shared library, so it needs the shared linker flags.
+  set(CMAKE_CXX_FLAGS "/O2 /GL /fp:fast /arch:AVX2 /EHsc")
+  set(CMAKE_EXE_LINKER_FLAGS "/LTCG")
+  set(CMAKE_SHARED_LINKER_FLAGS "/LTCG")
 endif()
 
 # Fetch Corrosion for Rust integration and Catch2 for testing
